@@ -1,0 +1,112 @@
+#pragma once
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+// ── Static GPU hardware info (queried once at init) ──────────────────────────
+struct GpuHardwareInfo {
+    char     name[256]          = {};
+    int      compute_major      = 0;
+    int      compute_minor      = 0;
+    uint32_t cuda_cores         = 0;   // from NVML nvmlDeviceGetNumGpuCores
+    int      sm_count           = 0;   // multiProcessorCount
+    int      warp_size          = 32;
+    int      max_threads_per_sm = 0;
+    int      max_threads_block  = 0;
+    int      max_blocks_per_sm  = 0;
+    int      shared_mem_per_sm  = 0;   // bytes
+    int      shared_mem_block   = 0;   // bytes
+    int      l2_cache_bytes     = 0;
+    int      num_registers      = 0;   // registers per thread block
+    uint64_t total_vram_bytes   = 0;
+    int      mem_bus_width_bits = 0;
+    int      mem_clock_mhz_max  = 0;
+    int      sm_clock_mhz_max   = 0;
+    float    peak_bandwidth_gbs = 0.f;
+    float    peak_tflops_fp32   = 0.f;
+    char     arch_name[64]      = {};  // "Ada Lovelace", "Ampere", etc.
+    bool     has_rt_cores       = false;
+    bool     has_tensor_cores   = false;
+    int      rt_core_gen        = 0;   // 1=Turing, 2=Ampere, 3=Ada
+    int      tensor_core_gen    = 0;   // 1=Volta, 2=Turing, 3=Ampere, 4=Ada
+};
+
+// ── Per-frame live metrics (filled each frame) ───────────────────────────────
+struct GpuLiveStats {
+    // NVML live readings
+    uint32_t gpu_util_pct      = 0;   // 0–100
+    uint32_t mem_util_pct      = 0;   // 0–100
+    uint64_t vram_used_bytes   = 0;
+    uint64_t vram_free_bytes   = 0;
+    uint32_t temp_celsius      = 0;
+    uint32_t power_mw          = 0;
+    uint32_t sm_clock_mhz      = 0;
+    uint32_t mem_clock_mhz     = 0;
+    uint32_t power_limit_mw    = 0;
+    uint64_t throttle_reasons  = 0;
+
+    // Kernel dispatch info (computed from render params each frame)
+    int render_w               = 0;
+    int render_h               = 0;
+    int block_x                = 16;
+    int block_y                = 16;
+    int grid_x                 = 0;
+    int grid_y                 = 0;
+    uint64_t total_threads     = 0;
+    uint64_t active_threads    = 0;   // pixels actually shaded
+    uint64_t total_warps       = 0;
+    uint64_t active_warps      = 0;
+    float    thread_occupancy  = 0.f; // active_threads / total_threads
+
+    // Memory breakdown (bytes on device)
+    size_t   mem_bvh           = 0;
+    size_t   mem_tris          = 0;
+    size_t   mem_mats          = 0;
+    size_t   mem_textures      = 0;
+    size_t   mem_accum         = 0;
+    size_t   mem_rng           = 0;
+    size_t   mem_reservoirs    = 0;
+    size_t   mem_hdri          = 0;
+    size_t   mem_total_tracked = 0;
+
+    // Active core types (based on current feature flags)
+    bool     using_cuda_cores   = true;
+    bool     using_rt_cores     = false;
+    bool     using_tensor_cores = false;
+    bool     using_tex_units    = false;
+    bool     using_raster       = false; // never, we're a path tracer
+
+    // History for plots (ring buffer, 128 entries)
+    static constexpr int HIST = 128;
+    float gpu_util_hist[HIST]  = {};
+    float mem_util_hist[HIST]  = {};
+    float sm_clock_hist[HIST]  = {};
+    float power_hist[HIST]     = {};
+    float temp_hist[HIST]      = {};
+    int   hist_offset          = 0;
+};
+
+// ── NVML opaque handle ───────────────────────────────────────────────────────
+struct NvmlContext {
+    void* device = nullptr;  // nvmlDevice_t cast to void*
+    bool  ok     = false;
+};
+
+// ── API ──────────────────────────────────────────────────────────────────────
+
+// Call once at startup. Populates hw and initialises NVML.
+void stats_init(NvmlContext& nvml, GpuHardwareInfo& hw);
+
+// Call once per frame (cheap NVML poll + compute kernel stats).
+// render_w/h = actual rendered pixels; feature_flags from ControlPanelState.
+void stats_update(NvmlContext& nvml, GpuLiveStats& live, const GpuHardwareInfo& hw,
+                  int render_w, int render_h,
+                  bool optix_on, bool dlss_on, bool has_textures, bool has_hdri,
+                  size_t mem_bvh, size_t mem_tris, size_t mem_mats,
+                  size_t mem_textures, size_t mem_accum, size_t mem_rng,
+                  size_t mem_reservoirs, size_t mem_hdri);
+
+// Draw the ImGui "GPU Stats" window. Returns false if window is closed.
+bool stats_draw(const GpuHardwareInfo& hw, GpuLiveStats& live);
+
+// Call at shutdown.
+void stats_shutdown(NvmlContext& nvml);

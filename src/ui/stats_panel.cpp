@@ -1,0 +1,535 @@
+// stats_panel.cpp
+// Full GPU stats panel: NVML live metrics, CUDA device properties, kernel
+// dispatch info, memory breakdown, active core types, history plots.
+
+#include "stats_panel.h"
+#include <imgui.h>
+#include <cuda_runtime.h>
+#include <nvml.h>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+
+// ── Architecture helpers ──────────────────────────────────────────────────────
+
+static const char* arch_name_from_nvml(nvmlDeviceArchitecture_t a) {
+    switch (a) {
+        case NVML_DEVICE_ARCH_KEPLER:  return "Kepler";
+        case NVML_DEVICE_ARCH_MAXWELL: return "Maxwell";
+        case NVML_DEVICE_ARCH_PASCAL:  return "Pascal";
+        case NVML_DEVICE_ARCH_VOLTA:   return "Volta";
+        case NVML_DEVICE_ARCH_TURING:  return "Turing";
+        case NVML_DEVICE_ARCH_AMPERE:  return "Ampere";
+        case NVML_DEVICE_ARCH_ADA:     return "Ada Lovelace";
+        case NVML_DEVICE_ARCH_HOPPER:  return "Hopper";
+        default:                        return "Unknown";
+    }
+}
+
+// CUDA cores per SM for each compute capability (SM major.minor → cores)
+static int cores_per_sm(int major, int minor) {
+    switch (major * 10 + minor) {
+        case 30: case 32: case 35: case 37: return 192; // Kepler
+        case 50: case 52: case 53:          return 128; // Maxwell
+        case 60:                            return  64; // Pascal (GP100)
+        case 61: case 62:                   return 128; // Pascal (GP10x)
+        case 70: case 72:                   return  64; // Volta
+        case 75:                            return  64; // Turing
+        case 80:                            return  64; // Ampere GA100
+        case 86: case 87:                   return 128; // Ampere GA10x
+        case 89:                            return 128; // Ada Lovelace
+        case 90:                            return 128; // Hopper
+        default:                            return 128;
+    }
+}
+
+// RT core generation by compute capability
+static int rt_gen_from_cc(int major, int minor) {
+    if (major == 7 && minor == 5) return 1; // Turing RT gen1
+    if (major == 8)               return 2; // Ampere RT gen2
+    if (major == 8 && minor == 9) return 3; // Ada RT gen3
+    if (major == 9)               return 3; // Ada/Hopper
+    return 0; // no RT cores
+}
+
+// Tensor core generation by compute capability
+static int tensor_gen_from_cc(int major, int minor) {
+    if (major == 7 && minor == 0) return 1; // Volta TC gen1
+    if (major == 7 && minor == 5) return 2; // Turing TC gen2
+    if (major == 8 && minor == 0) return 3; // Ampere TC gen3 (TF32/BF16)
+    if (major == 8 && minor >= 6) return 3;
+    if (major == 8 && minor == 9) return 4; // Ada TC gen4 (FP8)
+    if (major == 9)               return 4;
+    return 0;
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+void stats_init(NvmlContext& nvml, GpuHardwareInfo& hw)
+{
+    // ── NVML init ────────────────────────────────────────────────────────────
+    nvmlReturn_t r = nvmlInit_v2();
+    nvml.ok = (r == NVML_SUCCESS);
+    if (!nvml.ok) return;
+
+    nvmlDevice_t dev;
+    if (nvmlDeviceGetHandleByIndex(0, &dev) != NVML_SUCCESS) { nvml.ok = false; return; }
+    nvml.device = (void*)dev;
+
+    // Name
+    nvmlDeviceGetName(dev, hw.name, sizeof(hw.name));
+
+    // Compute capability
+    nvmlDeviceGetCudaComputeCapability(dev, &hw.compute_major, &hw.compute_minor);
+
+    // CUDA cores from NVML (most accurate)
+    uint32_t num_cores = 0;
+    if (nvmlDeviceGetNumGpuCores(dev, &num_cores) == NVML_SUCCESS)
+        hw.cuda_cores = num_cores;
+
+    // Architecture name + RT/Tensor core info
+    nvmlDeviceArchitecture_t arch;
+    if (nvmlDeviceGetArchitecture(dev, &arch) == NVML_SUCCESS)
+        strncpy_s(hw.arch_name, sizeof(hw.arch_name), arch_name_from_nvml(arch), _TRUNCATE);
+
+    hw.rt_core_gen     = rt_gen_from_cc(hw.compute_major, hw.compute_minor);
+    hw.tensor_core_gen = tensor_gen_from_cc(hw.compute_major, hw.compute_minor);
+    hw.has_rt_cores    = (hw.rt_core_gen    > 0);
+    hw.has_tensor_cores= (hw.tensor_core_gen > 0);
+
+    // Memory
+    nvmlMemory_t mem;
+    if (nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS)
+        hw.total_vram_bytes = mem.total;
+
+    // Clocks
+    nvmlDeviceGetMaxClockInfo(dev, NVML_CLOCK_SM,  (unsigned int*)&hw.sm_clock_mhz_max);
+    nvmlDeviceGetMaxClockInfo(dev, NVML_CLOCK_MEM, (unsigned int*)&hw.mem_clock_mhz_max);
+
+    // Power limit
+    // (queried in stats_update per frame)
+
+    // ── CUDA device properties (fills gaps NVML doesn't cover) ───────────────
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+        hw.sm_count           = prop.multiProcessorCount;
+        hw.warp_size          = prop.warpSize;
+        hw.max_threads_per_sm = prop.maxThreadsPerMultiProcessor;
+        hw.max_threads_block  = prop.maxThreadsPerBlock;
+        hw.shared_mem_per_sm  = (int)prop.sharedMemPerMultiprocessor;
+        hw.shared_mem_block   = (int)prop.sharedMemPerBlock;
+        hw.l2_cache_bytes     = prop.l2CacheSize;
+        hw.num_registers      = prop.regsPerBlock;
+        hw.mem_bus_width_bits = prop.memoryBusWidth;
+
+        // Fill CUDA cores if NVML gave 0
+        if (hw.cuda_cores == 0)
+            hw.cuda_cores = (uint32_t)(hw.sm_count * cores_per_sm(hw.compute_major, hw.compute_minor));
+
+        // Theoretical peak bandwidth GB/s = 2 * memClk * busWidth/8 / 1e9
+        // memClk from CUDA is in kHz
+        float mem_clk_hz = (float)prop.memoryClockRate * 1000.f; // kHz → Hz
+        hw.peak_bandwidth_gbs = 2.f * mem_clk_hz * (float)(prop.memoryBusWidth / 8) / 1e9f;
+
+        // Theoretical FP32 TFLOPS = cuda_cores * sm_clk * 2 / 1e12
+        float sm_clk_hz = (float)hw.sm_clock_mhz_max * 1e6f;
+        hw.peak_tflops_fp32 = (float)hw.cuda_cores * sm_clk_hz * 2.f / 1e12f;
+    }
+}
+
+// ── Per-frame update ─────────────────────────────────────────────────────────
+
+void stats_update(NvmlContext& nvml, GpuLiveStats& live, const GpuHardwareInfo& hw,
+                  int render_w, int render_h,
+                  bool optix_on, bool dlss_on, bool has_textures, bool has_hdri,
+                  size_t mem_bvh, size_t mem_tris, size_t mem_mats,
+                  size_t mem_textures, size_t mem_accum, size_t mem_rng,
+                  size_t mem_reservoirs, size_t mem_hdri)
+{
+    // ── NVML live poll ────────────────────────────────────────────────────────
+    if (nvml.ok && nvml.device) {
+        nvmlDevice_t dev = (nvmlDevice_t)nvml.device;
+
+        nvmlUtilization_t util;
+        if (nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
+            live.gpu_util_pct = util.gpu;
+            live.mem_util_pct = util.memory;
+        }
+
+        nvmlMemory_t mem;
+        if (nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS) {
+            live.vram_used_bytes = mem.used;
+            live.vram_free_bytes = mem.free;
+        }
+
+        unsigned int val;
+        if (nvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &val) == NVML_SUCCESS)
+            live.temp_celsius = val;
+
+        if (nvmlDeviceGetPowerUsage(dev, &val) == NVML_SUCCESS)
+            live.power_mw = val;
+
+        if (nvmlDeviceGetPowerManagementLimit(dev, &val) == NVML_SUCCESS)
+            live.power_limit_mw = val;
+
+        if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM,  &val) == NVML_SUCCESS) live.sm_clock_mhz  = val;
+        if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_MEM, &val) == NVML_SUCCESS) live.mem_clock_mhz = val;
+
+        unsigned long long tr;
+        if (nvmlDeviceGetCurrentClocksThrottleReasons(dev, &tr) == NVML_SUCCESS)
+            live.throttle_reasons = tr;
+    }
+
+    // ── Kernel dispatch info ──────────────────────────────────────────────────
+    live.render_w        = render_w;
+    live.render_h        = render_h;
+    live.block_x         = 16;
+    live.block_y         = 16;
+    live.grid_x          = (render_w + 15) / 16;
+    live.grid_y          = (render_h + 15) / 16;
+    live.total_threads   = (uint64_t)live.grid_x * live.grid_y * 256ULL;
+    live.active_threads  = (uint64_t)render_w * render_h;
+    live.total_warps     = live.total_threads / 32ULL;
+    live.active_warps    = (live.active_threads + 31ULL) / 32ULL;
+    live.thread_occupancy= live.total_threads > 0
+        ? (float)live.active_threads / (float)live.total_threads : 0.f;
+
+    // ── Memory breakdown ──────────────────────────────────────────────────────
+    live.mem_bvh        = mem_bvh;
+    live.mem_tris       = mem_tris;
+    live.mem_mats       = mem_mats;
+    live.mem_textures   = mem_textures;
+    live.mem_accum      = mem_accum;
+    live.mem_rng        = mem_rng;
+    live.mem_reservoirs = mem_reservoirs;
+    live.mem_hdri       = mem_hdri;
+    live.mem_total_tracked = mem_bvh + mem_tris + mem_mats + mem_textures
+                           + mem_accum + mem_rng + mem_reservoirs + mem_hdri;
+
+    // ── Active core types ─────────────────────────────────────────────────────
+    live.using_cuda_cores   = true;
+    live.using_rt_cores     = optix_on && hw.has_rt_cores;
+    live.using_tensor_cores = dlss_on  && hw.has_tensor_cores;
+    live.using_tex_units    = has_textures || has_hdri;
+
+    // ── History ring buffer ───────────────────────────────────────────────────
+    int o = live.hist_offset;
+    live.gpu_util_hist[o] = (float)live.gpu_util_pct;
+    live.mem_util_hist[o] = (float)live.mem_util_pct;
+    live.sm_clock_hist[o] = (float)live.sm_clock_mhz;
+    live.power_hist[o]    = live.power_mw / 1000.f;  // → watts
+    live.temp_hist[o]     = (float)live.temp_celsius;
+    live.hist_offset      = (o + 1) % GpuLiveStats::HIST;
+}
+
+// ── Draw helpers ─────────────────────────────────────────────────────────────
+
+static void mem_label(char* buf, size_t n, size_t bytes) {
+    if (bytes >= 1024*1024*1024)
+        snprintf(buf, n, "%.2f GB", bytes / (1024.0*1024.0*1024.0));
+    else if (bytes >= 1024*1024)
+        snprintf(buf, n, "%.1f MB", bytes / (1024.0*1024.0));
+    else if (bytes >= 1024)
+        snprintf(buf, n, "%.1f KB", bytes / 1024.0);
+    else
+        snprintf(buf, n, "%zu B", bytes);
+}
+
+static void colored_progress(const char* label, float frac, float r, float g, float b,
+                              const char* overlay = nullptr) {
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(r, g, b, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,       ImVec4(0.15f, 0.15f, 0.15f, 1.f));
+    char ovr[64] = {};
+    if (overlay) strncpy_s(ovr, sizeof(ovr), overlay, _TRUNCATE);
+    ImGui::ProgressBar(frac, ImVec2(-1.f, 14.f), overlay ? ovr : "");
+    ImGui::PopStyleColor(2);
+    if (label && label[0]) {
+        ImGui::SameLine(0.f, 4.f);
+        ImGui::TextDisabled("%s", label);
+    }
+}
+
+static void core_badge(const char* name, bool active, float r, float g, float b,
+                        const char* tooltip = nullptr) {
+    ImVec4 col = active ? ImVec4(r,g,b,1.f) : ImVec4(0.35f,0.35f,0.35f,1.f);
+    ImGui::TextColored(col, "[%s]", name);
+    if (tooltip && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", tooltip);
+    ImGui::SameLine(0.f, 6.f);
+}
+
+static void plot_history(const char* label, const float* data, int count, int offset,
+                          float scale_min, float scale_max, const char* fmt, float cur_val,
+                          ImVec4 col) {
+    ImGui::PushStyleColor(ImGuiCol_PlotLines, col);
+    char overlay[32]; snprintf(overlay, sizeof(overlay), fmt, cur_val);
+    ImGui::PlotLines(label, data, count, offset, overlay, scale_min, scale_max, ImVec2(-1.f, 40.f));
+    ImGui::PopStyleColor();
+}
+
+// ── Main draw ────────────────────────────────────────────────────────────────
+
+bool stats_draw(const GpuHardwareInfo& hw, GpuLiveStats& live)
+{
+    ImGui::SetNextWindowSize(ImVec2(420.f, 820.f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (!ImGui::Begin("GPU Stats", &open)) { ImGui::End(); return open; }
+
+    char tmp[128];
+
+    // ════════════════════════════════════════════════════════════════
+    // 1. HARDWARE OVERVIEW
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("Hardware", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextColored(ImVec4(1.f,0.85f,0.3f,1.f), "%s", hw.name);
+        ImGui::Text("Architecture : %s  (SM %d.%d)", hw.arch_name, hw.compute_major, hw.compute_minor);
+        ImGui::Separator();
+
+        // CUDA cores
+        ImGui::Text("CUDA (shader) cores : %u  across %d SMs",
+                    hw.cuda_cores, hw.sm_count);
+        ImGui::Text("Cores per SM        : %u  (warp size %d)",
+                    hw.sm_count > 0 ? hw.cuda_cores / hw.sm_count : 0, hw.warp_size);
+        ImGui::Separator();
+
+        // RT / Tensor cores
+        if (hw.has_rt_cores)
+            ImGui::Text("RT cores   : Gen %d  (%d per SM, %d total)",
+                        hw.rt_core_gen, hw.sm_count > 0 ? 1 : 0, hw.sm_count);
+        else
+            ImGui::TextDisabled("RT cores   : none (pre-Turing)");
+
+        if (hw.has_tensor_cores)
+            ImGui::Text("Tensor cores : Gen %d  (%d SMs × 4 TC/SM)",
+                        hw.tensor_core_gen, hw.sm_count);
+        else
+            ImGui::TextDisabled("Tensor cores : none");
+        ImGui::Separator();
+
+        // Memory
+        mem_label(tmp, sizeof(tmp), hw.total_vram_bytes);
+        ImGui::Text("VRAM             : %s  (%d-bit bus)", tmp, hw.mem_bus_width_bits);
+        ImGui::Text("L2 cache         : %d KB", hw.l2_cache_bytes / 1024);
+        ImGui::Text("Shared mem / SM  : %d KB", hw.shared_mem_per_sm / 1024);
+        ImGui::Text("Shared mem / blk : %d KB", hw.shared_mem_block / 1024);
+        ImGui::Text("Registers / blk  : %d", hw.num_registers);
+        ImGui::Separator();
+
+        // Peak performance
+        ImGui::Text("Peak BW   : %.1f GB/s",  hw.peak_bandwidth_gbs);
+        ImGui::Text("Peak FP32 : %.2f TFLOPS",hw.peak_tflops_fp32);
+        ImGui::Text("SM clk (max) : %d MHz   Mem clk: %d MHz",
+                    hw.sm_clock_mhz_max, hw.mem_clock_mhz_max);
+    }
+
+    ImGui::Spacing();
+
+    // ════════════════════════════════════════════════════════════════
+    // 2. LIVE METRICS
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("Live Metrics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // GPU utilisation
+        char ov[32]; snprintf(ov, sizeof(ov), "GPU %u%%", live.gpu_util_pct);
+        colored_progress(nullptr, live.gpu_util_pct / 100.f, 0.2f, 0.8f, 0.3f, ov);
+
+        // Memory utilisation
+        snprintf(ov, sizeof(ov), "MEM %u%%", live.mem_util_pct);
+        colored_progress(nullptr, live.mem_util_pct / 100.f, 0.3f, 0.5f, 1.f, ov);
+
+        ImGui::Separator();
+        // SM clock vs max
+        float sm_frac = hw.sm_clock_mhz_max > 0
+            ? (float)live.sm_clock_mhz / hw.sm_clock_mhz_max : 0.f;
+        snprintf(ov, sizeof(ov), "SM  %u / %u MHz", live.sm_clock_mhz, hw.sm_clock_mhz_max);
+        colored_progress(nullptr, sm_frac, 1.f, 0.7f, 0.1f, ov);
+
+        // Mem clock vs max
+        float mem_frac = hw.mem_clock_mhz_max > 0
+            ? (float)live.mem_clock_mhz / hw.mem_clock_mhz_max : 0.f;
+        snprintf(ov, sizeof(ov), "MEM %u / %u MHz", live.mem_clock_mhz, hw.mem_clock_mhz_max);
+        colored_progress(nullptr, mem_frac, 0.7f, 0.4f, 1.f, ov);
+
+        ImGui::Separator();
+        // Temperature
+        float temp_frac = live.temp_celsius / 100.f;
+        float tr = fminf(1.f, live.temp_celsius / 90.f);
+        snprintf(ov, sizeof(ov), "Temp %u°C", live.temp_celsius);
+        colored_progress(nullptr, temp_frac, tr, 1.f - tr, 0.1f, ov);
+
+        // Power
+        float pwr_frac = live.power_limit_mw > 0
+            ? (float)live.power_mw / live.power_limit_mw : 0.f;
+        snprintf(ov, sizeof(ov), "Power %.0f / %.0f W",
+                 live.power_mw / 1000.f, live.power_limit_mw / 1000.f);
+        colored_progress(nullptr, pwr_frac, 1.f, 0.4f, 0.1f, ov);
+
+        // Throttle reasons
+        if (live.throttle_reasons != 0 &&
+            live.throttle_reasons != 0x0000000000000001ULL /* idle */)
+        {
+            ImGui::TextColored(ImVec4(1.f,0.4f,0.2f,1.f), "! Clock throttled (0x%llX)",
+                               (unsigned long long)live.throttle_reasons);
+            if (live.throttle_reasons & 0x0000000000000002ULL)
+                ImGui::TextDisabled("  - GPU idle");
+            if (live.throttle_reasons & 0x0000000000000008ULL)
+                ImGui::TextDisabled("  - SW thermal");
+            if (live.throttle_reasons & 0x0000000000000010ULL)
+                ImGui::TextDisabled("  - HW slowdown");
+            if (live.throttle_reasons & 0x0000000000000020ULL)
+                ImGui::TextDisabled("  - SW power cap");
+            if (live.throttle_reasons & 0x0000000000000040ULL)
+                ImGui::TextDisabled("  - HW thermal");
+            if (live.throttle_reasons & 0x0000000000000080ULL)
+                ImGui::TextDisabled("  - HW power brake");
+        }
+    }
+
+    ImGui::Spacing();
+
+    // ════════════════════════════════════════════════════════════════
+    // 3. ACTIVE CORE TYPES
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("Active Core Types", ImGuiTreeNodeFlags_DefaultOpen)) {
+        core_badge("CUDA/Shader", live.using_cuda_cores, 0.2f, 0.9f, 0.4f,
+            "General-purpose SIMT cores — always active during path tracing");
+        core_badge("TEX", live.using_tex_units, 0.9f, 0.7f, 0.1f,
+            "Texture units — active when sampling material or HDRI textures");
+        core_badge("RT", live.using_rt_cores, 0.4f, 0.8f, 1.f,
+            "Fixed-function ray-triangle intersection (OptiX required)");
+        core_badge("TENSOR", live.using_tensor_cores, 1.f, 0.5f, 0.8f,
+            "Matrix-multiply units — active with DLSS neural upscaling");
+        ImGui::NewLine();
+
+        ImGui::TextDisabled("Memory access paths active:");
+        ImGui::BulletText("Global (HBM/GDDR) : always (BVH, triangles, accum)");
+        if (live.using_tex_units)
+            ImGui::BulletText("L1 TEX cache       : textures + HDRI sampled via TEX units");
+        ImGui::BulletText("L2 unified cache   : all traffic");
+        ImGui::BulletText("Register file      : per-thread path state");
+        ImGui::BulletText("Constant cache     : kernel params struct");
+    }
+
+    ImGui::Spacing();
+
+    // ════════════════════════════════════════════════════════════════
+    // 4. KERNEL DISPATCH
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("Kernel Dispatch", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Render res    : %d × %d  pixels", live.render_w, live.render_h);
+        ImGui::Text("Block size    : %d × %d  (%d threads)", live.block_x, live.block_y,
+                    live.block_x * live.block_y);
+        ImGui::Text("Grid size     : %d × %d  (%d blocks)",  live.grid_x, live.grid_y,
+                    live.grid_x * live.grid_y);
+        ImGui::Separator();
+
+        ImGui::Text("Threads launched : %llu", (unsigned long long)live.total_threads);
+        ImGui::Text("Threads active   : %llu  (real pixels)", (unsigned long long)live.active_threads);
+        ImGui::Text("Threads idle     : %llu  (edge padding)", (unsigned long long)(live.total_threads - live.active_threads));
+
+        char pad_ov[32];
+        snprintf(pad_ov, sizeof(pad_ov), "Active %.1f%%", live.thread_occupancy * 100.f);
+        colored_progress(nullptr, live.thread_occupancy, 0.5f, 0.9f, 0.5f, pad_ov);
+
+        ImGui::Separator();
+        ImGui::Text("Warps launched  : %llu", (unsigned long long)live.total_warps);
+        ImGui::Text("Warps active    : %llu", (unsigned long long)live.active_warps);
+        ImGui::Text("Warps / SM      : %llu  (SM count %d)",
+                    live.total_warps / (uint64_t)(hw.sm_count > 0 ? hw.sm_count : 1), hw.sm_count);
+        ImGui::TextDisabled("Max warps / SM  : %d", hw.max_threads_per_sm / hw.warp_size);
+
+        // Theoretical SM occupancy: warps_per_sm / max_warps_per_sm
+        int max_warps_sm = hw.warp_size > 0 ? hw.max_threads_per_sm / hw.warp_size : 32;
+        int warps_per_sm = hw.sm_count > 0 ? (int)(live.total_warps / hw.sm_count) : 0;
+        float occ = max_warps_sm > 0 ? fminf(1.f, (float)warps_per_sm / max_warps_sm) : 0.f;
+        char occ_ov[32]; snprintf(occ_ov, sizeof(occ_ov), "SM occ %.0f%%", occ * 100.f);
+        colored_progress(nullptr, occ, 0.3f, 0.7f, 1.f, occ_ov);
+    }
+
+    ImGui::Spacing();
+
+    // ════════════════════════════════════════════════════════════════
+    // 5. MEMORY BREAKDOWN
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("Memory Breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // VRAM bar
+        float vram_frac = hw.total_vram_bytes > 0
+            ? (float)live.vram_used_bytes / hw.total_vram_bytes : 0.f;
+        char vram_ov[64];
+        mem_label(tmp, sizeof(tmp), live.vram_used_bytes);
+        char total_s[32]; mem_label(total_s, sizeof(total_s), hw.total_vram_bytes);
+        snprintf(vram_ov, sizeof(vram_ov), "VRAM %s / %s", tmp, total_s);
+        colored_progress(nullptr, vram_frac, 0.9f, 0.4f, 0.2f, vram_ov);
+
+        ImGui::Separator();
+        ImGui::Text("Tracked allocations:");
+
+        auto mem_row = [&](const char* name, size_t bytes, const char* type) {
+            mem_label(tmp, sizeof(tmp), bytes);
+            float frac = live.mem_total_tracked > 0
+                ? (float)bytes / live.mem_total_tracked : 0.f;
+            ImGui::Text("  %-18s %8s  [%s]", name, tmp, type);
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.3f,0.6f,1.f,0.7f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f,0.1f,0.1f,0.f));
+            ImGui::ProgressBar(frac, ImVec2(60.f, 10.f), "");
+            ImGui::PopStyleColor(2);
+        };
+
+        mem_row("BVH nodes",      live.mem_bvh,        "Global");
+        mem_row("Triangles",      live.mem_tris,        "Global");
+        mem_row("Materials",      live.mem_mats,        "Global");
+        mem_row("Textures",       live.mem_textures,    "TEX (L1 cached)");
+        mem_row("Accum buffer",   live.mem_accum,       "Global (RW)");
+        mem_row("RNG states",     live.mem_rng,         "Global");
+        mem_row("Reservoirs",     live.mem_reservoirs,  "Global (ReSTIR)");
+        mem_row("HDRI env",       live.mem_hdri,        "TEX (L1 cached)");
+
+        ImGui::Separator();
+        mem_label(tmp, sizeof(tmp), live.mem_total_tracked);
+        ImGui::Text("  %-18s %8s", "Total tracked", tmp);
+
+        char free_s[32]; mem_label(free_s, sizeof(free_s), live.vram_free_bytes);
+        ImGui::TextDisabled("  Free VRAM: %s", free_s);
+    }
+
+    ImGui::Spacing();
+
+    // ════════════════════════════════════════════════════════════════
+    // 6. HISTORY PLOTS
+    // ════════════════════════════════════════════════════════════════
+    if (ImGui::CollapsingHeader("History Plots")) {
+        int o = live.hist_offset, n = GpuLiveStats::HIST;
+
+        plot_history("##gpu_util", live.gpu_util_hist, n, o, 0.f, 100.f,
+                     "GPU %.0f%%", (float)live.gpu_util_pct,
+                     ImVec4(0.2f,0.9f,0.4f,1.f));
+        ImGui::TextDisabled("GPU Utilisation %%");
+
+        plot_history("##sm_clk", live.sm_clock_hist, n, o, 0.f, (float)hw.sm_clock_mhz_max,
+                     "SM %g MHz", (float)live.sm_clock_mhz,
+                     ImVec4(1.f,0.7f,0.1f,1.f));
+        ImGui::TextDisabled("SM Clock MHz");
+
+        plot_history("##power", live.power_hist, n, o, 0.f,
+                     live.power_limit_mw > 0 ? live.power_limit_mw / 1000.f : 500.f,
+                     "%.0f W", live.power_mw / 1000.f,
+                     ImVec4(1.f,0.3f,0.1f,1.f));
+        ImGui::TextDisabled("Power (W)");
+
+        plot_history("##temp", live.temp_hist, n, o, 0.f, 100.f,
+                     "%g°C", (float)live.temp_celsius,
+                     ImVec4(1.f,0.5f,0.1f,1.f));
+        ImGui::TextDisabled("Temperature °C");
+    }
+
+    ImGui::End();
+    return open;
+}
+
+// ── Shutdown ─────────────────────────────────────────────────────────────────
+
+void stats_shutdown(NvmlContext& nvml)
+{
+    if (nvml.ok) nvmlShutdown();
+    nvml = NvmlContext{};
+}

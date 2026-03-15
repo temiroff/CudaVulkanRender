@@ -1,0 +1,15 @@
+build/
+*.spv
+*.user
+*.suo
+.vs/
+imgui.ini
+
+# Large asset folders
+model/
+hdri/
+
+# Large external SDKs (not committed — download separately)
+external/streamline/
+external/streamline-sdk.zip
+external/usd_devkit/

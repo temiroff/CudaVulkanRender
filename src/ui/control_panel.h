@@ -1,0 +1,113 @@
+#pragma once
+
+#include "../scene.h"
+#include "../post_process.h"
+#include "../nim_vlm.h"
+
+enum class InteractMode { Select, Move, Orbit };
+
+struct ControlPanelState {
+    // ── Interaction mode ──────────────────────
+    InteractMode interact_mode = InteractMode::Orbit;
+    int   selected_sphere   = -1;     // index in prims_sorted, -1 = none
+    int   selected_mesh_obj = -1;     // MeshObject index, -1 = none
+
+    // ── FPS camera (source of truth for Select/Move modes) ─
+    float pos[3]     = { 0.f, 1.f, 5.f };
+    float yaw        = 0.f;     // degrees; 0 = look toward -Z
+    float pitch      = 0.f;     // degrees, clamped [-89, 89]
+    float move_speed = 5.f;
+    float look_sens  = 0.15f;
+
+    // ── Orbit camera ──────────────────────────
+    float orbit_pivot[3] = { 0.f, 1.f, 0.f };
+    float orbit_dist     = 5.f;
+
+    // Derived — rebuilt each frame in main
+    float cam_from[3] = {};
+    float cam_at[3]   = {};
+
+    // ── Render settings ───────────────────────
+    float vfov         = 60.f;
+    float aperture     = 0.0f;
+    float focus_dist   = 10.f;
+    int   spp          = 1;
+    int   max_depth    = 2;
+    int   color_mode   = 0;   // 0=shaders, 1=greyscale, 2=random per object
+    float firefly_clamp = 10.f; // max per-sample luminance (0 = disabled)
+
+    // ── Stats (written each frame) ────────────
+    float mrays_per_sec = 0.f;
+    float frame_ms      = 0.f;
+    int   frame_count   = 0;
+
+    static constexpr int HISTORY = 128;
+    float frame_times[HISTORY] = {};
+    int   ft_offset = 0;
+
+    // ── glTF load ─────────────────────────────
+    char gltf_path[512]      = "";
+    bool load_gltf_requested = false;
+    bool mesh_loaded         = false;
+    int  num_mesh_tris       = 0;
+
+    // ── HDRI ──────────────────────────────────
+    char hdri_path[512]      = "";
+    bool load_hdri_requested = false;
+    bool hdri_loaded         = false;
+    float hdri_intensity     = 1.0f;
+    float hdri_yaw_deg       = 0.0f;   // rotation around Y axis in degrees
+
+    // ── Denoiser ──────────────────────────────
+    bool denoise_enabled     = false;
+    bool denoise_available   = false;  // set by main once OIDN init succeeds
+    int  denoise_every_n     = 32;     // run denoiser every N accumulated frames
+    bool denoise_on_demand   = false;  // set true for a single one-shot run
+
+    // ── Post-processing ───────────────────────
+    PostPushConstants post;          // exposure, tone_map_mode, bloom_strength, etc.
+    bool post_enabled = true;
+
+    // ── AI Object Recognition (NVIDIA NIM VLM) ──
+    NimVlmConfig nim_cfg;
+    NimVlmResult nim_result;
+    bool nim_busy              = false;  // recognition in flight
+    bool nim_request           = false;  // set true by UI button → handled in main.cpp
+    bool nim_auto_enabled      = false;  // auto-fire after N stable frames
+    int  nim_auto_frames       = 128;    // frame threshold for auto-fire
+    bool nim_connection_ok     = false;  // last ping result
+    bool nim_connection_tested = false;  // true once we've pinged at least once
+    bool nim_ping_request      = false;  // request a connection test from main
+    bool nim_docker_launch_req = false;  // request docker run from main
+    char nim_docker_error[256] = {};     // non-empty if last docker launch failed
+
+    // ── Save render ───────────────────────────
+    bool save_exr_requested = false;
+    char save_exr_path[512] = "";
+
+    // ── Flags ─────────────────────────────────
+    bool camera_dirty = true;
+    bool show_bvh_dbg = false;
+
+    // ── Feature toggles ────────────────────────
+    // ReSTIR DI
+    bool restir_enabled    = false;
+    int  restir_candidates = 8;     // M: RIS candidates per pixel
+    bool restir_spatial    = true;  // spatial reuse pass
+    int  restir_radius     = 30;    // spatial neighbor radius in pixels
+
+    // OptiX (requires OptiX SDK — detected at build time)
+    bool optix_enabled     = false;
+
+    // DLSS / Resolution scaling
+    bool dlss_enabled      = false;
+    int  dlss_quality      = 1;     // 0=performance(50%), 1=balanced(67%), 2=quality(75%)
+    // dlss_has_sdk: set true by main if DLSS_ENABLED is defined
+    bool dlss_has_sdk      = false;
+
+    // Per-feature FPS baselines for comparison
+    float fps_baseline  = 0.f;  // measured before any feature is on
+    bool  fps_locked    = false; // true once baseline is captured
+};
+
+bool control_panel_draw(ControlPanelState& s);
