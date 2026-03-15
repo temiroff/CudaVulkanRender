@@ -164,24 +164,25 @@ static void create_display_image(PostProcess&     pp,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  load_agx_lut — parses AgX_Base_sRGB.cube and uploads to a 3D Vulkan texture.
-//  Returns true on success; pp.lut_* fields are populated.
+//  load_3d_cube_lut — parses any .cube 3D LUT file and uploads to Vulkan.
+//  Out params: out_image, out_memory, out_view, out_size (filled on success).
 // ─────────────────────────────────────────────────────────────────────────────
 
-static bool load_agx_lut(PostProcess&     pp,
-                         VkPhysicalDevice phys,
-                         VkCommandPool    cmd_pool,
-                         VkQueue          queue,
-                         const std::string& cube_path)
+static bool load_3d_cube_lut(VkDevice         device,
+                              VkPhysicalDevice phys,
+                              VkCommandPool    cmd_pool,
+                              VkQueue          queue,
+                              const std::string& cube_path,
+                              VkImage&         out_image,
+                              VkDeviceMemory&  out_memory,
+                              VkImageView&     out_view,
+                              int&             out_size)
 {
     std::ifstream f(cube_path);
-    if (!f.is_open()) {
-        std::cerr << "[PostProcess] AgX LUT not found: " << cube_path << "\n";
-        return false;
-    }
+    if (!f.is_open()) return false;
 
     int N = 0;
-    std::vector<float> data;  // packed R,G,B,A (A=1) triples in .cube order
+    std::vector<float> data;
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -191,23 +192,19 @@ static bool load_agx_lut(PostProcess&     pp,
             data.reserve((size_t)N * N * N * 4);
             continue;
         }
-        // Skip non-data lines (TITLE, DOMAIN_*)
         if (!std::isdigit((unsigned char)line[0]) &&
             line[0] != '-' && line[0] != '+' && line[0] != '.') continue;
         if (N == 0) continue;
         std::istringstream ss(line);
         float r, g, b;
         if (ss >> r >> g >> b) {
-            data.push_back(r);
-            data.push_back(g);
-            data.push_back(b);
-            data.push_back(1.0f);
+            data.push_back(r); data.push_back(g);
+            data.push_back(b); data.push_back(1.0f);
         }
     }
-
     if (N == 0 || (int)data.size() != N * N * N * 4) {
-        std::cerr << "[PostProcess] AgX LUT parse error: expected " << N*N*N
-                  << " entries, got " << data.size()/4 << "\n";
+        std::cerr << "[PostProcess] .cube parse error for: " << cube_path
+                  << " (expected " << N*N*N << " entries, got " << data.size()/4 << ")\n";
         return false;
     }
 
@@ -217,108 +214,93 @@ static bool load_agx_lut(PostProcess&     pp,
     img_ci.imageType     = VK_IMAGE_TYPE_3D;
     img_ci.format        = VK_FORMAT_R32G32B32A32_SFLOAT;
     img_ci.extent        = { (uint32_t)N, (uint32_t)N, (uint32_t)N };
-    img_ci.mipLevels     = 1;
-    img_ci.arrayLayers   = 1;
+    img_ci.mipLevels     = 1;  img_ci.arrayLayers = 1;
     img_ci.samples       = VK_SAMPLE_COUNT_1_BIT;
     img_ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
     img_ci.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     img_ci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(pp.device, &img_ci, nullptr, &pp.lut_image) != VK_SUCCESS) {
-        std::cerr << "[PostProcess] Failed to create AgX LUT 3D image\n";
-        return false;
-    }
+    if (vkCreateImage(device, &img_ci, nullptr, &out_image) != VK_SUCCESS) return false;
 
     VkMemoryRequirements mem_req;
-    vkGetImageMemoryRequirements(pp.device, pp.lut_image, &mem_req);
+    vkGetImageMemoryRequirements(device, out_image, &mem_req);
     VkMemoryAllocateInfo alloc_i{};
     alloc_i.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_i.allocationSize  = mem_req.size;
     alloc_i.memoryTypeIndex = find_memory_type(phys, mem_req.memoryTypeBits,
                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vkAllocateMemory(pp.device, &alloc_i, nullptr, &pp.lut_memory);
-    vkBindImageMemory(pp.device, pp.lut_image, pp.lut_memory, 0);
+    vkAllocateMemory(device, &alloc_i, nullptr, &out_memory);
+    vkBindImageMemory(device, out_image, out_memory, 0);
 
-    // ── Upload via staging buffer ─────────────────────────────────────────────
+    // ── Staging upload ────────────────────────────────────────────────────────
     VkDeviceSize buf_size = data.size() * sizeof(float);
+    VkBuffer stg_buf; VkDeviceMemory stg_mem;
+    {
+        VkBufferCreateInfo bc{};
+        bc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bc.size  = buf_size;
+        bc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(device, &bc, nullptr, &stg_buf);
+        VkMemoryRequirements smr;
+        vkGetBufferMemoryRequirements(device, stg_buf, &smr);
+        VkMemoryAllocateInfo sai{};
+        sai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        sai.allocationSize = smr.size;
+        sai.memoryTypeIndex = find_memory_type(phys, smr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device, &sai, nullptr, &stg_mem);
+        vkBindBufferMemory(device, stg_buf, stg_mem, 0);
+        void* mapped;
+        vkMapMemory(device, stg_mem, 0, buf_size, 0, &mapped);
+        memcpy(mapped, data.data(), buf_size);
+        vkUnmapMemory(device, stg_mem);
+    }
 
-    VkBuffer       stg_buf; VkDeviceMemory stg_mem;
-    VkBufferCreateInfo bc{};
-    bc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bc.size  = buf_size;
-    bc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    vkCreateBuffer(pp.device, &bc, nullptr, &stg_buf);
-    VkMemoryRequirements smr;
-    vkGetBufferMemoryRequirements(pp.device, stg_buf, &smr);
-    VkMemoryAllocateInfo sai{};
-    sai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    sai.allocationSize = smr.size;
-    sai.memoryTypeIndex = find_memory_type(phys, smr.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(pp.device, &sai, nullptr, &stg_mem);
-    vkBindBufferMemory(pp.device, stg_buf, stg_mem, 0);
-
-    void* mapped;
-    vkMapMemory(pp.device, stg_mem, 0, buf_size, 0, &mapped);
-    memcpy(mapped, data.data(), buf_size);
-    vkUnmapMemory(pp.device, stg_mem);
-
-    // ── One-time command: transition + copy + transition ─────────────────────
     VkCommandBuffer cb;
-    begin_one_time(pp.device, cmd_pool, cb);
+    begin_one_time(device, cmd_pool, cb);
 
-    // Transition: UNDEFINED → TRANSFER_DST
-    VkImageMemoryBarrier bar1{};
-    bar1.sType                           = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    bar1.oldLayout                       = VK_IMAGE_LAYOUT_UNDEFINED;
-    bar1.newLayout                       = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    bar1.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-    bar1.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-    bar1.image                           = pp.lut_image;
-    bar1.subresourceRange                = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    bar1.srcAccessMask                   = 0;
-    bar1.dstAccessMask                   = VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkImageMemoryBarrier bar{};
+    bar.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image            = out_image;
+    bar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    bar.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+    bar.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.srcAccessMask    = 0;
+    bar.dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,nullptr,0,nullptr,1,&bar1);
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,nullptr,0,nullptr,1,&bar);
 
-    // Copy buffer → 3D image
     VkBufferImageCopy region{};
-    region.bufferOffset      = 0;
-    region.bufferRowLength   = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageOffset       = {0, 0, 0};
-    region.imageExtent       = { (uint32_t)N, (uint32_t)N, (uint32_t)N };
-    vkCmdCopyBufferToImage(cb, stg_buf, pp.lut_image,
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { (uint32_t)N, (uint32_t)N, (uint32_t)N };
+    vkCmdCopyBufferToImage(cb, stg_buf, out_image,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // Transition: TRANSFER_DST → SHADER_READ_ONLY
-    VkImageMemoryBarrier bar2 = bar1;
-    bar2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    bar2.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    bar2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    bar2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bar.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,nullptr,0,nullptr,1,&bar2);
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,nullptr,0,nullptr,1,&bar);
 
-    end_one_time(pp.device, cmd_pool, cb, queue);
+    end_one_time(device, cmd_pool, cb, queue);
+    vkDestroyBuffer(device, stg_buf, nullptr);
+    vkFreeMemory   (device, stg_mem, nullptr);
 
-    // Cleanup staging
-    vkDestroyBuffer(pp.device, stg_buf, nullptr);
-    vkFreeMemory(pp.device, stg_mem, nullptr);
-
-    // ── Create image view (3D) ────────────────────────────────────────────────
+    // ── Image view (3D) ───────────────────────────────────────────────────────
     VkImageViewCreateInfo view_ci{};
-    view_ci.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_ci.image                           = pp.lut_image;
-    view_ci.viewType                        = VK_IMAGE_VIEW_TYPE_3D;
-    view_ci.format                          = VK_FORMAT_R32G32B32A32_SFLOAT;
-    view_ci.subresourceRange                = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCreateImageView(pp.device, &view_ci, nullptr, &pp.lut_view);
+    view_ci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image            = out_image;
+    view_ci.viewType         = VK_IMAGE_VIEW_TYPE_3D;
+    view_ci.format           = VK_FORMAT_R32G32B32A32_SFLOAT;
+    view_ci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCreateImageView(device, &view_ci, nullptr, &out_view);
 
-    pp.lut_size = N;
-    std::cout << "[PostProcess] AgX LUT loaded: " << N << "x" << N << "x" << N << "\n";
+    out_size = N;
+    std::cout << "[PostProcess] LUT loaded (" << cube_path << "): "
+              << N << "x" << N << "x" << N << "\n";
     return true;
 }
 
@@ -375,9 +357,8 @@ static void update_compute_desc(PostProcess& pp,
     write2.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     write2.pImageInfo      = &ldr_info;
 
-    // Binding 3: AgX 3D LUT (sampled image only — shader reuses binding-1 sampler)
+    // Binding 3: AgX 3D LUT
     VkDescriptorImageInfo lut_info{};
-    lut_info.sampler     = VK_NULL_HANDLE;
     lut_info.imageView   = pp.lut_view;
     lut_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
@@ -385,14 +366,28 @@ static void update_compute_desc(PostProcess& pp,
     write3.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write3.dstSet          = pp.compute_desc;
     write3.dstBinding      = 3;
-    write3.dstArrayElement = 0;
     write3.descriptorCount = 1;
     write3.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write3.pImageInfo      = &lut_info;
 
-    uint32_t n_writes = (pp.lut_view != VK_NULL_HANDLE) ? 4 : 3;
-    VkWriteDescriptorSet writes[] = { write0, write1, write2, write3 };
-    vkUpdateDescriptorSets(pp.device, n_writes, writes, 0, nullptr);
+    // Binding 4: Khronos PBR Neutral 3D LUT
+    VkDescriptorImageInfo pbr_info{};
+    pbr_info.imageView   = pp.pbr_view;
+    pbr_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write4{};
+    write4.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write4.dstSet          = pp.compute_desc;
+    write4.dstBinding      = 4;
+    write4.descriptorCount = 1;
+    write4.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write4.pImageInfo      = &pbr_info;
+
+    // Only write LUT descriptors if the views are valid
+    std::vector<VkWriteDescriptorSet> writes = { write0, write1, write2 };
+    if (pp.lut_view) writes.push_back(write3);
+    if (pp.pbr_view) writes.push_back(write4);
+    vkUpdateDescriptorSets(pp.device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -463,17 +458,26 @@ PostProcess post_process_create(
     bindings[2].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[2].pImmutableSamplers = nullptr;
 
-    // Binding 3: AgX 3D LUT (sampled image only — reuses binding-1 sampler in shader)
+    // Binding 3: AgX 3D LUT (sampled image, reuses binding-1 sampler in shader)
     bindings[3].binding            = 3;
     bindings[3].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[3].descriptorCount    = 1;
     bindings[3].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[3].pImmutableSamplers = nullptr;
 
+    VkDescriptorSetLayoutBinding b4{};
+    b4.binding            = 4;
+    b4.descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b4.descriptorCount    = 1;
+    b4.stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
+    b4.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutBinding all_bindings[5] = { bindings[0], bindings[1], bindings[2], bindings[3], b4 };
+
     VkDescriptorSetLayoutCreateInfo dsl_ci{};
     dsl_ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 4;
-    dsl_ci.pBindings    = bindings;
+    dsl_ci.bindingCount = 5;
+    dsl_ci.pBindings    = all_bindings;
     vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &pp.dsl);
 
     // ── Create push constant range ───────────────────────────────────────────
@@ -507,7 +511,7 @@ PostProcess post_process_create(
     // ── Create descriptor pool ───────────────────────────────────────────────
     VkDescriptorPoolSize pool_sizes[3] = {};
     pool_sizes[0].type            = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[0].descriptorCount = 4;  // binding 0 (HDR) + binding 3 (LUT)
+    pool_sizes[0].descriptorCount = 6;  // binding 0 (HDR) + binding 3 (AgX LUT) + binding 4 (PBR LUT)
     pool_sizes[1].type            = VK_DESCRIPTOR_TYPE_SAMPLER;
     pool_sizes[1].descriptorCount = 2;
     pool_sizes[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -532,18 +536,27 @@ PostProcess post_process_create(
     // ── Create display image ─────────────────────────────────────────────────
     create_display_image(pp, phys, cmd_pool, queue);
 
-    // ── Load AgX 3D LUT ──────────────────────────────────────────────────────
-    // Look next to exe first, then fall back to Blender installation.
-    {
-        auto lut_next_to_exe = exe_dir() / "luts" / "AgX_Base_sRGB.cube";
-        const std::string blender_lut =
-            "C:/Program Files/Blender Foundation/Blender 5.0/5.0/datafiles/colormanagement/luts/AgX_Base_sRGB.cube";
-        bool loaded = load_agx_lut(pp, phys, cmd_pool, queue, lut_next_to_exe.string());
-        if (!loaded)
-            loaded = load_agx_lut(pp, phys, cmd_pool, queue, blender_lut);
-        if (!loaded)
-            std::cerr << "[PostProcess] WARNING: AgX LUT not loaded — AgX mode will use analytical fallback\n";
-    }
+    // ── Load 3D LUTs from colormanagement/ ──────────────────────────────────
+    // Look in colormanagement/ next to exe, then Blender installation.
+    auto cm_local   = exe_dir() / "colormanagement";
+    const std::string cm_blender =
+        "C:/Program Files/Blender Foundation/Blender 5.0/5.0/datafiles/colormanagement";
+
+    auto try_load = [&](const std::string& name,
+                        VkImage& img, VkDeviceMemory& mem, VkImageView& view, int& sz) {
+        auto p1 = (cm_local   / "luts" / name).string();
+        auto p2 =  cm_blender + "/luts/" + name;
+        if (!load_3d_cube_lut(device, phys, cmd_pool, queue, p1, img, mem, view, sz))
+            load_3d_cube_lut(device, phys, cmd_pool, queue, p2, img, mem, view, sz);
+    };
+
+    try_load("AgX_Base_sRGB.cube",  pp.lut_image, pp.lut_memory, pp.lut_view, pp.lut_size);
+    try_load("pbrNeutral.cube",     pp.pbr_image, pp.pbr_memory, pp.pbr_view, pp.pbr_size);
+
+    if (!pp.lut_size)
+        std::cerr << "[PostProcess] WARNING: AgX LUT not loaded — AgX mode will use fallback\n";
+    if (!pp.pbr_size)
+        std::cerr << "[PostProcess] WARNING: pbrNeutral LUT not loaded — KhronosPBR will use fallback\n";
 
     // ── Write descriptor set ─────────────────────────────────────────────────
     update_compute_desc(pp, hdr_view, hdr_sampler);
@@ -714,10 +727,13 @@ void post_process_destroy(PostProcess& pp)
     if (pp.display_image   != VK_NULL_HANDLE) vkDestroyImage    (pp.device, pp.display_image,   nullptr);
     if (pp.display_memory  != VK_NULL_HANDLE) vkFreeMemory      (pp.device, pp.display_memory,  nullptr);
 
-    // Destroy AgX LUT resources
-    if (pp.lut_view   != VK_NULL_HANDLE) vkDestroyImageView(pp.device, pp.lut_view,  nullptr);
-    if (pp.lut_image  != VK_NULL_HANDLE) vkDestroyImage    (pp.device, pp.lut_image, nullptr);
+    // Destroy LUT resources
+    if (pp.lut_view   != VK_NULL_HANDLE) vkDestroyImageView(pp.device, pp.lut_view,   nullptr);
+    if (pp.lut_image  != VK_NULL_HANDLE) vkDestroyImage    (pp.device, pp.lut_image,  nullptr);
     if (pp.lut_memory != VK_NULL_HANDLE) vkFreeMemory      (pp.device, pp.lut_memory, nullptr);
+    if (pp.pbr_view   != VK_NULL_HANDLE) vkDestroyImageView(pp.device, pp.pbr_view,   nullptr);
+    if (pp.pbr_image  != VK_NULL_HANDLE) vkDestroyImage    (pp.device, pp.pbr_image,  nullptr);
+    if (pp.pbr_memory != VK_NULL_HANDLE) vkFreeMemory      (pp.device, pp.pbr_memory, nullptr);
 
     // Destroy Vulkan pipeline objects
     if (pp.pipeline != VK_NULL_HANDLE) vkDestroyPipeline       (pp.device, pp.pipeline, nullptr);

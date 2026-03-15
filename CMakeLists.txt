@@ -205,12 +205,12 @@ add_custom_command(TARGET pathtracer POST_BUILD
     COMMENT "Copying MayaUSD runtime DLLs"
 )
 
-# Copy AgX LUT next to the exe (luts/ subfolder)
+# Copy full Blender color management folder next to the exe
 add_custom_command(TARGET pathtracer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/luts"
-        "$<TARGET_FILE_DIR:pathtracer>/luts"
-    COMMENT "Copying color management LUTs"
+        "${CMAKE_SOURCE_DIR}/colormanagement"
+        "$<TARGET_FILE_DIR:pathtracer>/colormanagement"
+    COMMENT "Copying Blender color management (OCIO config + LUTs)"
 )
 
 # Enable device-side linking so __device__ functions can be called across .cu TUs

@@ -33,8 +33,12 @@ struct PostProcess {
     VkImage               lut_image       = VK_NULL_HANDLE;
     VkDeviceMemory        lut_memory      = VK_NULL_HANDLE;
     VkImageView           lut_view        = VK_NULL_HANDLE;
-    VkSampler             lut_sampler     = VK_NULL_HANDLE;
     int                   lut_size        = 0;  // N for NxNxN (0 = not loaded)
+    // Khronos PBR Neutral 3D LUT (binding 4) — Blender pbrNeutral.cube
+    VkImage               pbr_image       = VK_NULL_HANDLE;
+    VkDeviceMemory        pbr_memory      = VK_NULL_HANDLE;
+    VkImageView           pbr_view        = VK_NULL_HANDLE;
+    int                   pbr_size        = 0;
     int width  = 0;
     int height = 0;
 };

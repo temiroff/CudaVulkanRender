@@ -12,8 +12,10 @@
 [[vk::binding(1, 0)]] SamplerState hdr_sampler;
 // Binding 2: storage image  (VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
 [[vk::binding(2, 0)]] RWTexture2D<float4> ldr_output;
-// Binding 3: AgX 3D LUT     (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampled via binding 1)
+// Binding 3: AgX 3D LUT         (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampled via binding 1)
 [[vk::binding(3, 0)]] Texture3D<float4> agx_lut;
+// Binding 4: Khronos PBR Neutral (VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampled via binding 1)
+[[vk::binding(4, 0)]] Texture3D<float4> pbr_lut;
 
 // ── Push constants ───────────────────────────────────────────────────────────
 
@@ -81,28 +83,21 @@ float3 tonemap_filmic(float3 x)
     return clamp(r, float3(0.f, 0.f, 0.f), float3(1.f, 1.f, 1.f));
 }
 
-// Mode 5: Khronos PBR Neutral — spec from KhronosGroup/ToneMapping (2023).
-// Preserves low-luminance colors exactly; gently compresses highlights.
+// Mode 5: Khronos PBR Neutral — uses Blender's pbrNeutral.cube LUT (binding 4).
+// Pipeline (from Blender OCIO config — Khronos PBR Neutral sRGB display colorspace):
+//   1. Log2 normalize with [-9, 10] (19 stops)
+//   2. Sample pbrNeutral.cube 3D LUT — output is linear Rec.709
+//   3. Output linear (hardware sRGB OETF applied by swapchain)
 float3 tonemap_khronos_pbr(float3 color)
 {
     color = max(color, float3(0.f, 0.f, 0.f));
-    const float startCompression = 0.8f - 0.04f;   // = 0.76
-    const float desaturation     = 0.15f;
 
-    // Black-point offset (removes muddy shadow bias)
-    float x = min(color.r, min(color.g, color.b));
-    float offset = (x < 0.08f) ? (x - 6.25f * x * x) : 0.04f;
-    color -= offset;
+    // Log2 normalize: (log2(x) - (-9)) / (10 - (-9)) = (log2(x) + 9) / 19
+    float3 log_c = (log2(max(color, float3(1e-10f, 1e-10f, 1e-10f))) + 9.f) / 19.f;
+    log_c = clamp(log_c, float3(0.f, 0.f, 0.f), float3(1.f, 1.f, 1.f));
 
-    float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression) return color;
-
-    const float d    = 1.f - startCompression;
-    float newPeak    = 1.f - d * d / (peak + d - startCompression);
-    color           *= newPeak / peak;
-
-    float g = 1.f - 1.f / (desaturation * (peak - newPeak) + 1.f);
-    return lerp(color, float3(newPeak, newPeak, newPeak), g);
+    // Sample LUT — output is linear Rec.709 (no gamma decode needed)
+    return pbr_lut.SampleLevel(hdr_sampler, log_c, 0).rgb;
 }
 
 // Mode 3: AgX — exact Blender 5.0 color management.
