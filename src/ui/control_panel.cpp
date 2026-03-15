@@ -549,36 +549,54 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── DLSS ─────────────────────────────────
-        ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "DLSS / Resolution Scale");
+        // ── DLSS / Resolution Scale ───────────────
 #ifdef DLSS_ENABLED
-        ImGui::SameLine();
-        ImGui::TextDisabled("(NGX SDK found)");
+        ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "DLSS (NGX)");
         cam_changed |= ImGui::Checkbox("Enable DLSS##dlss", &s.dlss_enabled);
-        if (s.dlss_enabled) {
-            ImGui::Indent(12.f);
-            static const char* qnames[] = { "Performance (50%)", "Balanced (67%)", "Quality (75%)" };
-            cam_changed |= ImGui::Combo("Quality##dq", &s.dlss_quality, qnames, 3);
-            ImGui::Unindent(12.f);
-        }
 #else
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1.f), "(NGX SDK not found)");
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
-        bool _dummy_dlss = false;
-        ImGui::Checkbox("Enable DLSS##dlss", &_dummy_dlss);
-        ImGui::PopStyleVar();
-        // Software resolution scaling still works without the NGX SDK
-        ImGui::TextDisabled("Resolution scaling (no neural upscale):");
-        cam_changed |= ImGui::Checkbox("Resolution Scale##rs_sw", &s.dlss_enabled);
+        ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "Resolution Scale");
+        cam_changed |= ImGui::Checkbox("Enable##rs_sw", &s.dlss_enabled);
+#endif
         if (s.dlss_enabled) {
             ImGui::Indent(12.f);
-            static const char* qnames[] = { "50% (fast)", "67% (balanced)", "75% (quality)" };
-            cam_changed |= ImGui::Combo("Scale##dq", &s.dlss_quality, qnames, 3);
-            ImGui::TextDisabled("Bilinear upscale (install NGX SDK for neural)");
+
+            // Continuous scale slider: 1% → 100%
+            int pct = (int)std::roundf(s.dlss_scale * 100.f);
+            if (ImGui::SliderInt("Render %##dlss_pct", &pct, 1, 100, "%d%%")) {
+                s.dlss_scale = pct / 100.f;
+                // Derive quality preset for DLSS SDK (snaps to nearest preset)
+                if      (pct <= 58) s.dlss_quality = 0;  // Performance ~50%
+                else if (pct <= 71) s.dlss_quality = 1;  // Balanced    ~67%
+                else                s.dlss_quality = 2;  // Quality     ~75%
+                cam_changed = true;
+            }
+
+            // Visual marker lines at the 3 DLSS presets
+            float avail = ImGui::GetContentRegionAvail().x;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float bar_y = p.y - ImGui::GetTextLineHeight() * 0.5f;
+            auto mark = [&](float frac, const char* label) {
+                float x = p.x + frac * avail;
+                dl->AddLine(ImVec2(x, bar_y - 4.f), ImVec2(x, bar_y + 4.f),
+                            IM_COL32(120,220,120,180), 1.5f);
+                dl->AddText(ImVec2(x - 4.f, bar_y - 14.f),
+                            IM_COL32(140,220,140,200), label);
+            };
+            mark(0.50f, "50");
+            mark(0.67f, "67");
+            mark(0.75f, "75");
+
+            // Show current render resolution
+            ImGui::TextDisabled("~%d x %d px (of viewport)",
+                (int)(s.dlss_scale * 1920), (int)(s.dlss_scale * 1080));
+#ifndef DLSS_ENABLED
+            ImGui::TextDisabled("Bilinear upscale. NGX SDK = neural DLSS.");
+#endif
             ImGui::Unindent(12.f);
         }
-        ImGui::TextDisabled("For DLSS: get NGX SDK from developer.nvidia.com");
+#ifndef DLSS_ENABLED
+        ImGui::TextDisabled("For neural DLSS: get NGX SDK from developer.nvidia.com");
 #endif
     }
 

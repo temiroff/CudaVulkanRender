@@ -1926,9 +1926,11 @@ int main() {
         int render_w = rt_w, render_h = rt_h;
         if (ctrl.dlss_enabled) {
 #ifdef DLSS_ENABLED
-            // Init DLSS on first enable or quality change
-            static int s_last_dlss_quality = -1;
-            if (!dlss_active || s_last_dlss_quality != ctrl.dlss_quality) {
+            // Init DLSS on first enable or quality/scale change
+            static int   s_last_dlss_quality = -1;
+            static float s_last_dlss_scale   = -1.f;
+            bool scale_changed = (s_last_dlss_scale != ctrl.dlss_scale);
+            if (!dlss_active || s_last_dlss_quality != ctrl.dlss_quality || scale_changed) {
                 dlss_free(dlss);
                 dlss_active = dlss_init(dlss,
                     vk.instance, vk.physicalDevice, vk.device,
@@ -1936,11 +1938,8 @@ int main() {
                     rt_w, rt_h, ctrl.dlss_quality,
                     render_w, render_h);
                 s_last_dlss_quality = ctrl.dlss_quality;
+                s_last_dlss_scale   = ctrl.dlss_scale;
                 if (!dlss_active) {
-                    // DLSS init failed — render at full resolution.
-                    // Software downscale without a real upscaler just writes a partial
-                    // render_w×render_h patch in the top-left of interop.image, which
-                    // looks like a "small render" in the corner.
                     render_w = rt_w;
                     render_h = rt_h;
                     fprintf(stderr, "[dlss] init failed — falling back to full-resolution render\n");
@@ -1950,8 +1949,8 @@ int main() {
                 render_h = dlss.render_h;
             }
 #else
-            // Software bilinear scaling (no NGX SDK)
-            float sc = dlss_scale_factor(ctrl.dlss_quality);
+            // Software bilinear scaling — use continuous slider value directly
+            float sc = std::max(0.01f, std::min(1.f, ctrl.dlss_scale));
             render_w = std::max(1, (int)(rt_w * sc));
             render_h = std::max(1, (int)(rt_h * sc));
 #endif

@@ -100,10 +100,11 @@ struct ControlPanelState {
     bool optix_enabled     = false;
 
     // DLSS / Resolution scaling
-    bool dlss_enabled      = false;
-    int  dlss_quality      = 1;     // 0=performance(50%), 1=balanced(67%), 2=quality(75%)
+    bool  dlss_enabled     = false;
+    float dlss_scale       = 0.5f;  // 0.01..1.0 — render resolution as fraction of viewport
+    int   dlss_quality     = 1;     // derived from dlss_scale for DLSS SDK preset selection
     // dlss_has_sdk: set true by main if DLSS_ENABLED is defined
-    bool dlss_has_sdk      = false;
+    bool  dlss_has_sdk     = false;
 
     // Per-feature FPS baselines for comparison
     float fps_baseline  = 0.f;  // measured before any feature is on
