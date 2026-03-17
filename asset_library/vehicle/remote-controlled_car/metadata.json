@@ -1,0 +1,12 @@
+{
+  "name": "remote-controlled_car",
+  "category": "vehicle",
+  "object": "remote-controlled car",
+  "description": "A colorful, hand-painted remote-controlled car with a detailed design, featuring a vibrant blue body with red and yellow accents, and a red and yellow spoiler. It has a sleek, aerodynamic shape and is equipped with a small propeller at the front.",
+  "tags": "remote control, car, RC, vehicle, paint, design, propeller, aerodynamic, sporty",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\toy_car.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

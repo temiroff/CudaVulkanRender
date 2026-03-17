@@ -1,0 +1,12 @@
+{
+  "name": "basketball",
+  "category": "prop",
+  "object": "basketball",
+  "description": "A brown leather basketball with black stitching, suspended in mid-air. The ball has a smooth texture and appears to be new with no visible wear. It is positioned against a blurred background of a parking lot.",
+  "tags": "basketball, leather, sports, mid-air, parking lot, urban, sports equipment, new, smooth",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\ball_basketball_realistic.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

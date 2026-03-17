@@ -627,6 +627,15 @@ void post_process_resize(
         VK_IMAGE_LAYOUT_GENERAL);
 }
 
+void post_process_set_input(
+    PostProcess& pp,
+    VkImageView  hdr_view,
+    VkSampler    hdr_sampler)
+{
+    if (pp.device == VK_NULL_HANDLE || pp.compute_desc == VK_NULL_HANDLE) return;
+    update_compute_desc(pp, hdr_view, hdr_sampler);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  post_process_dispatch
 // ─────────────────────────────────────────────────────────────────────────────
@@ -742,4 +751,112 @@ void post_process_destroy(PostProcess& pp)
     if (pp.pool     != VK_NULL_HANDLE) vkDestroyDescriptorPool  (pp.device, pp.pool,     nullptr);
 
     pp = {};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  post_process_readback
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::vector<uint16_t> post_process_readback(
+    PostProcess&     pp,
+    VkPhysicalDevice phys,
+    VkCommandPool    cmd_pool,
+    VkQueue          queue)
+{
+    if (pp.display_image == VK_NULL_HANDLE || pp.width == 0 || pp.height == 0)
+        return {};
+
+    // R16G16B16A16_SFLOAT = 8 bytes per pixel
+    VkDeviceSize buf_size = (VkDeviceSize)pp.width * pp.height * 8;
+
+    // Create a host-visible staging buffer
+    VkBuffer       staging_buf  = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem  = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bci{};
+    bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size        = buf_size;
+    bci.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(pp.device, &bci, nullptr, &staging_buf);
+
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(pp.device, staging_buf, &mr);
+    VkMemoryAllocateInfo mai{};
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize  = mr.size;
+    mai.memoryTypeIndex = find_memory_type(phys, mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(pp.device, &mai, nullptr, &staging_mem);
+    vkBindBufferMemory(pp.device, staging_buf, staging_mem, 0);
+
+    // Record a one-shot command buffer
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool        = cmd_pool;
+    cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(pp.device, &cbai, &cb);
+
+    VkCommandBufferBeginInfo cbbi{};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &cbbi);
+
+    // Transition display_image SHADER_READ_ONLY → TRANSFER_SRC
+    VkImageMemoryBarrier to_src{};
+    to_src.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_src.srcAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+    to_src.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    to_src.oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_src.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_src.image               = pp.display_image;
+    to_src.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &to_src);
+
+    // Copy image → buffer
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { (uint32_t)pp.width, (uint32_t)pp.height, 1 };
+    vkCmdCopyImageToBuffer(cb, pp.display_image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 1, &region);
+
+    // Transition back TRANSFER_SRC → SHADER_READ_ONLY
+    VkImageMemoryBarrier to_read{};
+    to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_read.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+    to_read.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_read.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.image               = pp.display_image;
+    to_read.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &to_read);
+
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cb;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    vkFreeCommandBuffers(pp.device, cmd_pool, 1, &cb);
+
+    // Map and copy to output vector (RGBA16F per pixel)
+    std::vector<uint16_t> out((size_t)pp.width * pp.height * 4);
+    void* mapped = nullptr;
+    vkMapMemory(pp.device, staging_mem, 0, buf_size, 0, &mapped);
+    memcpy(out.data(), mapped, buf_size);
+    vkUnmapMemory(pp.device, staging_mem);
+
+    vkDestroyBuffer(pp.device, staging_buf, nullptr);
+    vkFreeMemory   (pp.device, staging_mem, nullptr);
+
+    return out;
 }

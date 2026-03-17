@@ -960,7 +960,7 @@ int main() {
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
         bool cam_changed = control_panel_draw(ctrl);
-        viewport_draw(vp, (ctrl.post_enabled && post.imgui_desc) ? post.imgui_desc : interop.descriptor);
+        viewport_draw(vp, (ctrl.post_enabled && post.imgui_desc) ? post.imgui_desc : interop.descriptor, ctrl);
         // Outliner — selection from here doesn't reset accumulation
         outliner_draw(prims_sorted, mesh.objects,
                       ctrl.selected_sphere, ctrl.selected_mesh_obj, multi_sel);
@@ -1217,16 +1217,13 @@ int main() {
                          "Recognizing [%d/%d]...",
                          batch.current_idx + 1, (int)batch.files.size());
             } else {
-                // Skip NIM: use filename as nice_name
+                // Skip NIM: use filename as description
                 batch.nim_result = {};
                 auto stem = std::filesystem::path(batch.files[batch.current_idx]).stem().string();
                 snprintf(batch.nim_result.category,    sizeof(batch.nim_result.category),    "prop");
-                snprintf(batch.nim_result.nice_name,   sizeof(batch.nim_result.nice_name),   "%s", stem.c_str());
+                snprintf(batch.nim_result.description, sizeof(batch.nim_result.description), "%s", stem.c_str());
                 snprintf(batch.nim_result.object_type, sizeof(batch.nim_result.object_type), "%s", stem.c_str());
-                // Grab pixels and save
-                std::vector<float> px((size_t)rt_w * rt_h * 4);
-                cudaMemcpy(px.data(), d_accum, px.size() * sizeof(float), cudaMemcpyDeviceToHost);
-                batch_save(batch, px.data(), rt_w, rt_h);
+                batch_save(batch);
                 // Advance
                 batch.current_idx++;
                 if (batch.current_idx >= (int)batch.files.size()) {
@@ -1267,13 +1264,10 @@ int main() {
                 // Fallback to filename
                 auto stem = std::filesystem::path(batch.files[batch.current_idx]).stem().string();
                 snprintf(batch.nim_result.category,    sizeof(batch.nim_result.category),    "prop");
-                snprintf(batch.nim_result.nice_name,   sizeof(batch.nim_result.nice_name),   "%s", stem.c_str());
+                snprintf(batch.nim_result.description, sizeof(batch.nim_result.description), "%s", stem.c_str());
                 snprintf(batch.nim_result.object_type, sizeof(batch.nim_result.object_type), "%s", stem.c_str());
             }
-            // Save render + metadata
-            std::vector<float> px((size_t)rt_w * rt_h * 4);
-            cudaMemcpy(px.data(), d_accum, px.size() * sizeof(float), cudaMemcpyDeviceToHost);
-            batch_save(batch, px.data(), rt_w, rt_h);
+            batch_save(batch);
             // Advance to next model
             batch.current_idx++;
             if (batch.current_idx >= (int)batch.files.size()) {
@@ -1527,7 +1521,7 @@ int main() {
         bool   mesh_moved    = false;   // set when gizmo translates mesh objects
 
         // ── Sphere gizmo ──────────────────────────────────────────────
-        if (ctrl.selected_sphere >= 0 && ctrl.interact_mode == InteractMode::Move && !alt_orbit) {
+        if (ctrl.overlay_gizmo && ctrl.selected_sphere >= 0 && ctrl.interact_mode == InteractMode::Move && !alt_orbit) {
             gizmo_result = draw_move_gizmo(
                 ImGui::GetForegroundDrawList(), cam,
                 prims_sorted[ctrl.selected_sphere].center,
@@ -1554,7 +1548,7 @@ int main() {
         }
 
         // ── Mesh object gizmo ─────────────────────────────────────────
-        if (ctrl.selected_mesh_obj >= 0 &&
+        if (ctrl.overlay_gizmo && ctrl.selected_mesh_obj >= 0 &&
             ctrl.selected_mesh_obj < (int)mesh.objects.size() &&
             !multi_sel.empty() &&
             ctrl.interact_mode == InteractMode::Move && !alt_orbit)
@@ -1639,7 +1633,7 @@ int main() {
             //   • N>1 objects selected → merged silhouette (inner edges excluded)
             //   • Camera moving       → draw stale cached edges (no recompute)
             //   • Camera stable ≥ N frames → recompute
-            if (!multi_sel.empty() && !mesh.all_prims.empty()) {
+            if (ctrl.overlay_selection && !multi_sel.empty() && !mesh.all_prims.empty()) {
                 struct SilEntry {
                     std::vector<std::pair<float3,float3>> edges;
                     float3 mn, mx;
@@ -1718,7 +1712,7 @@ int main() {
             }
 
             // Draw ring around selected sphere
-            if (ctrl.selected_sphere >= 0 && ctrl.selected_sphere < (int)prims_sorted.size()) {
+            if (ctrl.overlay_selection && ctrl.selected_sphere >= 0 && ctrl.selected_sphere < (int)prims_sorted.size()) {
                 const Sphere& sel = prims_sorted[ctrl.selected_sphere];
                 ImVec2 cs;
                 float depth = world_to_screen(cam, sel.center, vp.origin, vp.size,
@@ -1740,7 +1734,7 @@ int main() {
             }
 
             // Orbit pivot crosshair (orbit mode only)
-            if (ctrl.interact_mode == InteractMode::Orbit) {
+            if (ctrl.overlay_orbit && ctrl.interact_mode == InteractMode::Orbit) {
                 float3 piv = { ctrl.orbit_pivot[0], ctrl.orbit_pivot[1], ctrl.orbit_pivot[2] };
                 ImVec2 ps;
                 if (world_to_screen(cam, piv, vp.origin, vp.size, ctrl.vfov, aspect, ps) > 0.f) {
@@ -1751,48 +1745,54 @@ int main() {
                 }
             }
             // ── NIM VLM result overlay (bottom-left of viewport) ─────────
-            if (ctrl.nim_result.success && ctrl.nim_result.nice_name[0] != '\0') {
-                const float pad = 10.f;
-                const float lh  = ImGui::GetTextLineHeight();
+            if (ctrl.overlay_nim && ctrl.nim_result.success && ctrl.nim_result.object_type[0] != '\0') {
+                const float pad     = 10.f;
+                const float fs      = ImGui::GetFontSize();
+                ImFont*     font    = ImGui::GetFont();
 
-                // Build lines
-                const char* line0 = ctrl.nim_result.nice_name;
-                char        line1[160], line2[160];
-                snprintf(line1, sizeof(line1), "Category   %s", ctrl.nim_result.category);
-                snprintf(line2, sizeof(line2), "Object       %s", ctrl.nim_result.object_type);
+                // Fixed inner width — clamp between 260 and 520, or 38% of viewport
+                float inner_w = std::max(260.f, std::min(vp.size.x * 0.38f, 520.f));
+                float box_w   = inner_w + pad * 2.f;
 
-                float w0 = ImGui::CalcTextSize(line0).x;
-                float w1 = ImGui::CalcTextSize(line1).x;
-                float w2 = ImGui::CalcTextSize(line2).x;
-                float box_w = std::max({w0, w1, w2}) + pad * 2.f;
-                float box_h = lh * 3.f + pad * 2.f + 6.f;
+                // Build text lines
+                char line_cat[160], line_obj[160], line_desc[512], line_tags[512];
+                snprintf(line_cat,  sizeof(line_cat),  "Category  %s", ctrl.nim_result.category);
+                snprintf(line_obj,  sizeof(line_obj),  "Type      %s", ctrl.nim_result.object_type);
+                snprintf(line_desc, sizeof(line_desc), "%s", ctrl.nim_result.description);
+                snprintf(line_tags, sizeof(line_tags), "Tags  %s",     ctrl.nim_result.tags);
+
+                // Measure wrapped heights
+                auto wh = [&](const char* s) {
+                    return ImGui::CalcTextSize(s, nullptr, false, inner_w).y;
+                };
+                float box_h = pad + wh(line_obj) + 2.f
+                            + 1.f + 4.f  // separator
+                            + wh(line_cat) + 2.f
+                            + wh(line_desc) + 2.f
+                            + wh(line_tags) + 2.f
+                            + pad;
 
                 float bx = vp.origin.x + pad;
                 float by = vp.origin.y + vp.size.y - pad - box_h;
 
-                // Background
-                dl->AddRectFilled(
-                    ImVec2(bx, by),
-                    ImVec2(bx + box_w, by + box_h),
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx+box_w, by+box_h),
                     IM_COL32(10, 10, 10, 180), 4.f);
-                dl->AddRect(
-                    ImVec2(bx, by),
-                    ImVec2(bx + box_w, by + box_h),
+                dl->AddRect(ImVec2(bx, by), ImVec2(bx+box_w, by+box_h),
                     IM_COL32(255, 160, 30, 120), 4.f, 0, 1.f);
 
-                // Title line (full size, orange)
-                dl->AddText(ImVec2(bx + pad, by + pad),
-                    IM_COL32(255, 200, 80, 255), line0);
+                float cy = by + pad;
+                auto draw_wrapped = [&](const char* s, ImU32 col, float gap = 2.f) {
+                    dl->AddText(font, fs, ImVec2(bx+pad, cy), col, s, nullptr, inner_w);
+                    cy += ImGui::CalcTextSize(s, nullptr, false, inner_w).y + gap;
+                };
 
-                // Separator
-                float sep_y = by + pad + lh + 3.f;
-                dl->AddLine(ImVec2(bx + pad, sep_y), ImVec2(bx + box_w - pad, sep_y),
+                draw_wrapped(line_obj, IM_COL32(255, 200, 80, 255));
+                dl->AddLine(ImVec2(bx+pad, cy+1.f), ImVec2(bx+box_w-pad, cy+1.f),
                     IM_COL32(255, 160, 30, 60), 1.f);
-
-                dl->AddText(ImVec2(bx + pad, sep_y + 4.f),
-                    IM_COL32(160, 160, 160, 220), line1);
-                dl->AddText(ImVec2(bx + pad, sep_y + 4.f + lh + 2.f),
-                    IM_COL32(210, 210, 210, 220), line2);
+                cy += 5.f;
+                draw_wrapped(line_cat,  IM_COL32(160, 160, 160, 220));
+                draw_wrapped(line_desc, IM_COL32(210, 210, 210, 220));
+                draw_wrapped(line_tags, IM_COL32(120, 180, 255, 200));
             }
 
             dl->PopClipRect();
@@ -1935,7 +1935,7 @@ int main() {
                 dlss_active = dlss_init(dlss,
                     vk.instance, vk.physicalDevice, vk.device,
                     vk.commandPool, vk.graphicsQueue,
-                    rt_w, rt_h, ctrl.dlss_quality,
+                    rt_w, rt_h, ctrl.dlss_quality, ctrl.dlss_scale,
                     render_w, render_h);
                 s_last_dlss_quality = ctrl.dlss_quality;
                 s_last_dlss_scale   = ctrl.dlss_scale;
@@ -1956,6 +1956,9 @@ int main() {
 #endif
             pt.width  = render_w;
             pt.height = render_h;
+            // When sw-scaling, pathtracer must NOT write partial pixels to the
+            // full-res surface — sw_upscale will fill it instead.
+            pt.skip_surface_write = (render_w < rt_w || render_h < rt_h) ? 1 : 0;
         } else if (dlss_active) {
             dlss_free(dlss);
             dlss_active = false;
@@ -1990,7 +1993,6 @@ int main() {
             rp.spp              = ctrl.spp;
             rp.max_depth        = ctrl.max_depth;
             rp.num_candidates   = ctrl.restir_candidates;
-            rp.spatial_reuse    = ctrl.restir_spatial;
             rp.spatial_radius   = ctrl.restir_radius;
             rp.hdri_tex         = hdri.loaded ? hdri.tex : 0;
             rp.hdri_intensity   = ctrl.hdri_intensity;
@@ -2001,6 +2003,14 @@ int main() {
         }
 
         cudaDeviceSynchronize();
+
+        // ── Software bicubic upscale (when not using neural DLSS) ────────────
+        if (ctrl.dlss_enabled && pt.skip_surface_write) {
+            pathtracer_sw_upscale(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
+            if (ctrl.dlss_debug)
+                pathtracer_sw_upscale_debug_pip(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
+        }
+
         ++frame_count;
 
         // ── Denoiser: always reads d_accum, writes to d_display ──────────────
@@ -2015,7 +2025,9 @@ int main() {
 
         // Camera/scene moved → drop stale denoised frame so the fresh noisy
         // path tracer output (already in interop.surface) shows through live.
-        if (cam_changed) d_display_valid = false;
+        // Keep last denoised frame while camera is moving — only truly invalidate when
+        // denoising is disabled (handled below). cam_changed just triggers an accumulation
+        // reset, but the previous denoised frame is still better than raw 1-sample output.
 
 #ifdef OPTIX_ENABLED
         if (ctrl.optix_enabled && optix_dn.available) {
@@ -2024,8 +2036,9 @@ int main() {
             bool run_dn = ctrl.denoise_on_demand;
             ctrl.denoise_on_demand = false;
             if (!run_dn && frame_count > 0) {
-                // Run every frame for first 16 frames to avoid visible blink on settle
-                int every = (frame_count <= 16) ? 1 : ctrl.denoise_every_n;
+                // On cam_changed (frame_count==0 after reset): always run to get fresh denoised frame
+                // first 16 frames: run every frame for fast settle; then per user setting
+                int every = (cam_changed || frame_count <= 16) ? 1 : ctrl.denoise_every_n;
                 run_dn = (frame_count % every == 0);
             }
             if (run_dn) {
@@ -2077,7 +2090,8 @@ int main() {
 
             stats_update(nvml, live_stats, hw_info,
                 render_w, render_h,
-                ctrl.optix_enabled, ctrl.dlss_enabled,
+                ctrl.optix_enabled, false /*optix_rt: sw BVH, RT cores unused*/,
+                dlss_active && ctrl.dlss_enabled,
                 mesh.num_texs > 0, hdri.loaded,
                 sz_bvh, sz_tris, sz_mats, sz_texs,
                 sz_accum, sz_rng, sz_res, sz_hdri);
@@ -2104,7 +2118,9 @@ int main() {
         if (dlss_active && ctrl.dlss_enabled) {
             dlss_upscale(dlss, cb,
                          interop.image, interop.image_view, interop.memory,
-                         ctrl.post.exposure);
+                         ctrl.post.exposure, cam,
+                         ctrl.vfov, (float)rt_w / (float)rt_h,
+                         cam_changed);
         }
 #endif
 

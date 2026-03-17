@@ -16,16 +16,18 @@
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/shader.h>
 #include <pxr/usd/usdShade/types.h>   // UsdShadeAttributeType
+#include <pxr/usd/usdShade/tokens.h>  // UsdShadeTokens->materialBind
+#include <pxr/usd/usdGeom/subset.h>   // UsdGeomSubset — per-face material bindings
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/vec2f.h>
 #include <pxr/base/vt/array.h>
-#include <pxr/usd/ar/resolver.h>      // ArGetResolver / OpenAsset for USDZ
-#include <pxr/usd/ar/asset.h>         // ArAsset::GetSize / GetBuffer (full definition)
-
 // stb_image — tinygltf already defines STB_IMAGE_IMPLEMENTATION in gltf_loader.cpp.
 // Include only the declarations here; the definitions are shared via the linker.
 #include <stb_image.h>
+
+// miniz — direct ZIP extraction for USDZ packages (already compiled via tinyexr deps)
+#include "miniz.h"
 
 #include <iostream>
 #include <unordered_map>
@@ -33,6 +35,7 @@
 #include <fstream>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
@@ -79,41 +82,115 @@ static float3 cross3(float3 a, float3 b)
 //  Texture loading
 // ─────────────────────────────────────────────
 
-// Load a texture — tries ArResolver first (handles USDZ-embedded assets),
-// then falls back to stbi_load from disk.
+// Extract a file entry from a USDZ (ZIP) archive into memory.
+// sub_path: path inside the archive (e.g. "textures/diffuse.png").
+// Falls back to case-insensitive search and basename-only match.
+static std::vector<uint8_t> extract_from_usdz(const std::string& zip_path,
+                                               const std::string& sub_path)
+{
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0))
+        return {};
+
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    auto normalize = [](std::string s) {
+        for (auto& c : s) if (c == '\\') c = '/';
+        return s;
+    };
+
+    const std::string sub_norm  = normalize(sub_path);
+    const std::string sub_lower = lower(sub_norm);
+    // basename for last-resort match
+    std::string sub_base = sub_lower;
+    auto slash = sub_base.rfind('/');
+    if (slash != std::string::npos) sub_base = sub_base.substr(slash + 1);
+
+    int idx = mz_zip_reader_locate_file(&zip, sub_norm.c_str(), nullptr, 0);
+
+    if (idx < 0) {
+        int n = (int)mz_zip_reader_get_num_files(&zip);
+        for (int i = 0; i < n; ++i) {
+            mz_zip_archive_file_stat stat{};
+            if (!mz_zip_reader_file_stat(&zip, i, &stat)) continue;
+            std::string fname = lower(normalize(stat.m_filename));
+            if (fname == sub_lower) { idx = i; break; }
+            // Match on trailing basename
+            auto sl = fname.rfind('/');
+            if (sl != std::string::npos && fname.substr(sl + 1) == sub_base)
+                idx = i;  // keep looking for a better match
+        }
+    }
+
+    if (idx < 0) { mz_zip_reader_end(&zip); return {}; }
+
+    size_t sz = 0;
+    void* data = mz_zip_reader_extract_to_heap(&zip, (mz_uint)idx, &sz, 0);
+    mz_zip_reader_end(&zip);
+    if (!data) return {};
+
+    std::vector<uint8_t> result(static_cast<uint8_t*>(data),
+                                 static_cast<uint8_t*>(data) + sz);
+    mz_free(data);
+    return result;
+}
+
+// Load a texture embedded inside a USDZ archive.
+static int load_texture_usdz(const std::string& zip_path,
+                              const std::string& sub_path,
+                              std::vector<TextureImage>& textures_out,
+                              std::unordered_map<std::string,int>& tex_cache,
+                              bool is_srgb)
+{
+    std::string cache_key = zip_path + "[" + sub_path + "]" + (is_srgb ? "|srgb" : "|lin");
+    auto it = tex_cache.find(cache_key);
+    if (it != tex_cache.end()) return it->second;
+
+    std::vector<uint8_t> bytes = extract_from_usdz(zip_path, sub_path);
+    if (bytes.empty()) {
+        std::cerr << "[usd_loader] cannot extract from USDZ '" << zip_path
+                  << "': " << sub_path << '\n';
+        tex_cache[cache_key] = -1;
+        return -1;
+    }
+
+    int w, h, ch;
+    unsigned char* stbi_data = stbi_load_from_memory(
+        bytes.data(), (int)bytes.size(), &w, &h, &ch, 4);
+    if (!stbi_data) {
+        std::cerr << "[usd_loader] stbi failed for USDZ entry: " << sub_path << '\n';
+        tex_cache[cache_key] = -1;
+        return -1;
+    }
+
+    TextureImage ti;
+    ti.width  = w;
+    ti.height = h;
+    ti.srgb   = is_srgb;
+    ti.pixels.assign(stbi_data, stbi_data + (size_t)w * h * 4);
+    stbi_image_free(stbi_data);
+
+    int idx = (int)textures_out.size();
+    textures_out.push_back(std::move(ti));
+    tex_cache[cache_key] = idx;
+    return idx;
+}
+
+// Load a texture from a plain file path.
 static int load_texture_file(const std::string& path,
                               std::vector<TextureImage>& textures_out,
                               std::unordered_map<std::string,int>& tex_cache,
                               bool is_srgb = false)
 {
     if (path.empty()) return -1;
-    // Cache key includes sRGB flag — same image can be loaded linear and sRGB
     std::string cache_key = path + (is_srgb ? "|srgb" : "|lin");
     auto it = tex_cache.find(cache_key);
     if (it != tex_cache.end()) return it->second;
 
-    unsigned char* stbi_data = nullptr;
     int w = 0, h = 0, ch = 0;
-
-    // Try OpenUSD asset resolver — resolves paths inside USDZ packages
-    // (e.g. "/scene.usdz[textures/diffuse.png]")
-    {
-        auto asset = ArGetResolver().OpenAsset(ArResolvedPath(path));
-        if (asset) {
-            size_t sz = asset->GetSize();
-            auto buf  = asset->GetBuffer();
-            if (buf && sz > 0) {
-                stbi_data = stbi_load_from_memory(
-                    reinterpret_cast<const stbi_uc*>(buf.get()),
-                    (int)sz, &w, &h, &ch, 4);
-            }
-        }
-    }
-
-    // Fallback: plain file read
-    if (!stbi_data)
-        stbi_data = stbi_load(path.c_str(), &w, &h, &ch, 4);
-
+    unsigned char* stbi_data = stbi_load(path.c_str(), &w, &h, &ch, 4);
     if (!stbi_data) {
         std::cerr << "[usd_loader] cannot load texture: " << path << '\n';
         tex_cache[cache_key] = -1;
@@ -123,7 +200,7 @@ static int load_texture_file(const std::string& path,
     TextureImage ti;
     ti.width  = w;
     ti.height = h;
-    ti.srgb   = is_srgb;  // tag so uploader applies sRGB→linear conversion
+    ti.srgb   = is_srgb;
     ti.pixels.assign(stbi_data, stbi_data + (size_t)w * h * 4);
     stbi_image_free(stbi_data);
 
@@ -149,12 +226,21 @@ static std::string resolve_asset(const std::string& asset_path,
 }
 
 // Extract UsdPreviewSurface inputs into GpuMaterial.
+// stage_path is the full file path (not dir) so we can build USDZ bracket paths.
 static GpuMaterial read_preview_surface(
     const UsdShadeShader&    shader,
-    const std::string&       stage_dir,
+    const std::string&       stage_path,
     std::vector<TextureImage>& textures_out,
     std::unordered_map<std::string,int>& tex_cache)
 {
+    namespace fs = std::filesystem;
+    const std::string stage_dir = fs::path(stage_path).parent_path().string();
+    const bool is_usdz = [&]{
+        auto ext = fs::path(stage_path).extension().string();
+        for (auto& c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return ext == ".usdz";
+    }();
+
     GpuMaterial gm{};
     gm.base_color         = make_float4(0.8f, 0.8f, 0.8f, 1.f);
     gm.metallic           = 0.f;
@@ -171,6 +257,31 @@ static GpuMaterial read_preview_surface(
         if (!fileInp) return -1;
         SdfAssetPath ap;
         if (!fileInp.Get(&ap)) return -1;
+
+        // For USDZ: textures are embedded in the ZIP; extract directly with miniz.
+        if (is_usdz) {
+            std::string asset   = ap.GetAssetPath();
+            std::string resolved = ap.GetResolvedPath();
+            std::cerr << "[usd_loader] USDZ tex  asset='" << asset
+                      << "'  resolved='" << resolved << "'\n";
+            std::string sub = asset.empty() ? resolved : asset;
+            // Case 1: bracket path "anything.usdz[sub/path.png]"
+            auto bracket = sub.find('[');
+            if (bracket != std::string::npos && sub.back() == ']')
+                sub = sub.substr(bracket + 1, sub.size() - bracket - 2);
+            else {
+                // Case 2: plain relative "./0/tex.png"
+                if (sub.size() >= 2 && sub[0] == '.' && (sub[1] == '/' || sub[1] == '\\'))
+                    sub = sub.substr(2);
+            }
+            for (auto& c : sub) if (c == '\\') c = '/';
+            std::cerr << "[usd_loader] USDZ sub='" << sub << "'\n";
+            if (!sub.empty())
+                return load_texture_usdz(stage_path, sub, textures_out, tex_cache, is_srgb);
+            return -1;
+        }
+
+        // Non-USDZ: use resolved path or relative-to-stage lookup
         std::string resolved = ap.GetResolvedPath();
         if (resolved.empty()) resolved = resolve_asset(ap.GetAssetPath(), stage_dir);
         return load_texture_file(resolved, textures_out, tex_cache, is_srgb);
@@ -221,6 +332,13 @@ static GpuMaterial read_preview_surface(
             if (src) tex_idx_out = get_tex_idx(src, /*is_srgb=*/false);
         }
     };
+
+    // Print shader id so we can confirm it's UsdPreviewSurface
+    {
+        TfToken shader_id;
+        shader.GetShaderId(&shader_id);
+        std::cerr << "[usd_loader] shader id='" << shader_id << "'\n";
+    }
 
     read_color3("diffuseColor",  gm.base_color,       /*is_srgb=*/true);
     read_color3("baseColor",     gm.base_color,       /*is_srgb=*/true);
@@ -314,6 +432,52 @@ bool usd_load(const std::string&          path,
 
     int next_obj_id = 0;
 
+    // ── Material resolution helper (reused for mesh-level and GeomSubset-level) ──
+    auto resolve_material = [&](const UsdShadeMaterial& mat) -> int {
+        if (!mat) return default_mat_idx;
+        std::string mat_path = mat.GetPrim().GetPath().GetString();
+        auto it = mat_cache.find(mat_path);
+        if (it != mat_cache.end()) return it->second;
+
+        UsdShadeShader surface_shader;
+        // Try all render-context surface outputs (universal + named)
+        for (UsdShadeOutput surf_out : {
+                mat.GetSurfaceOutput(),
+                mat.GetSurfaceOutput(UsdShadeTokens->universalRenderContext) }) {
+            if (!surf_out || surface_shader) continue;
+            // Prefer newer GetConnectedSources (plural) — works with USD 21.11+
+            UsdShadeSourceInfoVector sources =
+                UsdShadeConnectableAPI::GetConnectedSources(surf_out);
+            if (!sources.empty()) {
+                surface_shader = UsdShadeShader(sources[0].source.GetPrim());
+            } else {
+                // Legacy singular API fallback
+                UsdShadeConnectableAPI src; TfToken srcName; UsdShadeAttributeType srcType;
+                if (UsdShadeConnectableAPI::GetConnectedSource(surf_out, &src, &srcName, &srcType))
+                    surface_shader = UsdShadeShader(src.GetPrim());
+            }
+        }
+        // Last resort: walk descendants looking for a UsdPreviewSurface shader
+        if (!surface_shader) {
+            for (const UsdPrim& child : mat.GetPrim().GetDescendants()) {
+                UsdShadeShader sh(child);
+                if (!sh) continue;
+                TfToken id; sh.GetShaderId(&id);
+                if (id == TfToken("UsdPreviewSurface") ||
+                    id == TfToken("ND_UsdPreviewSurface_surfaceshader")) {
+                    surface_shader = sh; break;
+                }
+            }
+        }
+        GpuMaterial gm = surface_shader
+            ? read_preview_surface(surface_shader, path, textures_out, tex_cache)
+            : default_mat;
+        int idx = (int)materials_out.size();
+        materials_out.push_back(gm);
+        mat_cache[mat_path] = idx;
+        return idx;
+    };
+
     // Traverse with instance proxy expansion so instanced scenes (like Kitchen_set)
     // are visited. UsdTraverseInstanceProxies() opts into proxy prim traversal.
     for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
@@ -347,46 +511,67 @@ bool usd_load(const std::string&          path,
         TfToken uv_interp = UsdGeomTokens->faceVarying;
         VtIntArray uv_indices;
 
-        for (const char* name : { "st", "st0", "UVMap", "map1" }) {
-            UsdGeomPrimvar pv = pvAPI.GetPrimvar(TfToken(name));
-            if (pv && pv.IsDefined()) {
-                pv.Get(&uvs);
-                pv.GetIndices(&uv_indices);
-                uv_interp = pv.GetInterpolation();
-                break;
+        {
+            static const char* UV_NAMES[] = { "st", "st0", "UVMap", "map1", nullptr };
+            bool found_uv = false;
+            for (int ui = 0; UV_NAMES[ui]; ++ui) {
+                UsdGeomPrimvar pv = pvAPI.GetPrimvar(TfToken(UV_NAMES[ui]));
+                if (pv && pv.IsDefined()) {
+                    pv.Get(&uvs);
+                    pv.GetIndices(&uv_indices);
+                    uv_interp = pv.GetInterpolation();
+                    std::cerr << "[usd_loader] UV primvar='" << UV_NAMES[ui]
+                              << "'  count=" << uvs.size()
+                              << "  interp=" << uv_interp << '\n';
+                    found_uv = true;
+                    break;
+                }
+            }
+            if (!found_uv) {
+                // List all available primvars so we know what names to add
+                std::cerr << "[usd_loader] NO UV primvar found on '"
+                          << prim.GetPath() << "'. Available:";
+                for (auto& pv : pvAPI.GetPrimvars())
+                    std::cerr << " " << pv.GetName();
+                std::cerr << '\n';
             }
         }
 
         // ── Material ──────────────────────────────────────────────────
+        // Mesh-level fallback binding
         int mat_idx = default_mat_idx;
         {
             UsdShadeMaterialBindingAPI binding(prim);
             UsdShadeMaterial mat = binding.ComputeBoundMaterial();
             if (mat) {
-                std::string mat_path = mat.GetPrim().GetPath().GetString();
-                auto it = mat_cache.find(mat_path);
-                if (it != mat_cache.end()) {
-                    mat_idx = it->second;
-                } else {
-                    // Walk shader network for UsdPreviewSurface
-                    UsdShadeShader surface_shader;
-                    UsdShadeOutput surf_out = mat.GetSurfaceOutput();
-                    if (surf_out) {
-                        UsdShadeConnectableAPI src;
-                        TfToken srcName; UsdShadeAttributeType srcType;
-                        if (UsdShadeConnectableAPI::GetConnectedSource(
-                                surf_out, &src, &srcName, &srcType)) {
-                            surface_shader = UsdShadeShader(src.GetPrim());
-                        }
-                    }
-                    GpuMaterial gm = surface_shader
-                        ? read_preview_surface(surface_shader, stage_dir, textures_out, tex_cache)
-                        : default_mat;
-                    mat_idx = (int)materials_out.size();
-                    materials_out.push_back(gm);
-                    mat_cache[mat_path] = mat_idx;
-                }
+                mat_idx = resolve_material(mat);
+                std::cerr << "[usd_loader] mesh '" << prim.GetPath()
+                          << "' -> mat_idx=" << mat_idx << '\n';
+            } else {
+                std::cerr << "[usd_loader] mesh '" << prim.GetPath()
+                          << "' -> no mesh-level binding\n";
             }
+        }
+
+        // ── Per-face materials from GeomSubset children ───────────────
+        // Many exporters (Reality Composer, Blender, Maya) bind materials at
+        // the face-group level via UsdGeomSubset prims with familyName=materialBind.
+        std::unordered_map<int, int> face_mat_map;  // face_idx → mat_idx
+        for (const UsdPrim& child : prim.GetChildren()) {
+            if (!child.IsA<UsdGeomSubset>()) continue;
+            UsdGeomSubset subset(child);
+            TfToken family;
+            subset.GetFamilyNameAttr().Get(&family);
+            if (family != UsdShadeTokens->materialBind) continue;
+
+            VtIntArray face_indices;
+            subset.GetIndicesAttr().Get(&face_indices);
+
+            UsdShadeMaterialBindingAPI sub_bind(child);
+            UsdShadeMaterial sub_mat = sub_bind.ComputeBoundMaterial();
+            int sub_mat_idx = sub_mat ? resolve_material(sub_mat) : mat_idx;
+            for (int fi : face_indices)
+                face_mat_map[fi] = sub_mat_idx;
         }
 
         // ── Build triangles from polygons ─────────────────────────────
@@ -469,7 +654,9 @@ bool usd_load(const std::string&          path,
                 tri.t0 = make_float4(0.f, 0.f, 0.f, 0.f);  // no tangents yet
                 tri.t1 = make_float4(0.f, 0.f, 0.f, 0.f);
                 tri.t2 = make_float4(0.f, 0.f, 0.f, 0.f);
-                tri.mat_idx = mat_idx;
+                // Per-face material from GeomSubset overrides mesh-level mat
+                auto fm = face_mat_map.find(face_idx);
+                tri.mat_idx = (fm != face_mat_map.end()) ? fm->second : mat_idx;
                 tri.obj_id  = obj_id;
 
                 // AABB

@@ -1,0 +1,12 @@
+{
+  "name": "figurine",
+  "category": "prop",
+  "object": "figurine",
+  "description": "A detailed figurine of a pilot with a helmet, goggles, and a gas mask, mounted on a wooden base. The helmet is brown with a visor, and the goggles have green lenses. The base is a simple wooden block with a black hose attached.",
+  "tags": "figurine, pilot, helmet, goggles, gas mask, wooden, art, model, display, artistic",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\FlightHelmet.gltf",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

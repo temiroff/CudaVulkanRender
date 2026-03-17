@@ -1,0 +1,12 @@
+{
+  "name": "figurine",
+  "category": "character",
+  "object": "figurine",
+  "description": "A small, detailed figurine of a firefighter holding a fire extinguisher. The figurine is wearing a blue uniform with a red jacket and a blue cap with a yellow emblem. The extinguisher is red and white with a yellow nozzle.",
+  "tags": "firefighter, figurine, blue, red, uniform, cap, extinguisher, yellow, detail, character",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\toy_drummer.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

@@ -57,6 +57,53 @@ __device__ inline Ray camera_ray(const Camera& cam, float u, float v, unsigned i
     };
 }
 
+__device__ inline Ray camera_ray_center(const Camera& cam, float u, float v)
+{
+    return {
+        cam.origin,
+        normalize(cam.lower_left + u * cam.horizontal + v * cam.vertical - cam.origin)
+    };
+}
+
+__device__ inline float camera_focus_distance(const Camera& cam)
+{
+    float3 plane_center = cam.lower_left + cam.horizontal * 0.5f + cam.vertical * 0.5f;
+    return fmaxf(1e-6f, dot(cam.origin - plane_center, cam.w));
+}
+
+__device__ inline float linear_depth_to_device_depth(float z_view, float z_near, float z_far)
+{
+    z_view = fmaxf(z_view, fmaxf(1e-6f, z_near));
+    z_near = fmaxf(1e-6f, z_near);
+    z_far = fmaxf(z_near + 1e-3f, z_far);
+    float a = z_far / (z_far - z_near);
+    float b = -(z_near * z_far) / (z_far - z_near);
+    return fminf(0.99999f, fmaxf(0.f, a + b / z_view));
+}
+
+__device__ inline bool project_world_to_pixel(const Camera& cam, float3 world,
+                                              int width, int height,
+                                              float& out_x, float& out_y, float& out_depth)
+{
+    float3 rel = world - cam.origin;
+    float x_view = dot(rel, cam.u);
+    float y_view = dot(rel, cam.v);
+    float z_view = -dot(rel, cam.w);
+    if (z_view <= 1e-4f) return false;
+
+    float focus_dist = camera_focus_distance(cam);
+    float half_w = fmaxf(1e-6f, length(cam.horizontal) * 0.5f);
+    float half_h = fmaxf(1e-6f, length(cam.vertical) * 0.5f);
+    float plane_scale = focus_dist / z_view;
+    float ndc_x = (x_view * plane_scale) / half_w;
+    float ndc_y = (y_view * plane_scale) / half_h;
+
+    out_x = (ndc_x * 0.5f + 0.5f) * (float)width;
+    out_y = (0.5f - ndc_y * 0.5f) * (float)height;
+    out_depth = z_view;
+    return true;
+}
+
 // ─────────────────────────────────────────────
 //  Ray-origin offset — black terminator fix
 //  Offsets p along the geometric normal so the scattered ray never starts
@@ -151,23 +198,34 @@ __device__ bool scatter_gpu_material(
 {
     // Base color
     float4 base = mat.base_color;
-    if (mat.base_color_tex >= 0)
-        base = mul4(base, sample_tex(textures, mat.base_color_tex, rec.uv));
+    if (mat.base_color_tex >= 0) {
+        float4 tex = sample_tex(textures, mat.base_color_tex, rec.uv);
+        base = mat.custom_shader ? tex : mul4(base, tex);
+    }
 
     // Metallic / roughness
     float metallic  = mat.metallic;
     float roughness = mat.roughness;
     if (mat.metallic_rough_tex >= 0) {
         float4 mr = sample_tex(textures, mat.metallic_rough_tex, rec.uv);
-        roughness *= mr.y;   // G channel
-        metallic  *= mr.z;   // B channel
+        if (mat.custom_shader) {
+            roughness = mr.y;   // G channel — direct from shader
+            metallic  = mr.z;   // B channel — direct from shader
+        } else {
+            roughness *= mr.y;
+            metallic  *= mr.z;
+        }
     }
 
     // Emissive
     float4 emis = mat.emissive_factor;
     if (mat.emissive_tex >= 0) {
         float4 et = sample_tex(textures, mat.emissive_tex, rec.uv);
-        emis.x *= et.x; emis.y *= et.y; emis.z *= et.z;
+        if (mat.custom_shader) {
+            emis.x = et.x; emis.y = et.y; emis.z = et.z;
+        } else {
+            emis.x *= et.x; emis.y *= et.y; emis.z *= et.z;
+        }
     }
     emission = make_float3(emis.x, emis.y, emis.z);
 
@@ -424,9 +482,57 @@ __global__ void pathtrace_kernel(PathTracerParams p) {
     float3 accum = lerp(make_float3(prev.x, prev.y, prev.z), color, t);
     p.accum_buffer[idx] = make_float4(accum.x, accum.y, accum.z, 1.f);
 
-    // Write raw linear HDR — tone mapping done in Slang post-process pass
-    surf2Dwrite(make_float4(accum.x, accum.y, accum.z, 1.f), p.surface, x * (int)sizeof(float4), y);
+    // Write raw linear HDR — tone mapping done in Slang post-process pass.
+    // Skip when an upscale pass will write the full surface itself (avoids partial-surface flicker).
+    if (!p.skip_surface_write)
+        surf2Dwrite(make_float4(accum.x, accum.y, accum.z, 1.f), p.surface, x * (int)sizeof(float4), y);
 
+}
+
+__global__ void dlss_aux_kernel(DlssAuxParams p)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= p.width || y >= p.height) return;
+
+    float u = ((float)x + 0.5f) / (float)max(1, p.width);
+    float v = 1.f - ((float)y + 0.5f) / (float)max(1, p.height);
+    Ray ray = camera_ray_center(p.cam, u, v);
+
+    HitRecord rec;
+    bool any_hit = (p.num_prims > 0) && bvh_hit(p.bvh, p.prims, ray, 1e-3f, 1e20f, rec);
+    float t_max = any_hit ? rec.t : 1e20f;
+    if (p.tri_bvh && p.num_triangles > 0) {
+        HitRecord tri_rec;
+        if (bvh_hit_triangles(p.tri_bvh, p.triangles, ray, 1e-3f, t_max, tri_rec)) {
+            rec = tri_rec;
+            any_hit = true;
+        }
+    }
+
+    float depth_value = 1.f;
+    float2 motion_value = make_float2(0.f, 0.f);
+    if (any_hit) {
+        float world_x = 0.f, world_y = 0.f, world_depth = 0.f;
+        if (project_world_to_pixel(p.cam, rec.p, p.width, p.height, world_x, world_y, world_depth)) {
+            depth_value = linear_depth_to_device_depth(world_depth, p.camera_near, p.camera_far);
+
+            if (p.has_prev_camera) {
+                float prev_x = 0.f, prev_y = 0.f, prev_depth = 0.f;
+                if (project_world_to_pixel(p.prev_cam, rec.p, p.width, p.height, prev_x, prev_y, prev_depth))
+                    motion_value = make_float2(prev_x - ((float)x + 0.5f),
+                                               prev_y - ((float)y + 0.5f));
+            }
+        }
+    }
+
+    int idx = y * p.width + x;
+    if (p.depth_buffer) p.depth_buffer[idx] = depth_value;
+    if (p.motion_buffer) p.motion_buffer[idx] = motion_value;
+    if (p.depth_surface)
+        surf2Dwrite(depth_value, p.depth_surface, x * (int)sizeof(float), y);
+    if (p.motion_surface)
+        surf2Dwrite(motion_value, p.motion_surface, x * (int)sizeof(float2), y);
 }
 
 // ─────────────────────────────────────────────
@@ -451,6 +557,14 @@ void pathtracer_reset_accum(float4* accum, int width, int height) {
     cudaMemset(accum, 0, (size_t)width * height * sizeof(float4));
 }
 
+void pathtracer_write_dlss_aux(const DlssAuxParams& p, cudaStream_t stream)
+{
+    dim3 block(16, 16);
+    dim3 grid((p.width + block.x - 1) / block.x,
+              (p.height + block.y - 1) / block.y);
+    dlss_aux_kernel<<<grid, block, 0, stream>>>(p);
+}
+
 __global__ void blit_surface_kernel(const float4* src, cudaSurfaceObject_t surf, int w, int h)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -465,4 +579,294 @@ void pathtracer_blit_surface(const float4* d_src, cudaSurfaceObject_t surface, i
     dim3 block(16, 16);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     blit_surface_kernel<<<grid, block>>>(d_src, surface, width, height);
+}
+
+__device__ inline float3 tonemap_for_viewport(float3 hdr, float exposure, int mode)
+{
+    float exp_scale = exp2f(exposure);
+    hdr = make_float3(hdr.x * exp_scale, hdr.y * exp_scale, hdr.z * exp_scale);
+    hdr.x = fmaxf(hdr.x, 0.f);
+    hdr.y = fmaxf(hdr.y, 0.f);
+    hdr.z = fmaxf(hdr.z, 0.f);
+
+    float3 out = hdr;
+    switch (mode) {
+        case 0:
+            out.x = fminf(hdr.x, 1.f);
+            out.y = fminf(hdr.y, 1.f);
+            out.z = fminf(hdr.z, 1.f);
+            break;
+        case 1:
+            out.x = hdr.x / (1.f + hdr.x);
+            out.y = hdr.y / (1.f + hdr.y);
+            out.z = hdr.z / (1.f + hdr.z);
+            break;
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        default: {
+            auto aces = [](float x) {
+                float y = (x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f);
+                return fminf(fmaxf(y, 0.f), 1.f);
+            };
+            out.x = aces(hdr.x);
+            out.y = aces(hdr.y);
+            out.z = aces(hdr.z);
+            break;
+        }
+    }
+    return out;
+}
+
+__global__ void blit_surface_tonemap_kernel(const float4* src, cudaSurfaceObject_t surf, int w, int h,
+                                            float exposure, int tone_map_mode)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float4 px = src[y * w + x];
+    float3 tm = tonemap_for_viewport(make_float3(px.x, px.y, px.z), exposure, tone_map_mode);
+    surf2Dwrite(make_float4(tm.x, tm.y, tm.z, 1.f), surf, x * (int)sizeof(float4), y);
+}
+
+void pathtracer_blit_surface_tonemap(const float4* d_src, cudaSurfaceObject_t surface, int width, int height,
+                                     float exposure, int tone_map_mode)
+{
+    dim3 block(16, 16);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    blit_surface_tonemap_kernel<<<grid, block>>>(d_src, surface, width, height, exposure, tone_map_mode);
+}
+
+// ── Bicubic (Mitchell-Netravali B=1/3 C=1/3) weight for one axis ─────────────
+__device__ float mitchell(float x)
+{
+    const float B = 1.f / 3.f, C = 1.f / 3.f;
+    x = fabsf(x);
+    if (x < 1.f)
+        return ((12.f - 9.f*B - 6.f*C)*x*x*x
+              + (-18.f + 12.f*B + 6.f*C)*x*x
+              + (6.f - 2.f*B)) / 6.f;
+    if (x < 2.f)
+        return ((-B - 6.f*C)*x*x*x
+              + (6.f*B + 30.f*C)*x*x
+              + (-12.f*B - 48.f*C)*x
+              + (8.f*B + 24.f*C)) / 6.f;
+    return 0.f;
+}
+
+__device__ float4 accum_fetch(const float4* a, int x, int y, int w, int h)
+{
+    x = max(0, min(w - 1, x));
+    y = max(0, min(h - 1, y));
+    return a[y * w + x];
+}
+
+// ── Software upscale: bicubic (Mitchell) sample from accum (running average)
+//    at render_w×render_h, write to full dst_w×dst_h surface. ────────────────
+// NOTE: d_accum already holds the per-pixel running average — do NOT divide
+//       by frame_count here or the image fades to black over time.
+__global__ void sw_upscale_kernel(
+    const float4* accum, int src_w, int src_h,
+    cudaSurfaceObject_t surf, int dst_w, int dst_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    // Map dst pixel to src (accum) coordinate
+    float sx = ((float)dx + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+    float sy = ((float)dy + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+    int ix = (int)floorf(sx);
+    int iy = (int)floorf(sy);
+
+    // 4×4 bicubic neighbourhood
+    float4 result = make_float4(0.f, 0.f, 0.f, 0.f);
+    float  wsum   = 0.f;
+    for (int jy = -1; jy <= 2; ++jy) {
+        float wy = mitchell(sy - (float)(iy + jy));
+        for (int jx = -1; jx <= 2; ++jx) {
+            float wx = mitchell(sx - (float)(ix + jx));
+            float  w  = wx * wy;
+            float4 p  = accum_fetch(accum, ix + jx, iy + jy, src_w, src_h);
+            result.x += p.x * w;
+            result.y += p.y * w;
+            result.z += p.z * w;
+            wsum += w;
+        }
+    }
+    if (wsum > 0.f) { result.x /= wsum; result.y /= wsum; result.z /= wsum; }
+    // Clamp to avoid ringing artefacts going negative in HDR
+    result.x = fmaxf(result.x, 0.f);
+    result.y = fmaxf(result.y, 0.f);
+    result.z = fmaxf(result.z, 0.f);
+    result.w = 1.f;
+    surf2Dwrite(result, surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_sw_upscale(const float4* d_accum,
+                            int src_w, int src_h,
+                            cudaSurfaceObject_t surface,
+                            int dst_w, int dst_h)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    sw_upscale_kernel<<<grid, block>>>(d_accum, src_w, src_h, surface, dst_w, dst_h);
+}
+
+// ── Debug PiP: draw small render (nearest-neighbour) in top-left corner ─────
+__global__ void sw_pip_kernel(
+    const float4* accum, int src_w, int src_h,
+    cudaSurfaceObject_t surf, int pip_w, int pip_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= pip_w || dy >= pip_h) return;
+
+    const int B = 2;  // border width in pixels
+    // White border
+    if (dx < B || dy < B || dx >= pip_w - B || dy >= pip_h - B) {
+        surf2Dwrite(make_float4(1.f, 1.f, 1.f, 1.f), surf,
+                    dx * (int)sizeof(float4), dy);
+        return;
+    }
+
+    // Nearest-neighbour from running-average accum — shows actual render pixels
+    int inner_w = pip_w - 2 * B;
+    int inner_h = pip_h - 2 * B;
+    int sx = (dx - B) * src_w / inner_w;
+    int sy = (dy - B) * src_h / inner_h;
+    sx = min(sx, src_w - 1);
+    sy = min(sy, src_h - 1);
+
+    float4 c = accum[sy * src_w + sx];
+    c.w = 1.f;
+    surf2Dwrite(c, surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_sw_upscale_debug_pip(const float4* d_accum,
+                                      int src_w, int src_h,
+                                      cudaSurfaceObject_t surface,
+                                      int dst_w, int dst_h)
+{
+    // PiP box = 1/3 of the full surface in each dimension
+    int pip_w = dst_w / 3;
+    int pip_h = dst_h / 3;
+    dim3 block(16, 16);
+    dim3 grid((pip_w + 15) / 16, (pip_h + 15) / 16);
+    sw_pip_kernel<<<grid, block>>>(d_accum, src_w, src_h, surface, pip_w, pip_h);
+}
+
+__global__ void visualize_depth_kernel(const float* depth, int src_w, int src_h,
+                                       float min_depth, float max_depth,
+                                       cudaSurfaceObject_t surf, int dst_w, int dst_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    int sx = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
+    int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
+    float d = depth[sy * src_w + sx];
+    float vis = 0.f;
+    if (d < 0.99999f) {
+        float denom = fmaxf(1e-6f, max_depth - min_depth);
+        vis = (d - min_depth) / denom;
+        vis = fminf(1.f, fmaxf(0.f, vis));
+        vis = 1.f - vis;
+        vis = sqrtf(vis);
+    }
+    float4 out = make_float4(vis, vis, vis, 1.f);
+    surf2Dwrite(out, surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
+                                float min_depth, float max_depth,
+                                cudaSurfaceObject_t surface, int dst_w, int dst_h)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    visualize_depth_kernel<<<grid, block>>>(d_depth, src_w, src_h, min_depth, max_depth,
+                                            surface, dst_w, dst_h);
+}
+
+__global__ void visualize_motion_kernel(const float2* motion, int src_w, int src_h,
+                                        cudaSurfaceObject_t surf, int dst_w, int dst_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    int sx = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
+    int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
+    float2 mv = motion[sy * src_w + sx];
+
+    // Motion vectors are stored in pixel space. For debug display, normalize them
+    // perceptually so sub-pixel and small camera moves remain visible.
+    float px_x = mv.x;
+    float px_y = mv.y;
+    float mag_px = sqrtf(px_x * px_x + px_y * px_y);
+
+    // tanh gives a readable signed direction map without hard clipping.
+    float dir_x = tanhf(px_x * 0.35f);
+    float dir_y = tanhf(px_y * 0.35f);
+    float mag_v = 1.f - expf(-mag_px * 0.35f);
+
+    float r = fminf(1.f, fmaxf(0.f, 0.5f + 0.5f * dir_x));
+    float g = fminf(1.f, fmaxf(0.f, 0.5f - 0.5f * dir_y));
+    float b = fminf(1.f, fmaxf(0.f, mag_v));
+    surf2Dwrite(make_float4(r, g, b, 1.f), surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_visualize_motion(const float2* d_motion, int src_w, int src_h,
+                                 cudaSurfaceObject_t surface, int dst_w, int dst_h)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    visualize_motion_kernel<<<grid, block>>>(d_motion, src_w, src_h, surface, dst_w, dst_h);
+}
+
+__global__ void sw_upscale_tonemap_kernel(
+    const float4* accum, int src_w, int src_h,
+    cudaSurfaceObject_t surf, int dst_w, int dst_h,
+    float exposure, int tone_map_mode)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    float sx = ((float)dx + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+    float sy = ((float)dy + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+    int ix = (int)floorf(sx);
+    int iy = (int)floorf(sy);
+
+    float4 result = make_float4(0.f, 0.f, 0.f, 0.f);
+    float  wsum   = 0.f;
+    for (int jy = -1; jy <= 2; ++jy) {
+        float wy = mitchell(sy - (float)(iy + jy));
+        for (int jx = -1; jx <= 2; ++jx) {
+            float wx = mitchell(sx - (float)(ix + jx));
+            float  w  = wx * wy;
+            float4 p  = accum_fetch(accum, ix + jx, iy + jy, src_w, src_h);
+            result.x += p.x * w;
+            result.y += p.y * w;
+            result.z += p.z * w;
+            wsum += w;
+        }
+    }
+    if (wsum > 0.f) { result.x /= wsum; result.y /= wsum; result.z /= wsum; }
+    float3 tm = tonemap_for_viewport(make_float3(result.x, result.y, result.z), exposure, tone_map_mode);
+    surf2Dwrite(make_float4(tm.x, tm.y, tm.z, 1.f), surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_sw_upscale_tonemap(const float4* d_accum,
+                                   int src_w, int src_h,
+                                   cudaSurfaceObject_t surface,
+                                   int dst_w, int dst_h,
+                                   float exposure, int tone_map_mode)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    sw_upscale_tonemap_kernel<<<grid, block>>>(d_accum, src_w, src_h, surface, dst_w, dst_h,
+                                               exposure, tone_map_mode);
 }

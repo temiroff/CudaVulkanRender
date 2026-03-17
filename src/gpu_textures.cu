@@ -2,21 +2,25 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <string>
 #include <vector>
 
 // ─────────────────────────────────────────────
 //  Internal helper: abort on CUDA error
 // ─────────────────────────────────────────────
 
-static void cuda_check(cudaError_t err, const char* file, int line)
+static bool cuda_check(cudaError_t err, const char* file, int line, std::string* err_out = nullptr)
 {
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error %s (%d) at %s:%d\n",
-                     cudaGetErrorString(err), (int)err, file, line);
-        std::abort();
-    }
+    if (err == cudaSuccess) return true;
+
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "CUDA error %s (%d) at %s:%d",
+                  cudaGetErrorString(err), (int)err, file, line);
+    std::fprintf(stderr, "%s\n", msg);
+    if (err_out) *err_out = msg;
+    return false;
 }
-#define CUDA_CHECK(x) cuda_check((x), __FILE__, __LINE__)
+#define CUDA_CHECK(x, err_out) cuda_check((x), __FILE__, __LINE__, (err_out))
 
 // ─────────────────────────────────────────────
 //  gpu_texture_upload_rgba8
@@ -35,9 +39,14 @@ static inline uint8_t srgb_to_linear_u8(uint8_t v)
 }
 
 GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
-                                    bool srgb)
+                                    bool srgb, std::string* err_out)
 {
     GpuTexture t;
+
+    if (!data || width <= 0 || height <= 0) {
+        if (err_out) *err_out = "gpu_texture_upload_rgba8: invalid input image";
+        return t;
+    }
 
     // If sRGB, convert RGB channels to linear before uploading.
     // Alpha channel is left unchanged.
@@ -56,17 +65,22 @@ GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
 
     // 1. Allocate a 2-D CUDA array for uchar4 (RGBA, 8-bit per channel).
     cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
-    CUDA_CHECK(cudaMallocArray(&t.array, &desc, (size_t)width, (size_t)height));
+    if (!CUDA_CHECK(cudaMallocArray(&t.array, &desc, (size_t)width, (size_t)height), err_out))
+        return t;
 
     // 2. Copy host pixels into the array (no pitch on the source side).
-    CUDA_CHECK(cudaMemcpy2DToArray(
+    if (!CUDA_CHECK(cudaMemcpy2DToArray(
         t.array,
         /*wOffset=*/0, /*hOffset=*/0,
         data,
         /*spitch (bytes per source row)=*/(size_t)width * 4,
         /*width  (bytes per row to copy)=*/(size_t)width * 4,
         (size_t)height,
-        cudaMemcpyHostToDevice));
+        cudaMemcpyHostToDevice), err_out)) {
+        cudaFreeArray(t.array);
+        t.array = nullptr;
+        return t;
+    }
 
     // 3. Build resource descriptor pointing at the array.
     cudaResourceDesc resDesc{};
@@ -81,7 +95,11 @@ GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
     texDesc.readMode         = cudaReadModeNormalizedFloat; // uchar4 → float4 [0,1]
     texDesc.normalizedCoords = 1;
 
-    CUDA_CHECK(cudaCreateTextureObject(&t.tex, &resDesc, &texDesc, nullptr));
+    if (!CUDA_CHECK(cudaCreateTextureObject(&t.tex, &resDesc, &texDesc, nullptr), err_out)) {
+        cudaFreeArray(t.array);
+        t.array = nullptr;
+        return t;
+    }
     return t;
 }
 
@@ -92,11 +110,11 @@ GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
 void gpu_texture_free(GpuTexture& t)
 {
     if (t.tex != 0) {
-        CUDA_CHECK(cudaDestroyTextureObject(t.tex));
+        cuda_check(cudaDestroyTextureObject(t.tex), __FILE__, __LINE__);
         t.tex = 0;
     }
     if (t.array != nullptr) {
-        CUDA_CHECK(cudaFreeArray(t.array));
+        cuda_check(cudaFreeArray(t.array), __FILE__, __LINE__);
         t.array = nullptr;
     }
 }
@@ -105,7 +123,8 @@ void gpu_texture_free(GpuTexture& t)
 //  gpu_textures_upload_handles
 // ─────────────────────────────────────────────
 
-cudaTextureObject_t* gpu_textures_upload_handles(const std::vector<GpuTexture>& textures)
+cudaTextureObject_t* gpu_textures_upload_handles(const std::vector<GpuTexture>& textures,
+                                                 std::string* err_out)
 {
     if (textures.empty()) {
         return nullptr;
@@ -121,8 +140,12 @@ cudaTextureObject_t* gpu_textures_upload_handles(const std::vector<GpuTexture>& 
     // Allocate device memory and copy.
     const size_t bytes = handles.size() * sizeof(cudaTextureObject_t);
     cudaTextureObject_t* d_handles = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_handles, bytes));
-    CUDA_CHECK(cudaMemcpy(d_handles, handles.data(), bytes, cudaMemcpyHostToDevice));
+    if (!CUDA_CHECK(cudaMalloc(&d_handles, bytes), err_out))
+        return nullptr;
+    if (!CUDA_CHECK(cudaMemcpy(d_handles, handles.data(), bytes, cudaMemcpyHostToDevice), err_out)) {
+        cudaFree(d_handles);
+        return nullptr;
+    }
 
     return d_handles;
 }

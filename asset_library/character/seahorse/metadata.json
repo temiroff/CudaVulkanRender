@@ -1,0 +1,12 @@
+{
+  "name": "seahorse",
+  "category": "character",
+  "object": "seahorse",
+  "description": "A digitally rendered seahorse with a detailed, segmented body and a long, slender tail. The seahorse is positioned upright with its head raised, resembling a human-like posture. The model has a realistic texture that mimics the appearance of seahorse skin.",
+  "tags": "seahorse, 3D model, digital art, character, marine life, realistic, texture, upright, human-like posture",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\seahorse_anim_mtl_variant.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

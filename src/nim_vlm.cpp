@@ -272,22 +272,82 @@ static std::string json_escape(const std::string& s)
     return out;
 }
 
-static std::string build_request_json(
-    const char* model, float temperature, int max_tokens,
-    const std::string& image_b64)
+static std::string recognition_prompt()
 {
-    const std::string prompt =
-        "You are a 3D scene analysis assistant. Analyze this rendered 3D scene "
-        "and identify the most prominent object or overall environment. "
+    return
+        "You are a 3D asset cataloging assistant. Analyze these rendered views of a 3D model "
+        "and identify the object. "
         "Respond ONLY with valid JSON — no markdown, no explanation — in exactly this format:\\n"
         "{\\\"category\\\": \\\"<category>\\\", "
-        "\\\"object\\\": \\\"<specific object>\\\", "
-        "\\\"nice_name\\\": \\\"<creative 2-4 word name>\\\"}\\n"
+        "\\\"object\\\": \\\"<specific object type>\\\", "
+        "\\\"description\\\": \\\"<2-3 sentences describing visual appearance, materials, style>\\\", "
+        "\\\"tags\\\": \\\"<8-12 comma-separated search tags>\\\"}\\n"
         "Categories: furniture, vehicle, architecture, nature, character, "
         "prop, interior, environment, abstract\\n"
         "Example: {\\\"category\\\": \\\"furniture\\\", "
         "\\\"object\\\": \\\"wooden chair\\\", "
-        "\\\"nice_name\\\": \\\"Rustic Oak Throne\\\"}";
+        "\\\"description\\\": \\\"A rustic wooden chair with a high carved back and four legs. "
+        "The seat is upholstered in dark leather with brass nail trim. "
+        "Aged oak finish with visible wood grain.\\\", "
+        "\\\"tags\\\": \\\"chair, wooden, furniture, seating, rustic, oak, antique, interior\\\"}";
+}
+
+static NimVlmResult parse_nim_response(const std::string& response)
+{
+    NimVlmResult result;
+
+    if (response.substr(0, 6) == "ERROR:") {
+        snprintf(result.error_msg, sizeof(result.error_msg), "%s", response.c_str() + 6);
+        return result;
+    }
+
+    std::cout << "[NIM] Response: " << response.substr(0, 200) << "...\n";
+
+    std::string content = extract_content(response);
+    if (content.empty()) {
+        snprintf(result.error_msg, sizeof(result.error_msg),
+                 "Could not find 'content' in response: %.200s", response.c_str());
+        return result;
+    }
+
+    std::cout << "[NIM] Content: " << content << "\n";
+
+    // Strip ```json ... ``` wrapper if present
+    {
+        size_t start = content.find('{');
+        size_t end   = content.rfind('}');
+        if (start != std::string::npos && end != std::string::npos && end > start)
+            content = content.substr(start, end - start + 1);
+    }
+
+    std::string category    = json_string_value(content, "category");
+    std::string object_str  = json_string_value(content, "object");
+    std::string description = json_string_value(content, "description");
+    std::string tags        = json_string_value(content, "tags");
+
+    if (object_str.empty()) object_str = json_string_value(content, "object_type");
+
+    if (category.empty() && object_str.empty()) {
+        snprintf(result.error_msg, sizeof(result.error_msg),
+                 "VLM returned unparseable content: %.300s", content.c_str());
+        return result;
+    }
+
+    if (!category.empty()) category[0] = (char)toupper((unsigned char)category[0]);
+
+    snprintf(result.category,    sizeof(result.category),    "%s", category.c_str());
+    snprintf(result.object_type, sizeof(result.object_type), "%s", object_str.c_str());
+    snprintf(result.description, sizeof(result.description), "%s", description.c_str());
+    snprintf(result.tags,        sizeof(result.tags),        "%s", tags.c_str());
+    result.success = true;
+    return result;
+}
+
+static std::string build_request_json(
+    const char* model, float temperature, int max_tokens,
+    const std::string& image_b64)
+{
+    const std::string prompt = recognition_prompt();
 
     // Format temperature with one decimal
     char temp_str[32];
@@ -352,56 +412,75 @@ NimVlmResult nim_vlm_recognize(
         cfg.use_https,
         cfg.api_key[0] ? cfg.api_key : nullptr);
 
-    if (response.substr(0, 6) == "ERROR:") {
-        snprintf(result.error_msg, sizeof(result.error_msg),
-                 "%s", response.c_str() + 6);
+    return parse_nim_response(response);
+}
+
+NimVlmResult nim_vlm_recognize_multi(
+    const NimVlmConfig& cfg,
+    const float* const* pixels,
+    int                 count,
+    int                 width,
+    int                 height)
+{
+    NimVlmResult result;
+    if (count <= 0 || !pixels) {
+        snprintf(result.error_msg, sizeof(result.error_msg), "No images provided");
         return result;
     }
 
-    std::cout << "[NIM] Response: " << response.substr(0, 200) << "...\n";
-
-    // ── Parse outer OpenAI response → extract content ─────────────────────────
-    std::string content = extract_content(response);
-    if (content.empty()) {
-        snprintf(result.error_msg, sizeof(result.error_msg),
-                 "Could not find 'content' in response: %.200s",
-                 response.c_str());
-        return result;
+    // ── Encode all images to base64 JPEG ─────────────────────────────────────
+    std::vector<std::string> b64_images;
+    b64_images.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        auto jpeg = prepare_jpeg(pixels[i], width, height);
+        if (jpeg.empty()) {
+            snprintf(result.error_msg, sizeof(result.error_msg), "JPEG encode failed for angle %d", i);
+            return result;
+        }
+        b64_images.push_back(base64_encode(jpeg.data(), jpeg.size()));
     }
 
-    std::cout << "[NIM] Content: " << content << "\n";
+    // ── Build multi-image request JSON ────────────────────────────────────────
+    char temp_str[32];
+    snprintf(temp_str, sizeof(temp_str), "%.2f", (double)cfg.temperature);
 
-    // ── Parse inner JSON from VLM content ─────────────────────────────────────
-    // The content may be wrapped in ```json ... ``` — strip it
-    {
-        size_t start = content.find('{');
-        size_t end   = content.rfind('}');
-        if (start != std::string::npos && end != std::string::npos && end > start)
-            content = content.substr(start, end - start + 1);
+    std::string content_arr;
+    for (auto& b64 : b64_images) {
+        content_arr +=
+            "{"
+              "\"type\":\"image_url\","
+              "\"image_url\":{\"url\":\"data:image/jpeg;base64," + b64 + "\"}"
+            "},";
     }
+    // Append text prompt
+    content_arr +=
+        "{"
+          "\"type\":\"text\","
+          "\"text\":\"" + recognition_prompt() + "\""
+        "}";
 
-    std::string category   = json_string_value(content, "category");
-    std::string object_str = json_string_value(content, "object");
-    std::string nice_name  = json_string_value(content, "nice_name");
+    std::string body =
+        "{"
+        "\"model\":\"" + std::string(cfg.model) + "\","
+        "\"temperature\":" + temp_str + ","
+        "\"max_tokens\":" + std::to_string(cfg.max_tokens) + ","
+        "\"messages\":[{"
+          "\"role\":\"user\","
+          "\"content\":[" + content_arr + "]"
+        "}]"
+        "}";
 
-    // Fallback: look for alternate key spellings
-    if (object_str.empty()) object_str = json_string_value(content, "object_type");
-    if (nice_name.empty())  nice_name  = json_string_value(content, "name");
+    std::cout << "[NIM] Sending " << count << " angle images to "
+              << cfg.host << ":" << cfg.port << "\n";
 
-    if (category.empty() && object_str.empty()) {
-        snprintf(result.error_msg, sizeof(result.error_msg),
-                 "VLM returned unparseable content: %.300s", content.c_str());
-        return result;
-    }
+    std::string response = http_post(
+        cfg.host, cfg.port,
+        "/v1/chat/completions",
+        body, "application/json",
+        cfg.use_https,
+        cfg.api_key[0] ? cfg.api_key : nullptr);
 
-    // Capitalise category
-    if (!category.empty()) category[0] = (char)toupper((unsigned char)category[0]);
-
-    snprintf(result.category,    sizeof(result.category),    "%s", category.c_str());
-    snprintf(result.object_type, sizeof(result.object_type), "%s", object_str.c_str());
-    snprintf(result.nice_name,   sizeof(result.nice_name),   "%s", nice_name.c_str());
-    result.success = true;
-    return result;
+    return parse_nim_response(response);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

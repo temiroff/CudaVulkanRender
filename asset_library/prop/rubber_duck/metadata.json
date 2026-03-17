@@ -1,0 +1,12 @@
+{
+  "name": "rubber_duck",
+  "category": "prop",
+  "object": "rubber duck",
+  "description": "A bright yellow rubber duck with a simple, cartoonish design. It has a round body, a small beak, and a single eye. The duck is floating and appears to be made of a glossy material.",
+  "tags": "rubber, duck, yellow, cartoon, floating, glossy, toy, playful, water, bath",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\Duck.gltf",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

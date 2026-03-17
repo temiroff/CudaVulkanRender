@@ -67,15 +67,120 @@ __device__ float eval_phat(float3 p, float3 n, const EmissiveTri& lt, float3 lp,
     return fmaxf(0.f, em * g);
 }
 
-// Weighted Reservoir Sampling update — returns true if sample was selected
-__device__ bool wrs_update(Reservoir& r, int candidate, float weight, float rng_val) {
-    r.w_sum += weight;
-    r.M++;
-    if (rng_val * r.w_sum < weight) {
+__device__ inline float3 tri_normal(const EmissiveTri& lt)
+{
+    return rs_normalize(rs_cross(
+        make_float3(lt.v1.x - lt.v0.x, lt.v1.y - lt.v0.y, lt.v1.z - lt.v0.z),
+        make_float3(lt.v2.x - lt.v0.x, lt.v2.y - lt.v0.y, lt.v2.z - lt.v0.z)));
+}
+
+__device__ inline float3 tri_centroid(const EmissiveTri& lt)
+{
+    return make_float3((lt.v0.x + lt.v1.x + lt.v2.x) / 3.f,
+                       (lt.v0.y + lt.v1.y + lt.v2.y) / 3.f,
+                       (lt.v0.z + lt.v1.z + lt.v2.z) / 3.f);
+}
+
+__device__ inline float camera_focus_distance(const Camera& cam)
+{
+    float3 plane_center = cam.lower_left + cam.horizontal * 0.5f + cam.vertical * 0.5f;
+    return fmaxf(1e-6f, rs_dot(cam.origin - plane_center, cam.w));
+}
+
+__device__ inline bool project_world_to_pixel(const Camera& cam, float3 world,
+                                              int width, int height,
+                                              float& out_x, float& out_y, float& out_depth)
+{
+    float3 rel = world - cam.origin;
+    float x_view = rs_dot(rel, cam.u);
+    float y_view = rs_dot(rel, cam.v);
+    float z_view = -rs_dot(rel, cam.w);
+    if (z_view <= 1e-4f) return false;
+
+    float focus_dist = camera_focus_distance(cam);
+    float half_w = fmaxf(1e-6f, rs_len(cam.horizontal) * 0.5f);
+    float half_h = fmaxf(1e-6f, rs_len(cam.vertical) * 0.5f);
+    float plane_scale = focus_dist / z_view;
+    float ndc_x = (x_view * plane_scale) / half_w;
+    float ndc_y = (y_view * plane_scale) / half_h;
+
+    out_x = (ndc_x * 0.5f + 0.5f) * (float)width;
+    out_y = (0.5f - ndc_y * 0.5f) * (float)height;
+    out_depth = z_view;
+    return true;
+}
+
+__device__ inline bool wrs_merge(Reservoir& r, int candidate,
+                                 float weight_sum, int candidate_count,
+                                 float rng_val)
+{
+    if (candidate_count <= 0 || weight_sum <= 0.f) return false;
+    r.w_sum += weight_sum;
+    r.M += candidate_count;
+    if (rng_val * r.w_sum < weight_sum) {
         r.y = candidate;
         return true;
     }
     return false;
+}
+
+__device__ inline void restir_write_hit_info(ReSTIRHitInfo* info, int idx,
+                                             float3 hit_p, float3 hit_n, float depth)
+{
+    if (!info) return;
+    info[idx].world_pos = make_float4(hit_p.x, hit_p.y, hit_p.z, depth);
+    info[idx].normal    = make_float4(hit_n.x, hit_n.y, hit_n.z, 1.f);
+}
+
+__device__ inline void restir_write_invalid_hit(ReSTIRHitInfo* info, int idx)
+{
+    if (!info) return;
+    info[idx].world_pos = make_float4(0.f, 0.f, 0.f, 0.f);
+    info[idx].normal    = make_float4(0.f, 0.f, 0.f, 0.f);
+}
+
+__device__ inline bool restir_hit_valid(const ReSTIRHitInfo& info)
+{
+    return info.normal.w > 0.f && info.world_pos.w > 0.f;
+}
+
+__device__ inline bool restir_hit_compatible(const ReSTIRHitInfo& a, const ReSTIRHitInfo& b)
+{
+    if (!restir_hit_valid(a) || !restir_hit_valid(b)) return false;
+    float3 ap = make_float3(a.world_pos.x, a.world_pos.y, a.world_pos.z);
+    float3 bp = make_float3(b.world_pos.x, b.world_pos.y, b.world_pos.z);
+    float3 an = rs_normalize(make_float3(a.normal.x, a.normal.y, a.normal.z));
+    float3 bn = rs_normalize(make_float3(b.normal.x, b.normal.y, b.normal.z));
+    float dist = rs_len(ap - bp);
+    float max_dist = fmaxf(0.02f, 0.02f * fmaxf(a.world_pos.w, b.world_pos.w));
+    return dist <= max_dist && rs_dot(an, bn) >= 0.9f;
+}
+
+__host__ __device__ inline bool restir_mode_uses_spatial(const ReSTIRParams& p)
+{
+    return p.reuse_mode == (int)ReSTIRReuseMode::Spatial ||
+           p.reuse_mode == (int)ReSTIRReuseMode::TemporalSpatial;
+}
+
+__host__ __device__ inline bool restir_mode_uses_temporal(const ReSTIRParams& p)
+{
+    return p.reuse_mode == (int)ReSTIRReuseMode::Temporal ||
+           p.reuse_mode == (int)ReSTIRReuseMode::TemporalSpatial;
+}
+
+__device__ inline float reservoir_reuse_weight(const Reservoir& r, float3 hit_p, float3 hit_n,
+                                               const EmissiveTri& lt)
+{
+    if (r.y < 0 || r.M <= 0 || r.W <= 0.f) return 0.f;
+    float3 lp = tri_centroid(lt);
+    float3 ln = tri_normal(lt);
+    float q = eval_phat(hit_p, hit_n, lt, lp, ln);
+    return (q > 1e-10f) ? (r.W * (float)r.M * q) : 0.f;
+}
+
+// Weighted Reservoir Sampling update — returns true if sample was selected
+__device__ bool wrs_update(Reservoir& r, int candidate, float weight, float rng_val) {
+    return wrs_merge(r, candidate, weight, 1, rng_val);
 }
 
 // ── Visibility test (shadow ray) ────────────────────────────────────────────
@@ -108,6 +213,7 @@ __global__ void restir_ris_kernel(ReSTIRParams p) {
 
     if (p.num_emissive == 0 || !p.tri_bvh) {
         // No lights — reservoir stays empty, shade kernel will use sky
+        restir_write_invalid_hit(p.hit_info, idx);
         return;
     }
 
@@ -125,11 +231,14 @@ __global__ void restir_ris_kernel(ReSTIRParams p) {
     if (!bvh_hit_triangles(p.tri_bvh, p.triangles, ray, 1e-3f, 1e20f, rec)) {
         // Miss — store sentinel y=-2 so shade kernel can draw sky
         res.y = -2;
+        restir_write_invalid_hit(p.hit_info, idx);
         return;
     }
 
     float3 hit_p = rec.p;
     float3 hit_n = rec.normal;
+    float hit_depth = rs_len(hit_p - p.cam.origin);
+    restir_write_hit_info(p.hit_info, idx, hit_p, hit_n, hit_depth);
 
     // ── Initial RIS: sample M candidates ─────────────────────────────────────
     float total_area = 0.f;
@@ -161,13 +270,34 @@ __global__ void restir_ris_kernel(ReSTIRParams p) {
         wrs_update(res, li, weight, rs_rand(rng));
     }
 
+    if (restir_mode_uses_temporal(p) &&
+        p.has_prev_frame && p.prev_reservoirs && p.prev_hit_info) {
+        float prev_x = 0.f, prev_y = 0.f, prev_depth = 0.f;
+        if (project_world_to_pixel(p.prev_cam, hit_p, p.width, p.height,
+                                   prev_x, prev_y, prev_depth)) {
+            int px = (int)floorf(prev_x);
+            int py = (int)floorf(prev_y);
+            if (px >= 0 && px < p.width && py >= 0 && py < p.height) {
+                int prev_idx = py * p.width + px;
+                const ReSTIRHitInfo prev_hit = p.prev_hit_info[prev_idx];
+                const ReSTIRHitInfo cur_hit  = p.hit_info[idx];
+                const Reservoir& prev_res    = p.prev_reservoirs[prev_idx];
+                if (prev_res.y >= 0 &&
+                    restir_hit_compatible(cur_hit, prev_hit) &&
+                    prev_res.y < p.num_emissive) {
+                    const EmissiveTri& lt = p.emissive_tris[prev_res.y];
+                    float reuse_weight = reservoir_reuse_weight(prev_res, hit_p, hit_n, lt);
+                    wrs_merge(res, prev_res.y, reuse_weight, prev_res.M, rs_rand(rng));
+                }
+            }
+        }
+    }
+
     // Compute unbiased W
     if (res.y >= 0 && res.M > 0) {
         const EmissiveTri& lt = p.emissive_tris[res.y];
-        float3 lp = sample_tri(lt, 0.5f, 0.5f);  // centroid approx for p_hat
-        float3 ln = rs_normalize(rs_cross(
-            make_float3(lt.v1.x-lt.v0.x, lt.v1.y-lt.v0.y, lt.v1.z-lt.v0.z),
-            make_float3(lt.v2.x-lt.v0.x, lt.v2.y-lt.v0.y, lt.v2.z-lt.v0.z)));
+        float3 lp = tri_centroid(lt);
+        float3 ln = tri_normal(lt);
         float phat = eval_phat(hit_p, hit_n, lt, lp, ln);
         res.W = (phat > 1e-10f) ? (res.w_sum / ((float)res.M * phat)) : 0.f;
     }
@@ -186,6 +316,12 @@ __global__ void restir_spatial_kernel(ReSTIRParams p) {
 
     Reservoir r = p.reservoirs[idx];
     if (r.y == -2) { p.reservoirs_tmp[idx] = r; return; } // sky hit, skip
+    if (!p.hit_info) { p.reservoirs_tmp[idx] = r; return; }
+
+    const ReSTIRHitInfo cur_hit = p.hit_info[idx];
+    if (!restir_hit_valid(cur_hit)) { p.reservoirs_tmp[idx] = r; return; }
+    float3 hit_p = make_float3(cur_hit.world_pos.x, cur_hit.world_pos.y, cur_hit.world_pos.z);
+    float3 hit_n = rs_normalize(make_float3(cur_hit.normal.x, cur_hit.normal.y, cur_hit.normal.z));
 
     // Combine with k=4 random spatial neighbors
     const int K = 4;
@@ -198,14 +334,22 @@ __global__ void restir_spatial_kernel(ReSTIRParams p) {
 
         const Reservoir& nb = p.reservoirs[ny * p.width + nx];
         if (nb.y < 0 || nb.M == 0) continue;
+        if (nb.y >= p.num_emissive) continue;
 
-        float weight = nb.W * nb.w_sum / fmaxf(1.f, (float)nb.M);
-        wrs_update(r, nb.y, weight, rs_rand(rng));
+        const ReSTIRHitInfo nb_hit = p.hit_info[ny * p.width + nx];
+        if (!restir_hit_compatible(cur_hit, nb_hit)) continue;
+
+        const EmissiveTri& lt = p.emissive_tris[nb.y];
+        float weight = reservoir_reuse_weight(nb, hit_p, hit_n, lt);
+        wrs_merge(r, nb.y, weight, nb.M, rs_rand(rng));
     }
 
-    // Recompute W for combined reservoir
-    // (we don't have the hit point here so keep the original W)
-    // In a full implementation this would reproject + recompute p_hat
+    // Recompute W against the current shading point after neighbor reuse.
+    if (r.y >= 0 && r.M > 0 && r.y < p.num_emissive) {
+        const EmissiveTri& lt = p.emissive_tris[r.y];
+        float phat = eval_phat(hit_p, hit_n, lt, tri_centroid(lt), tri_normal(lt));
+        r.W = (phat > 1e-10f) ? (r.w_sum / ((float)r.M * phat)) : 0.f;
+    }
     p.reservoirs_tmp[idx] = r;
 }
 
@@ -360,7 +504,7 @@ void restir_launch(const ReSTIRParams& p, cudaStream_t stream) {
 
     restir_ris_kernel<<<grid, block, 0, stream>>>(p);
 
-    if (p.spatial_reuse && p.reservoirs_tmp) {
+    if (restir_mode_uses_spatial(p) && p.reservoirs_tmp) {
         restir_spatial_kernel<<<grid, block, 0, stream>>>(p);
         // Swap tmp into primary so shade reads the spatially-reused reservoirs
         ReSTIRParams p2 = p;

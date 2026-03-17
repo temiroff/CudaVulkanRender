@@ -1,0 +1,12 @@
+{
+  "name": "baseball_glove",
+  "category": "prop",
+  "object": "baseball glove",
+  "description": "A brown leather baseball glove with a checkered pattern on the back and stitching along the edges. It appears to be worn and has a vintage look.",
+  "tags": "baseball, glove, leather, vintage, worn, checkered, stitching, sports equipment",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\glove_baseball_mtl_variant.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

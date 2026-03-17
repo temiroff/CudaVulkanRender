@@ -1,0 +1,12 @@
+{
+  "name": "toy_dinosaur",
+  "category": "prop",
+  "object": "toy dinosaur",
+  "description": "A toy dinosaur with a metallic body and a red tail. It has a detailed texture that resembles scales and is designed to look like a realistic dinosaur. The toy is in flight, with its wings spread and tail extended.",
+  "tags": "toy, dinosaur, metallic, scaled, red tail, flying, model, prop, animation, animation model",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\chameleon_anim_mtl_variant.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "American_football",
+  "category": "prop",
+  "object": "American football",
+  "description": "A red American football with white laces and white stripes, suspended in mid-air. The ball has a glossy finish and is positioned against a blurred urban background. The laces are tightly wound and the ball appears to be in good condition.",
+  "tags": "American football, sports, glossy, suspended, urban, blurred background, sports equipment, sports",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\ball_football_realistic.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

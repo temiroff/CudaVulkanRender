@@ -1,0 +1,12 @@
+{
+  "name": "hummingbird",
+  "category": "nature",
+  "object": "hummingbird",
+  "description": "A hummingbird with vibrant pink and green plumage, hovering in mid-air. The bird's wings are spread wide, showcasing the iridescent feathers. The background features urban elements like buildings and vehicles.",
+  "tags": "hummingbird, iridescent, pink, green, urban, flight, nature, wildlife, bird",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\hummingbird_anim.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

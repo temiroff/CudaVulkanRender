@@ -35,11 +35,12 @@ bool nim_vlm_check_connection(const NimVlmConfig& cfg);
 bool nim_vlm_launch_docker(const NimVlmConfig& cfg, char* error_out = nullptr, int error_len = 0);
 
 struct NimVlmResult {
-    char category  [128] = {};  // broad category: furniture, vehicle, architecture …
-    char object_type[256] = {}; // specific type: "wooden chair", "sports car" …
-    char nice_name [384] = {};  // creative 2-4 word name: "Rustic Oak Throne" …
-    bool success         = false;
-    char error_msg [512] = {};
+    char category   [128] = {};  // broad category: furniture, vehicle, architecture …
+    char object_type[256] = {};  // specific type: "wooden chair", "sports car" …
+    char description[512] = {};  // 2-3 sentence visual description
+    char tags       [256] = {};  // comma-separated hashtags for search
+    bool success          = false;
+    char error_msg  [512] = {};
 };
 
 // Send pixels to the NIM VLM endpoint and return recognised scene info.
@@ -48,5 +49,14 @@ struct NimVlmResult {
 NimVlmResult nim_vlm_recognize(
     const NimVlmConfig& cfg,
     const float*        pixels_rgba_f32,
+    int                 width,
+    int                 height);
+
+// Multi-angle variant — sends up to 'count' renders in a single request.
+// pixels[i] points to a float4 RGBA buffer of width*height pixels.
+NimVlmResult nim_vlm_recognize_multi(
+    const NimVlmConfig& cfg,
+    const float* const* pixels,
+    int                 count,
     int                 width,
     int                 height);

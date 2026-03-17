@@ -1,5 +1,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
+#include <vector>
+#include <cstdint>
 
 // Must match push constant layout in post.slang
 struct PostPushConstants {
@@ -67,6 +69,12 @@ void post_process_resize(
     VkSampler        hdr_sampler,
     int new_w, int new_h);
 
+// Update the HDR input sampled by the compute pass without recreating resources.
+void post_process_set_input(
+    PostProcess&     pp,
+    VkImageView      hdr_view,
+    VkSampler        hdr_sampler);
+
 // Dispatch the compute shader. Call inside a command buffer, outside a render pass.
 // Inserts the necessary pipeline barriers for the display image (GENERAL layout for write,
 // then memory barrier so fragment shader (ImGui) can read it).
@@ -76,3 +84,12 @@ void post_process_dispatch(
     const PostPushConstants& params);
 
 void post_process_destroy(PostProcess& pp);
+
+// Read back the tonemapped display image (R16G16B16A16_SFLOAT) to CPU.
+// Returns RGBA half-float pixels, row-major top-to-bottom.
+// Blocks until the copy is complete.
+std::vector<uint16_t> post_process_readback(
+    PostProcess&     pp,
+    VkPhysicalDevice phys,
+    VkCommandPool    cmd_pool,
+    VkQueue          queue);

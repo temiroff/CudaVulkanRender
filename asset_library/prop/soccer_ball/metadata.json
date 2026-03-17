@@ -1,0 +1,12 @@
+{
+  "name": "soccer_ball",
+  "category": "prop",
+  "object": "soccer ball",
+  "description": "A classic black and white soccer ball with pentagonal and hexagonal panels. It appears to be made of leather with a smooth texture. The ball is in focus against a blurred background.",
+  "tags": "soccer ball, leather, sports equipment, pentagon, hexagon, black, white, focus, blurred background",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\ball_soccerball_realistic.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

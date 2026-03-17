@@ -1,0 +1,12 @@
+{
+  "name": "spaceship",
+  "category": "prop",
+  "object": "spaceship",
+  "description": "A futuristic spaceship with a sleek, metallic body and a large, domed helmet. It has a streamlined design with visible thrusters and a complex array of sensors and controls. The color scheme is primarily blue and silver with hints of green.",
+  "tags": "spaceship, futuristic, metallic, helmet, thrusters, sensors, controls, blue, silver, green",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\DamagedHelmet.gltf",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

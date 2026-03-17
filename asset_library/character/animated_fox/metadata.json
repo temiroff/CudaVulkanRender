@@ -1,0 +1,12 @@
+{
+  "name": "animated_fox",
+  "category": "character",
+  "object": "animated fox",
+  "description": "A stylized, animated fox with a smooth, orange fur texture and a white underbelly. It has a pointed snout, upright ears, and a tail that appears to be a white flag. The fox is depicted in a walking pose with its legs extended.",
+  "tags": "animated, fox, character, 3D model, animation, art, design, wildlife",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\Fox.gltf",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

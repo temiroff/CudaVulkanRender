@@ -3,6 +3,8 @@
 #include <vulkan/vulkan.h>
 #include <imgui.h>
 
+struct ControlPanelState;
+
 struct ViewportPanel {
     ImVec2 size     = { 800, 600 };
     ImVec2 origin   = {};           // screen-space top-left of the image
@@ -22,4 +24,4 @@ struct ViewportPanel {
     float  scroll_y       = 0.f;
 };
 
-void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor);
+void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor, ControlPanelState& controls);

@@ -114,40 +114,43 @@ std::string batch_sanitize(const std::string& s, int max_len)
     return out;
 }
 
-void batch_save(BatchProcessor& bp, const float* pixels_rgba_f32, int w, int h)
+void batch_save(BatchProcessor& bp)
 {
     namespace fs = std::filesystem;
     const std::string& src = bp.files[bp.current_idx];
+    const int w = bp.render_w, h = bp.render_h;
 
-    // ── Determine names from NIM result or filename fallback ─────────────────
-    std::string category  = "prop";
-    std::string nice_name = fs::path(src).stem().string();
-    std::string obj_type  = nice_name;
+    // ── Determine names: object_name is folder/file name, fallback = stem ─────
+    std::string category    = "prop";
+    std::string obj_type    = fs::path(src).stem().string();
+    std::string description;
+    std::string tags;
 
     if (bp.nim_result.success) {
-        if (bp.nim_result.category[0] != '\0')  category  = bp.nim_result.category;
-        if (bp.nim_result.nice_name[0] != '\0') nice_name = bp.nim_result.nice_name;
-        if (bp.nim_result.object_type[0]!= '\0')obj_type  = bp.nim_result.object_type;
+        if (bp.nim_result.category[0]    != '\0') category    = bp.nim_result.category;
+        if (bp.nim_result.object_type[0] != '\0') obj_type    = bp.nim_result.object_type;
+        if (bp.nim_result.description[0] != '\0') description = bp.nim_result.description;
+        if (bp.nim_result.tags[0]        != '\0') tags        = bp.nim_result.tags;
     }
 
     // Lowercase category for consistent folder naming
     for (auto& c : category) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
-    std::string cat_safe  = batch_sanitize(category,  32);
-    std::string name_safe = batch_sanitize(nice_name, 48);
+    std::string cat_safe = batch_sanitize(category, 32);
+    std::string obj_safe = batch_sanitize(obj_type, 48);   // used as folder AND filename
 
-    fs::path out_dir = fs::path(bp.config.output_dir) / cat_safe / name_safe;
+    fs::path out_dir = fs::path(bp.config.output_dir) / cat_safe / obj_safe;
 
     // ── Skip existing ─────────────────────────────────────────────────────────
     if (bp.config.skip_existing && fs::exists(out_dir / "render.jpg")) {
         BatchLogEntry e;
         e.source_path = src;
         e.category    = cat_safe;
-        e.nice_name   = name_safe;
+        e.object_name = obj_safe;
         e.out_dir     = out_dir.string();
         bp.log.push_back(e);
         snprintf(bp.status, sizeof(bp.status), "Skipped (exists): %s/%s",
-                 cat_safe.c_str(), name_safe.c_str());
+                 cat_safe.c_str(), obj_safe.c_str());
         return;
     }
 
@@ -155,13 +158,28 @@ void batch_save(BatchProcessor& bp, const float* pixels_rgba_f32, int w, int h)
     std::error_code ec;
     fs::create_directories(out_dir, ec);
 
-    // ── Write render.jpg ──────────────────────────────────────────────────────
-    auto jpeg = encode_jpeg(pixels_rgba_f32, w, h, bp.config.jpeg_quality);
-    if (!jpeg.empty()) {
-        auto jpg_path = (out_dir / "render.jpg").string();
-        FILE* fj = nullptr;
-        fopen_s(&fj, jpg_path.c_str(), "wb");
-        if (fj) { fwrite(jpeg.data(), 1, jpeg.size(), fj); fclose(fj); }
+    // ── Copy model file into folder as <obj_safe>.<original_ext> ─────────────
+    {
+        fs::path src_path(src);
+        fs::path dst_model = out_dir / (obj_safe + src_path.extension().string());
+        fs::copy_file(src_path, dst_model,
+                      fs::copy_options::overwrite_existing, ec);
+    }
+
+    // ── Write per-angle renders ───────────────────────────────────────────────
+    // Angle 0 = 3/4 perspective → render.jpg (main preview shown in viewer)
+    // Angle 1 = front pseudo-ortho → render_front.jpg
+    // Angle 2 = right-side pseudo-ortho → render_side.jpg
+    static const char* ANGLE_NAMES[] = { "render.jpg", "render_front.jpg", "render_side.jpg" };
+    for (int ai = 0; ai < BATCH_NUM_ANGLES; ++ai) {
+        if (bp.angle_pixels[ai].empty()) continue;
+        auto jpeg = encode_jpeg(bp.angle_pixels[ai].data(), w, h, bp.config.jpeg_quality);
+        if (!jpeg.empty()) {
+            auto jpg_path = (out_dir / ANGLE_NAMES[ai]).string();
+            FILE* fj = nullptr;
+            fopen_s(&fj, jpg_path.c_str(), "wb");
+            if (fj) { fwrite(jpeg.data(), 1, jpeg.size(), fj); fclose(fj); }
+        }
     }
 
     // ── Write metadata.json ───────────────────────────────────────────────────
@@ -177,14 +195,16 @@ void batch_save(BatchProcessor& bp, const float* pixels_rgba_f32, int w, int h)
         fopen_s(&fm, json_path.c_str(), "w");
         if (FILE* f = fm) {
             fprintf(f, "{\n");
-            fprintf(f, "  \"source\": \"%s\",\n",      json_esc(src).c_str());
-            fprintf(f, "  \"category\": \"%s\",\n",    json_esc(cat_safe).c_str());
-            fprintf(f, "  \"object\": \"%s\",\n",      json_esc(obj_type).c_str());
-            fprintf(f, "  \"nice_name\": \"%s\",\n",   json_esc(name_safe).c_str());
+            fprintf(f, "  \"name\": \"%s\",\n",           json_esc(obj_safe).c_str());
+            fprintf(f, "  \"category\": \"%s\",\n",       json_esc(cat_safe).c_str());
+            fprintf(f, "  \"object\": \"%s\",\n",         json_esc(obj_type).c_str());
+            fprintf(f, "  \"description\": \"%s\",\n",    json_esc(description).c_str());
+            fprintf(f, "  \"tags\": \"%s\",\n",           json_esc(tags).c_str());
+            fprintf(f, "  \"source\": \"%s\",\n",         json_esc(src).c_str());
             fprintf(f, "  \"render_resolution\": [%d, %d],\n", w, h);
             fprintf(f, "  \"frames_accumulated\": %d,\n", bp.config.target_frames);
-            fprintf(f, "  \"nim_used\": %s,\n",        bp.nim_result.success ? "true" : "false");
-            fprintf(f, "  \"date\": \"%s\"\n",         date_str);
+            fprintf(f, "  \"nim_used\": %s,\n",           bp.nim_result.success ? "true" : "false");
+            fprintf(f, "  \"date\": \"%s\"\n",            date_str);
             fprintf(f, "}\n");
             fclose(f);
         }
@@ -193,12 +213,12 @@ void batch_save(BatchProcessor& bp, const float* pixels_rgba_f32, int w, int h)
     BatchLogEntry e;
     e.source_path = src;
     e.category    = cat_safe;
-    e.nice_name   = name_safe;
+    e.object_name = obj_safe;
     e.out_dir     = out_dir.string();
     bp.log.push_back(e);
 
     snprintf(bp.status, sizeof(bp.status), "Saved: %s/%s",
-             cat_safe.c_str(), name_safe.c_str());
+             cat_safe.c_str(), obj_safe.c_str());
 }
 
 void batch_start(BatchProcessor& bp)
@@ -291,7 +311,7 @@ void batch_panel_draw(BatchProcessor& bp)
         if (ImGui::BeginChild("##batch_log", ImVec2(0, log_h), true)) {
             for (auto it = bp.log.rbegin(); it != bp.log.rend(); ++it) {
                 ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f),
-                    "%s / %s", it->category.c_str(), it->nice_name.c_str());
+                    "%s / %s", it->category.c_str(), it->object_name.c_str());
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", it->source_path.c_str());
             }

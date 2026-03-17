@@ -1,0 +1,12 @@
+{
+  "name": "baseball",
+  "category": "prop",
+  "object": "baseball",
+  "description": "A white baseball with red stitching, suspended in mid-air. The ball has a textured surface and appears to be made of leather. The stitching is evenly spaced and the ball is in focus against a blurred background.",
+  "tags": "baseball, sports, leather, stitching, mid-air, focus, blurred background, sports equipment",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\ball_baseball_realistic.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

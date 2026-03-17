@@ -41,6 +41,7 @@ struct VulkanContext {
     VkSemaphore              imageAvailable[MAX_FRAMES] = {};
     std::vector<VkSemaphore> renderFinished;              // size == swapchain image count
     VkFence                  inFlight[MAX_FRAMES]        = {};
+    std::vector<VkFence>     imagesInFlight;              // per swapchain image — which fence last submitted it
     int                      currentFrame               = 0;
 
     bool enableValidation = true;

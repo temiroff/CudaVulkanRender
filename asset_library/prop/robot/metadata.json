@@ -1,0 +1,12 @@
+{
+  "name": "robot",
+  "category": "prop",
+  "object": "robot",
+  "description": "A small, detailed robot with a red and grey color scheme, featuring a head with two eyes, a mouth, and a body with a chest plate and mechanical details. It stands on two legs with articulated arms.",
+  "tags": "robot, science fiction, artificial intelligence, mech, droid, cybernetic, metallic, red, grey, mechanical",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\robot.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

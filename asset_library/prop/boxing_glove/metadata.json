@@ -1,0 +1,12 @@
+{
+  "name": "boxing_glove",
+  "category": "prop",
+  "object": "boxing glove",
+  "description": "A red boxing glove with a black strap and a small black eyelet. It appears to be made of leather with a glossy finish. The glove is positioned in a way that suggests it is being held up against a background.",
+  "tags": "boxing, glove, red, leather, sports, fitness, gym, equipment, athletic",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\boxing_glove_realistic.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "wooden_table",
+  "category": "furniture",
+  "object": "wooden table",
+  "description": "A rustic wooden table with a high carved back and four legs. The seat is upholstered in dark leather with brass nail trim. Aged oak finish with visible wood grain.",
+  "tags": "chair, wooden, furniture, seating, rustic, oak, antique, interior",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\Lantern.gltf",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

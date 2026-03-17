@@ -5,7 +5,7 @@
 #include <string>
 #include <algorithm>
 
-// ── Native Windows file picker ──────────────────────────────────────────────
+// ?????? Native Windows file picker ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 #include <windows.h>
 #include <shobjidl.h>   // IFileOpenDialog
 
@@ -49,7 +49,20 @@ static std::string open_gltf_picker() {
 
 static const char* mat_names[] = { "Lambertian", "Metal", "Dielectric", "Emissive" };
 
-static std::string save_exr_picker() {
+static const char* viewport_pass_name(int pass)
+{
+    switch ((ViewportPassMode)pass) {
+        case ViewportPassMode::Final:      return "Final";
+        case ViewportPassMode::RawRender:  return "Raw Render";
+        case ViewportPassMode::Denoised:   return "Denoised";
+        case ViewportPassMode::DlssInput:  return "DLSS Input";
+        case ViewportPassMode::DlssDepth:  return "DLSS Depth";
+        case ViewportPassMode::DlssMotion: return "DLSS Motion";
+        default:                           return "Final";
+    }
+}
+
+static std::string save_render_picker(bool /*unused*/) {
     std::string result;
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
@@ -124,25 +137,36 @@ static std::string open_hdri_picker() {
 bool control_panel_draw(ControlPanelState& s) {
     bool cam_changed = false;
 
-    ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_MenuBar);
+    ImGui::Begin("Controls");
 
-    // ── Menu bar ──────────────────────────────
+    // ?????? Menu bar ??????????????????????????????????????????????????????????????????????????????????????????
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Save Render as EXR...", "Ctrl+S")) {
-                std::string p = save_exr_picker();
+            ImGui::MenuItem("Apply Tonemapping on Save", nullptr, &s.save_exr_tonemapped);
+            ImGui::MenuItem("16-bit Half EXR", nullptr, &s.save_exr_half);
+            ImGui::Separator();
+            const char* label = s.save_exr_half ? "Save Render as EXR (16-bit)..."
+                                                 : "Save Render as EXR (32-bit)...";
+            if (ImGui::MenuItem(label, "Ctrl+S")) {
+                std::string p = save_render_picker(false);
                 if (!p.empty()) {
-                    strncpy(s.save_exr_path, p.c_str(), sizeof(s.save_exr_path) - 1);
-                    s.save_exr_path[sizeof(s.save_exr_path) - 1] = '\0';
+                    strncpy_s(s.save_exr_path, sizeof(s.save_exr_path), p.c_str(), _TRUNCATE);
                     s.save_exr_requested = true;
                 }
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Overlays")) {
+            ImGui::MenuItem("Selection outline",      nullptr, &s.overlay_selection);
+            ImGui::MenuItem("Move gizmo",             nullptr, &s.overlay_gizmo);
+            ImGui::MenuItem("Orbit pivot",            nullptr, &s.overlay_orbit);
+            ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
+            ImGui::EndMenu();
+        }
         ImGui::EndMenuBar();
     }
 
-    // ── Interaction mode toggle ──────────────
+    // ?????? Interaction mode toggle ??????????????????????????????????????????
     ImGui::Text("Mode:");
     ImGui::SameLine();
     if (ImGui::RadioButton("Select", s.interact_mode == InteractMode::Select))
@@ -156,7 +180,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── Camera ──────────────────────────────
+    // ?????? Camera ??????????????????????????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Text("Pos: (%.2f, %.2f, %.2f)", s.pos[0], s.pos[1], s.pos[2]);
         ImGui::Text("Yaw: %.1f  Pitch: %.1f", s.yaw, s.pitch);
@@ -178,7 +202,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── Selected object info ──────────────────
+    // ?????? Selected object info ??????????????????????????????????????????????????????
     bool any_selected = (s.selected_sphere >= 0 || s.selected_mesh_obj >= 0);
     if (any_selected) {
         if (ImGui::CollapsingHeader("Selection", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -195,7 +219,7 @@ bool control_panel_draw(ControlPanelState& s) {
         ImGui::Separator();
     }
 
-    // ── Render Settings ──────────────────────
+    // ?????? Render Settings ??????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
         cam_changed |= ImGui::SliderInt("SPP / frame", &s.spp,       1, 32);
         cam_changed |= ImGui::SliderInt("Max Depth",   &s.max_depth, 1, 32);
@@ -205,13 +229,14 @@ bool control_panel_draw(ControlPanelState& s) {
         cam_changed |= ImGui::SliderFloat("Firefly Clamp", &s.firefly_clamp, 0.f, 100.f);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Clamp per-sample luminance to suppress bright speckles.\n0 = disabled. 5-20 recommended with HDRI.");
-        ImGui::Text("Accumulated frames: %d", s.frame_count);
+        ImGui::Text("Accumulated samples: %d  (%d frames ?? %d spp)",
+                    s.frame_count * s.spp, s.frame_count, s.spp);
         if (ImGui::Button("Reset Accumulation")) cam_changed = true;
     }
 
     ImGui::Separator();
 
-    // ── Performance Stats ─────────────────────
+    // ?????? Performance Stats ???????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Text("%.2f Mrays/sec", s.mrays_per_sec);
         ImGui::Text("%.2f ms / frame", s.frame_ms);
@@ -227,7 +252,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── glTF Model ───────────────────────────
+    // ?????? glTF Model ?????????????????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Scene (glTF / USD)", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (s.mesh_loaded)
             ImGui::TextColored(ImVec4(0.4f,1.f,0.4f,1.f), "Loaded  %d triangles", s.num_mesh_tris);
@@ -262,14 +287,14 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── HDRI Environment ──────────────────────
+    // ?????? HDRI Environment ??????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("HDRI Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
         float btn_w = ImGui::GetContentRegionAvail().x;
 
         if (s.hdri_loaded) {
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "HDRI loaded");
         } else {
-            ImGui::TextDisabled("No HDRI — using gradient sky");
+            ImGui::TextDisabled("No HDRI ??? using gradient sky");
         }
 
         // Show filename
@@ -300,7 +325,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── Denoiser (OIDN) ───────────────────────
+    // ?????? Denoiser (OIDN) ?????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Denoiser (OIDN)", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (s.denoise_available) {
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "OIDN ready (CPU)");
@@ -312,7 +337,7 @@ bool control_panel_draw(ControlPanelState& s) {
                 ImGui::Unindent(12.f);
             }
             if (ImGui::Button("Denoise Now")) s.denoise_on_demand = true;
-            ImGui::TextDisabled("CPU denoiser — fast at convergence");
+            ImGui::TextDisabled("CPU denoiser ??? fast at convergence");
         } else {
             ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f), "OIDN not found");
             ImGui::TextDisabled("Install OIDN SDK and rebuild with:");
@@ -323,7 +348,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── Post Processing ───────────────────────
+    // ?????? Post Processing ?????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Post Processing", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Enable Post-Processing", &s.post_enabled);
         if (s.post_enabled) {
@@ -364,10 +389,10 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── AI Object Recognition ─────────────────
+    // ?????? AI Object Recognition ???????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("AI Object Recognition (NIM VLM)")) {
 
-        // ── Mode toggle ──────────────────────────
+        // ?????? Mode toggle ??????????????????????????????????????????????????????????????????????????????
         bool cloud_mode = s.nim_cfg.use_https;
         if (ImGui::RadioButton("Cloud API (api.nvidia.com)", cloud_mode)) {
             s.nim_cfg.use_https = true;
@@ -414,16 +439,16 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── Connection status + test ──────────────
+        // ?????? Connection status + test ??????????????????????????????????????????
         {
             float bw = ImGui::GetContentRegionAvail().x - 10.f;
             if (s.nim_connection_tested) {
                 if (s.nim_connection_ok) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f,1.f,0.4f,1.f));
-                    ImGui::Text("● Connected");
+                    ImGui::Text("??? Connected");
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f,0.35f,0.3f,1.f));
-                    ImGui::Text("● Unreachable");
+                    ImGui::Text("??? Unreachable");
                 }
                 ImGui::PopStyleColor();
                 ImGui::SameLine(bw - 80.f);
@@ -436,7 +461,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── Auto-recognize ───────────────────────
+        // ?????? Auto-recognize ?????????????????????????????????????????????????????????????????????
         ImGui::Checkbox("Auto-recognize", &s.nim_auto_enabled);
         if (s.nim_auto_enabled) {
             ImGui::SameLine();
@@ -447,7 +472,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── Manual trigger ────────────────────────
+        // ?????? Manual trigger ????????????????????????????????????????????????????????????????????????
         if (s.nim_busy) {
             static float anim = 0.f;
             anim += ImGui::GetIO().DeltaTime * 2.f;
@@ -464,18 +489,25 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── Results ──────────────────────────────
+        // ?????? Results ??????????????????????????????????????????????????????????????????????????????????????????
         if (s.nim_result.success) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.f, 0.6f, 1.f));
-            ImGui::TextWrapped("%s", s.nim_result.nice_name);
+            ImGui::TextWrapped("%s", s.nim_result.object_type);
             ImGui::PopStyleColor();
             ImGui::Spacing();
             ImGui::TextDisabled("Category");
             ImGui::SameLine(90.f);
             ImGui::Text("%s", s.nim_result.category);
-            ImGui::TextDisabled("Object  ");
-            ImGui::SameLine(90.f);
-            ImGui::TextWrapped("%s", s.nim_result.object_type);
+            if (s.nim_result.description[0] != '\0') {
+                ImGui::TextDisabled("Desc    ");
+                ImGui::SameLine(90.f);
+                ImGui::TextWrapped("%s", s.nim_result.description);
+            }
+            if (s.nim_result.tags[0] != '\0') {
+                ImGui::TextDisabled("Tags    ");
+                ImGui::SameLine(90.f);
+                ImGui::TextWrapped("%s", s.nim_result.tags);
+            }
         } else if (s.nim_result.error_msg[0] != '\0') {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
             ImGui::TextWrapped("Error: %s", s.nim_result.error_msg);
@@ -487,10 +519,10 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── GPU Features ─────────────────────────
+    // ?????? GPU Features ???????????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("GPU Features", ImGuiTreeNodeFlags_DefaultOpen)) {
 
-        // ── Baseline FPS capture ──────────────────
+        // ?????? Baseline FPS capture ??????????????????????????????????????????????????????
         float cur_fps = s.frame_ms > 0.f ? 1000.f / s.frame_ms : 0.f;
         if (!s.fps_locked) {
             if (ImGui::Button("Lock Baseline FPS")) {
@@ -513,43 +545,84 @@ bool control_panel_draw(ControlPanelState& s) {
 
         ImGui::Separator();
 
-        // ── ReSTIR DI ────────────────────────────
+        // ?????? ReSTIR DI ????????????????????????????????????????????????????????????????????????????????????
         ImGui::TextColored(ImVec4(0.5f,0.9f,1.f,1.f), "ReSTIR DI");
         ImGui::SameLine();
         ImGui::TextDisabled("(CUDA, always available)");
         cam_changed |= ImGui::Checkbox("Enable ReSTIR##restir", &s.restir_enabled);
         if (s.restir_enabled) {
             ImGui::Indent(12.f);
+            static const char* restir_mode_items[] = {
+                "RIS Only",
+                "Spatial Reuse",
+                "Temporal Reuse",
+                "Temporal + Spatial",
+            };
+            cam_changed |= ImGui::Combo("Reuse mode##restir_mode", &s.restir_mode,
+                                        restir_mode_items, IM_ARRAYSIZE(restir_mode_items));
             cam_changed |= ImGui::SliderInt("Candidates (M)##rc", &s.restir_candidates, 1, 64);
-            cam_changed |= ImGui::Checkbox("Spatial reuse##rs",    &s.restir_spatial);
-            if (s.restir_spatial)
+            const bool mode_uses_spatial =
+                s.restir_mode == (int)ReSTIRReuseMode::Spatial ||
+                s.restir_mode == (int)ReSTIRReuseMode::TemporalSpatial;
+            if (mode_uses_spatial)
                 cam_changed |= ImGui::SliderInt("Radius px##rr", &s.restir_radius, 5, 60);
+            ImGui::TextDisabled("RIS = direct-light candidate sampling only");
+            ImGui::TextDisabled("Temporal = previous-frame reprojection, Spatial = neighbor reuse");
             ImGui::Unindent(12.f);
         }
 
         ImGui::Separator();
 
-        // ── OptiX ────────────────────────────────
-        ImGui::TextColored(ImVec4(1.f,0.8f,0.3f,1.f), "OptiX RT Cores");
+        // ?????? OptiX GPU Denoiser ????????????????????????????????????????????????????????????
+        ImGui::Separator();
+
+        ImGui::TextColored(ImVec4(0.4f,1.f,1.f,1.f), "OptiX RT Renderer");
 #ifdef OPTIX_ENABLED
         ImGui::SameLine();
         ImGui::TextDisabled("(SDK found)");
-        cam_changed |= ImGui::Checkbox("Enable OptiX##optix", &s.optix_enabled);
-        ImGui::TextDisabled("Uses HW ray tracing instead of software BVH");
+        cam_changed |= ImGui::Checkbox("Enable OptiX RT renderer##optix_rt", &s.optix_rt_enabled);
+        ImGui::TextDisabled("Mesh triangles only - uses RT cores for traversal");
+        ImGui::TextDisabled("CUDA ReSTIR stays on the CUDA backend");
+#else
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1.f), "(SDK not found)");
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
+        bool _dummy_optix_rt = false;
+        ImGui::Checkbox("Enable OptiX RT renderer##optix_rt", &_dummy_optix_rt);
+        ImGui::PopStyleVar();
+        ImGui::TextDisabled("Download OptiX SDK from developer.nvidia.com");
+        ImGui::TextDisabled("Then rebuild with OPTIX_ENABLED=ON");
+#endif
+        ImGui::TextColored(ImVec4(1.f,0.8f,0.3f,1.f), "OptiX GPU Denoiser");
+#ifdef OPTIX_ENABLED
+        ImGui::SameLine();
+        ImGui::TextDisabled("(SDK found)");
+        cam_changed |= ImGui::Checkbox("Enable OptiX denoiser##optix", &s.optix_enabled);
+        ImGui::TextDisabled("AI denoiser on GPU ??? overrides OIDN when enabled");
+        if (s.optix_enabled) {
+            ImGui::Indent(12.f);
+            ImGui::SliderInt("Every N frames##optix_dn", &s.denoise_every_n, 1, 128);
+            if (s.denoise_every_n == 1)
+                ImGui::TextDisabled("Denoising every frame (best quality, RTX recommended)");
+            else
+                ImGui::TextDisabled("Frame %d / %d", s.frame_count % s.denoise_every_n, s.denoise_every_n);
+            if (ImGui::Button("Denoise Now##optix")) s.denoise_on_demand = true;
+            ImGui::Unindent(12.f);
+        }
 #else
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1.f), "(SDK not found)");
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
         bool _dummy_optix = false;
-        ImGui::Checkbox("Enable OptiX##optix", &_dummy_optix);
+        ImGui::Checkbox("Enable OptiX denoiser##optix", &_dummy_optix);
         ImGui::PopStyleVar();
         ImGui::TextDisabled("Download OptiX SDK from developer.nvidia.com");
-        ImGui::TextDisabled("Then rebuild with -DOPTIX_ENABLED=ON");
+        ImGui::TextDisabled("Then rebuild with OPTIX_ENABLED=ON");
 #endif
 
         ImGui::Separator();
 
-        // ── DLSS / Resolution Scale ───────────────
+        // ?????? DLSS / Resolution Scale ?????????????????????????????????????????????
 #ifdef DLSS_ENABLED
         ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "DLSS (NGX)");
         cam_changed |= ImGui::Checkbox("Enable DLSS##dlss", &s.dlss_enabled);
@@ -557,39 +630,102 @@ bool control_panel_draw(ControlPanelState& s) {
         ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f), "Resolution Scale");
         cam_changed |= ImGui::Checkbox("Enable##rs_sw", &s.dlss_enabled);
 #endif
-        if (s.dlss_enabled) {
+if (s.dlss_enabled) {
             ImGui::Indent(12.f);
 
-            // Continuous scale slider: 1% → 100%
+            auto dlss_mode_name = [](int q) -> const char* {
+                switch (q) {
+                    case 0: return "Ultra Performance";
+                    case 1: return "Performance";
+                    case 3: return "Quality";
+                    case 4: return "Ultra Quality";
+                    case 5: return "DLAA";
+                    default: return "Balanced";
+                }
+            };
+
+            // Continuous scale slider: 1% ??? 100%
             int pct = (int)std::roundf(s.dlss_scale * 100.f);
             if (ImGui::SliderInt("Render %##dlss_pct", &pct, 1, 100, "%d%%")) {
                 s.dlss_scale = pct / 100.f;
-                // Derive quality preset for DLSS SDK (snaps to nearest preset)
-                if      (pct <= 58) s.dlss_quality = 0;  // Performance ~50%
-                else if (pct <= 71) s.dlss_quality = 1;  // Balanced    ~67%
-                else                s.dlss_quality = 2;  // Quality     ~75%
+                if      (pct <= 39) s.dlss_quality = 0;  // Ultra Performance
+                else if (pct <= 58) s.dlss_quality = 1;  // Performance
+                else if (pct <= 71) s.dlss_quality = 2;  // Balanced
+                else if (pct <= 84) s.dlss_quality = 3;  // Quality
+                else if (pct < 100) s.dlss_quality = 4;  // Ultra Quality
+                else                s.dlss_quality = 5;  // DLAA
                 cam_changed = true;
             }
 
-            // Visual marker lines at the 3 DLSS presets
-            float avail = ImGui::GetContentRegionAvail().x;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            ImVec2 p = ImGui::GetCursorScreenPos();
-            float bar_y = p.y - ImGui::GetTextLineHeight() * 0.5f;
-            auto mark = [&](float frac, const char* label) {
-                float x = p.x + frac * avail;
-                dl->AddLine(ImVec2(x, bar_y - 4.f), ImVec2(x, bar_y + 4.f),
-                            IM_COL32(120,220,120,180), 1.5f);
-                dl->AddText(ImVec2(x - 4.f, bar_y - 14.f),
-                            IM_COL32(140,220,140,200), label);
-            };
-            mark(0.50f, "50");
-            mark(0.67f, "67");
-            mark(0.75f, "75");
-
-            // Show current render resolution
             ImGui::TextDisabled("~%d x %d px (of viewport)",
                 (int)(s.dlss_scale * 1920), (int)(s.dlss_scale * 1080));
+            ImGui::Checkbox("Debug overlay##dlss_dbg", &s.dlss_debug);
+            if (s.dlss_debug) {
+                const char* overlay_items[] = {
+                    "Raw Render",
+                    "Denoised",
+                    "DLSS Input",
+                    "DLSS Depth",
+                    "DLSS Motion",
+                };
+                int overlay_idx = std::max(0, s.dlss_overlay_pass - 1);
+                if (ImGui::Combo("Overlay pass##dlss_overlay", &overlay_idx,
+                                 overlay_items, IM_ARRAYSIZE(overlay_items)))
+                    s.dlss_overlay_pass = overlay_idx + 1;
+            }
+            const char* viewport_items[] = {
+                "Final",
+                "Raw Render",
+                "Denoised",
+                "DLSS Input",
+                "DLSS Depth",
+                "DLSS Motion",
+            };
+            ImGui::Combo("Viewport pass##viewport_pass", &s.viewport_pass,
+                         viewport_items, IM_ARRAYSIZE(viewport_items));
+#ifdef DLSS_ENABLED
+            if (ImGui::TreeNodeEx("DLSS Debug Panel", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const float requested_pct = s.dlss_scale * 100.f;
+                const float actual_pct_x = (s.dlss_output_w_actual > 0)
+                    ? (100.f * (float)s.dlss_render_w_actual / (float)s.dlss_output_w_actual) : 0.f;
+                const float actual_pct_y = (s.dlss_output_h_actual > 0)
+                    ? (100.f * (float)s.dlss_render_h_actual / (float)s.dlss_output_h_actual) : 0.f;
+
+                ImGui::Text("Runtime: %s", s.dlss_runtime_active ? "Active" : "Inactive");
+                ImGui::Text("Auto mode: %s", dlss_mode_name(s.dlss_quality));
+                ImGui::Text("Viewport pass: %s", viewport_pass_name(s.viewport_pass));
+                ImGui::Text("Requested scale: %.1f%%", requested_pct);
+                if (s.dlss_runtime_active) {
+                    ImGui::Text("Input render: %d x %d", s.dlss_render_w_actual, s.dlss_render_h_actual);
+                    ImGui::Text("Output display: %d x %d", s.dlss_output_w_actual, s.dlss_output_h_actual);
+                    ImGui::Text("Actual scale: %.1f%% x %.1f%%", actual_pct_x, actual_pct_y);
+                } else {
+                    ImGui::TextDisabled("Input render: not active");
+                    ImGui::TextDisabled("Output display: not active");
+                }
+
+                if (s.dlss_state_valid) {
+                    const double vram_mb = (double)s.dlss_estimated_vram_bytes / (1024.0 * 1024.0);
+                    ImGui::Text("Estimated VRAM: %.1f MB", vram_mb);
+                } else {
+                    ImGui::TextDisabled("Estimated VRAM: unavailable");
+                }
+
+                ImGui::SeparatorText("Feature Support");
+                if (s.dlss_feature_query_ok) {
+                    ImGui::Text("Super Resolution: %s", s.dlss_sr_supported ? "Supported" : "Not supported");
+                    ImGui::Text("Ray Reconstruction: %s", s.dlss_rr_supported ? "Supported" : "Not supported");
+                    ImGui::Text("Frame Generation: %s", s.dlss_fg_supported ? "Supported" : "Not supported");
+                    ImGui::TextDisabled("This app currently integrates Super Resolution only.");
+                    ImGui::TextDisabled("Ray Reconstruction and Frame Generation need extra render/present integration.");
+                } else {
+                    ImGui::TextDisabled("Feature support query unavailable");
+                }
+
+                ImGui::TextDisabled("This panel shows live Streamline DLSS state for the current viewport.");
+                ImGui::TreePop();
+            }
+#endif
 #ifndef DLSS_ENABLED
             ImGui::TextDisabled("Bilinear upscale. NGX SDK = neural DLSS.");
 #endif
@@ -602,7 +738,7 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
-    // ── Debug ────────────────────────────────
+    // ?????? Debug ????????????????????????????????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("Debug")) {
         ImGui::Checkbox("BVH wireframe", &s.show_bvh_dbg);
     }
@@ -612,3 +748,29 @@ bool control_panel_draw(ControlPanelState& s) {
     s.camera_dirty = cam_changed;
     return cam_changed;
 }
+
+void control_panel_draw_main_menu(ControlPanelState& s) {
+    if (ImGui::BeginMenu("File")) {
+        ImGui::MenuItem("Apply Tonemapping on Save", nullptr, &s.save_exr_tonemapped);
+        ImGui::MenuItem("16-bit Half EXR", nullptr, &s.save_exr_half);
+        ImGui::Separator();
+        const char* label = s.save_exr_half ? "Save Render as EXR (16-bit)..."
+                                             : "Save Render as EXR (32-bit)...";
+        if (ImGui::MenuItem(label, "Ctrl+S")) {
+            std::string p = save_render_picker(false);
+            if (!p.empty()) {
+                strncpy_s(s.save_exr_path, sizeof(s.save_exr_path), p.c_str(), _TRUNCATE);
+                s.save_exr_requested = true;
+            }
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Overlays")) {
+        ImGui::MenuItem("Selection outline",      nullptr, &s.overlay_selection);
+        ImGui::MenuItem("Move gizmo",             nullptr, &s.overlay_gizmo);
+        ImGui::MenuItem("Orbit pivot",            nullptr, &s.overlay_orbit);
+        ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
+        ImGui::EndMenu();
+    }
+}
+

@@ -1,5 +1,10 @@
 #pragma once
+#ifdef _WIN32
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
+#include "scene.h"
+#include "cuda_interop.h"
 
 // DLSS (Deep Learning Super Sampling) via NVIDIA Streamline SDK.
 // Falls back gracefully when DLSS_ENABLED is not defined.
@@ -25,15 +30,14 @@ struct DlssState {
     VkDeviceMemory output_memory = VK_NULL_HANDLE;
     VkImageView    output_view   = VK_NULL_HANDLE;
 
-    // Motion vector image (render-res, RG16F — cleared to zero for static scenes)
-    VkImage        mv_image   = VK_NULL_HANDLE;
-    VkDeviceMemory mv_memory  = VK_NULL_HANDLE;
-    VkImageView    mv_view    = VK_NULL_HANDLE;
+    // Motion vector image (render-res, camera/object motion in pixel space)
+    CudaInterop    mv_interop;
 
-    // Depth image (render-res, R32_SFLOAT — cleared to zero)
-    VkImage        depth_image   = VK_NULL_HANDLE;
-    VkDeviceMemory depth_memory  = VK_NULL_HANDLE;
-    VkImageView    depth_view    = VK_NULL_HANDLE;
+    // Depth image (render-res, non-linear depth)
+    CudaInterop    depth_interop;
+
+    float2*        motion_buffer = nullptr;
+    float*         depth_buffer  = nullptr;
 
     VkDevice         device    = VK_NULL_HANDLE;
     VkPhysicalDevice phys_dev  = VK_NULL_HANDLE;
@@ -47,8 +51,25 @@ struct DlssState {
     int quality    = 1;   // 0=performance, 1=balanced, 2=quality
 
     int  frame_idx   = 0;
+    float jitter_x   = 0.f;
+    float jitter_y   = 0.f;
+    Camera prev_camera{};
+    bool   prev_camera_valid = false;
+    Camera prev_render_camera{};
+    bool   prev_render_camera_valid = false;
     bool available   = false;
     bool initialized = false;
+};
+
+struct DlssDebugState {
+    uint64_t estimated_vram_bytes = 0;
+};
+
+struct DlssFeatureSupport {
+    bool query_ok = false;
+    bool dlss_sr_supported = false;
+    bool dlss_rr_supported = false;
+    bool dlss_fg_supported = false;
 };
 
 // Quality mode → scale factor: 0→0.5, 1→0.667, 2→0.75
@@ -66,7 +87,7 @@ void dlss_pre_vulkan_init(const char* plugin_dir);
 bool dlss_init(DlssState& s,
                VkInstance instance, VkPhysicalDevice phys, VkDevice device,
                VkCommandPool cmd_pool, VkQueue queue,
-               int display_w, int display_h, int quality_mode,
+               int display_w, int display_h, int quality_mode, float render_scale,
                int& render_w_out, int& render_h_out);
 
 // Halton jitter for the current frame (call before dispatching the path tracer).
@@ -77,7 +98,18 @@ void dlss_get_jitter(DlssState& s, float& jx, float& jy);
 // After this call, s.output_image contains the upscaled full-res result.
 void dlss_upscale(DlssState& s, VkCommandBuffer cmd_buf,
                   VkImage input_image, VkImageView input_view,
-                  VkDeviceMemory input_memory, float exposure);
+                  VkDeviceMemory input_memory, float exposure,
+                  const Camera& camera, float vfov_deg, float aspect_ratio,
+                  bool reset_history);
 
 // Free all resources.
 void dlss_free(DlssState& s);
+
+// Query live DLSS runtime state from Streamline for the current viewport.
+bool dlss_get_debug_state(const DlssState& s, DlssDebugState& out_state);
+
+// Query which DLSS feature families are supported by the current adapter/runtime.
+bool dlss_query_feature_support(VkInstance instance, VkPhysicalDevice phys, DlssFeatureSupport& out_support);
+
+// Shut down the global Streamline runtime before destroying VkDevice/VkInstance.
+void dlss_shutdown();

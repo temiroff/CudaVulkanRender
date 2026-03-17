@@ -1,0 +1,12 @@
+{
+  "name": "guitar",
+  "category": "prop",
+  "object": "guitar",
+  "description": "A red electric guitar with a white pickguard and a black neck. It has a wooden headstock and is equipped with a microphone attached to a stand.",
+  "tags": "guitar, electric, red, white, black, microphone, stand, music, prop",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\fender_stratocaster.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

@@ -125,6 +125,8 @@ struct GpuMaterial {
     int    metallic_rough_tex;  // G channel = roughness, B channel = metallic
     int    normal_tex;          // tangent-space normal map (-1 = unused)
     int    emissive_tex;        // -1 = none
+    // 1 = custom shader owns all textures — read them as absolute values, not factors
+    int    custom_shader;
 };
 
 // ─────────────────────────────────────────────

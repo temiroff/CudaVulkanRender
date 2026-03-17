@@ -402,6 +402,9 @@ VulkanContext vk_create(GLFWwindow* window, bool enableValidation) {
     for (auto& s : ctx.renderFinished)
         vkCreateSemaphore(ctx.device, &sem, nullptr, &s);
 
+    // Per-image in-flight fence tracking — VK_NULL_HANDLE = not yet submitted
+    ctx.imagesInFlight.assign(ctx.swapImages.size(), VK_NULL_HANDLE);
+
     for (int i = 0; i < VulkanContext::MAX_FRAMES; ++i)
         vkCreateFence(ctx.device, &fen, nullptr, &ctx.inFlight[i]);
 
@@ -422,6 +425,9 @@ void vk_recreate_swapchain(VulkanContext& ctx, GLFWwindow* window) {
     for (auto s : ctx.renderFinished) vkDestroySemaphore(ctx.device, s, nullptr);
     ctx.renderFinished.resize(ctx.swapImages.size());
     for (auto& s : ctx.renderFinished) vkCreateSemaphore(ctx.device, &sem, nullptr, &s);
+
+    // Reset per-image fence tracking after swapchain recreate
+    ctx.imagesInFlight.assign(ctx.swapImages.size(), VK_NULL_HANDLE);
 }
 
 uint32_t vk_begin_frame(VulkanContext& ctx) {
@@ -432,6 +438,16 @@ uint32_t vk_begin_frame(VulkanContext& ctx) {
                                              ctx.imageAvailable[ctx.currentFrame],
                                              VK_NULL_HANDLE, &image_index);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) return UINT32_MAX;
+
+    // If a previous frame is still using this swapchain image's command buffer,
+    // wait for that specific fence before resetting.  With 2 frames-in-flight but
+    // 3 swapchain images, image_index and currentFrame can diverge, so the
+    // inFlight[currentFrame] wait above does NOT guarantee this image is free.
+    if (ctx.imagesInFlight[image_index] != VK_NULL_HANDLE)
+        vkWaitForFences(ctx.device, 1, &ctx.imagesInFlight[image_index], VK_TRUE, UINT64_MAX);
+
+    // Record which fence now owns this image's slot
+    ctx.imagesInFlight[image_index] = ctx.inFlight[ctx.currentFrame];
 
     vkResetFences(ctx.device, 1, &ctx.inFlight[ctx.currentFrame]);
     vkResetCommandBuffer(ctx.commandBuffers[image_index], 0);

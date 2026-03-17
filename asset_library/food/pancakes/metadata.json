@@ -1,0 +1,12 @@
+{
+  "name": "pancakes",
+  "category": "food",
+  "object": "pancakes",
+  "description": "A stack of golden-brown pancakes with blueberries on top, served on a white plate. The pancakes appear fluffy and are garnished with fresh blueberries. The plate is placed on a surface with a yellow line, suggesting a parking lot.",
+  "tags": "pancakes, blueberries, food, breakfast, dessert, parking lot, yellow line, white plate, outdoor",
+  "source": "F:\\PROJECTS\\NVDIA\\CudaVulkan\\model\\Assets\\pancakes_photogrammetry.usdz",
+  "render_resolution": [1105, 841],
+  "frames_accumulated": 234,
+  "nim_used": true,
+  "date": "2026-03-15"
+}

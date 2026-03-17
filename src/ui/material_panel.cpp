@@ -7,6 +7,9 @@
 #include <unordered_map>
 #include <string>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <windows.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Internal helpers
@@ -233,10 +236,36 @@ static int draw_assign_tab(int current_mat, std::vector<GpuMaterial>& host_mats,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Shader preset helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string get_shaders_dir()
+{
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    namespace fs = std::filesystem;
+    fs::path dir = fs::path(exe).parent_path() / "shaders";
+    fs::create_directories(dir);
+    return dir.string();
+}
+
+static std::vector<std::string> scan_shader_presets(const char* ext)
+{
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    std::string dir = get_shaders_dir();
+    if (!fs::exists(dir)) return out;
+    for (auto& e : fs::directory_iterator(dir))
+        if (e.is_regular_file() && e.path().extension() == ext)
+            out.push_back(e.path().stem().string());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Tab 3 — Custom Shader (NVRTC / Slang-compatible)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Per-material shader code buffer (keyed by mat_idx)
 // Per-material shader code — separate for each language
 static std::unordered_map<int, std::string>    s_cuda_code;
 static std::unordered_map<int, std::string>    s_slang_code;
@@ -262,8 +291,11 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
     if (s_shader_state.find(mat_idx) == s_shader_state.end()) s_shader_state[mat_idx] = {};
 
     auto& state = s_shader_state[mat_idx];
-    bool is_slang = (state.lang == 1);
-    auto& code  = is_slang ? s_slang_code[mat_idx] : s_cuda_code[mat_idx];
+    // Always look up through a lambda so we get the current language's store,
+    // even after the combo widget changes state.lang mid-frame.
+    auto get_code = [&]() -> std::string& {
+        return state.lang == 1 ? s_slang_code[mat_idx] : s_cuda_code[mat_idx];
+    };
 
     // ── Language selector ─────────────────────────────────────────────────────
     ImGui::Text("Language");
@@ -293,7 +325,7 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
     }
     ImGui::SameLine(); ImGui::TextDisabled("px");
 
-    ImGui::TextDisabled(is_slang
+    ImGui::TextDisabled(state.lang == 1
         ? "Return MatOut from custom_material(uv, pos, normal, frame) — Slang syntax"
         : "Return MatOut from __device__ custom_material(uv, pos, normal, frame) — CUDA C++");
     ImGui::Separator();
@@ -307,24 +339,96 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
     if (s_last_mat != mat_idx || s_last_lang != state.lang) {
         s_last_mat  = mat_idx;
         s_last_lang = state.lang;
-        int n = (int)code.size();
+        // Use state.lang directly — is_slang was evaluated before the combo widget
+        // could change state.lang, so it may hold the old value here.
+        bool cur_slang = (state.lang == 1);
+        const std::string& src = cur_slang ? s_slang_code[mat_idx] : s_cuda_code[mat_idx];
+        int n = (int)src.size();
         if (n >= EDITOR_BUF) n = EDITOR_BUF - 1;
-        memcpy(s_edit_buf, code.c_str(), (size_t)n);
+        memcpy(s_edit_buf, src.c_str(), (size_t)n);
         s_edit_buf[n] = '\0';
     }
 
     float editor_h = ImGui::GetContentRegionAvail().y - 80.f;
     if (editor_h < 100.f) editor_h = 100.f;
 
+    // Widget ID includes mat_idx and lang so ImGui re-reads the buffer on switch
+    char editor_id[48];
+    snprintf(editor_id, sizeof(editor_id), "##shader_code_%d_%d", mat_idx, state.lang);
+
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.10f, 0.12f, 1.f));
     ImGui::PushFont(ImGui::GetIO().Fonts->Fonts.Size > 1
                     ? ImGui::GetIO().Fonts->Fonts[1] : nullptr);
-    ImGui::InputTextMultiline("##shader_code", s_edit_buf, EDITOR_BUF,
+    ImGui::InputTextMultiline(editor_id, s_edit_buf, EDITOR_BUF,
                                ImVec2(-1.f, editor_h),
                                ImGuiInputTextFlags_AllowTabInput);
     ImGui::PopFont();
     ImGui::PopStyleColor();
-    code = s_edit_buf;
+    get_code() = s_edit_buf;
+
+    // ── Save / Load preset row ────────────────────────────────────────────────
+    {
+        const char* ext = (state.lang == 1) ? ".slang" : ".cu";
+
+        static char                  s_save_name[128]          = "my_shader";
+        static std::vector<std::string> s_preset_list;
+        static bool                  s_presets_stale           = true;
+        static int                   s_preset_idx              = -1;
+        static int                   s_last_lang_for_presets   = -1;
+
+        if (state.lang != s_last_lang_for_presets) {
+            s_last_lang_for_presets = state.lang;
+            s_presets_stale = true;
+            s_preset_idx    = -1;
+        }
+
+        // Dropdown — load preset
+        const char* combo_preview = (s_preset_idx >= 0 && s_preset_idx < (int)s_preset_list.size())
+                                    ? s_preset_list[s_preset_idx].c_str() : "Load preset...";
+        ImGui::SetNextItemWidth(150.f);
+        if (ImGui::BeginCombo("##preset_load", combo_preview)) {
+            if (s_presets_stale) {
+                s_preset_list   = scan_shader_presets(ext);
+                s_presets_stale = false;
+            }
+            if (s_preset_list.empty())
+                ImGui::TextDisabled("No saved shaders yet");
+            for (int i = 0; i < (int)s_preset_list.size(); ++i) {
+                if (ImGui::Selectable(s_preset_list[i].c_str(), i == s_preset_idx)) {
+                    s_preset_idx = i;
+                    std::string path = get_shaders_dir() + "/" + s_preset_list[i] + ext;
+                    std::ifstream f(path);
+                    if (f) {
+                        get_code().assign(std::istreambuf_iterator<char>(f), {});
+                        // Sync s_edit_buf immediately so the editor shows the loaded code
+                        const std::string& loaded = get_code();
+                        int n = (int)loaded.size();
+                        if (n >= EDITOR_BUF) n = EDITOR_BUF - 1;
+                        memcpy(s_edit_buf, loaded.c_str(), (size_t)n);
+                        s_edit_buf[n] = '\0';
+                        state.compiled = false;
+                        state.has_error = false;
+                        state.log.clear();
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+
+        // Save name input + button
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 50.f);
+        ImGui::InputText("##save_name", s_save_name, sizeof(s_save_name));
+        ImGui::SameLine();
+        if (ImGui::Button("Save")) {
+            std::string name(s_save_name);
+            if (!name.empty()) {
+                std::string path = get_shaders_dir() + "/" + name + ext;
+                std::ofstream f(path);
+                if (f) { f << get_code(); s_presets_stale = true; }
+            }
+        }
+    }
 
     ImGui::Spacing();
 
@@ -354,7 +458,9 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
         ImGui::PopStyleColor();
         if (!state.log.empty()) ImGui::TextDisabled("Warnings: %s", state.log.c_str());
     } else {
-        ImGui::TextDisabled("Press Compile & Apply to run the shader.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.85f, 0.2f, 1.f));
+        ImGui::Text(">> Press Compile & Apply to apply this shader.");
+        ImGui::PopStyleColor();
     }
     if (has_original)
         ImGui::TextDisabled("Original BSDF saved — Reset to BSDF restores it.");
@@ -368,8 +474,9 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
 
         bool ok = false;
         std::string err;
-        if (is_slang) {
-            SlangShaderResult sr = slang_shader_run(code, state.tex_w, state.tex_h, frame_count);
+        const std::string compile_code = get_code();  // snapshot current lang's code
+        if (state.lang == 1) {
+            SlangShaderResult sr = slang_shader_run(compile_code, state.tex_w, state.tex_h, frame_count);
             ok  = sr.success;
             err = sr.error_log;
             if (ok) {
@@ -379,7 +486,7 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
                 result.shader_normal_pixels   = std::move(sr.normal_pixels);
             }
         } else {
-            CustomShaderResult cr = custom_shader_run(code, state.tex_w, state.tex_h, frame_count);
+            CustomShaderResult cr = custom_shader_run(compile_code, state.tex_w, state.tex_h, frame_count);
             ok  = cr.success;
             err = cr.error_log;
             if (ok) {
@@ -396,12 +503,15 @@ static MaterialPanelChange draw_shader_tab(int mat_idx, GpuMaterial& mat, int fr
             result.shader_w   = state.tex_w;
             result.shader_h   = state.tex_h;
             result.shader_mat = mat_idx;
+            mat.custom_shader = 1;      // pathtracer uses textures as absolute values
+            result.materials  = true;   // re-upload GpuMaterial
         }
     }
 
     // ── Reset to original BSDF ────────────────────────────────────────────────
     if (clicked_reset && has_original) {
         mat = s_original_mat[mat_idx];            // restore PBR properties + textures
+        mat.custom_shader = 0;                    // back to normal factor×texture mode
         s_original_mat.erase(mat_idx);            // forget snapshot
         state.compiled  = false;
         state.has_error = false;

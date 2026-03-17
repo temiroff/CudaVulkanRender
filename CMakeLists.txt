@@ -8,7 +8,7 @@ set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 = Ada Lovelace = sm_89
 find_package(Vulkan REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
-# ── Optional: OptiX SDK ───────────────────────────────────────────────────────
+# ?????? Optional: OptiX SDK ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 # Set OPTIX_SDK_DIR in cmake-gui or -DOPTIX_SDK_DIR=... on command line.
 # Auto-detected from standard NVIDIA install locations if left empty.
 set(OPTIX_SDK_DIR "" CACHE PATH "Path to OptiX SDK root (contains include/optix.h)")
@@ -28,13 +28,13 @@ if(EXISTS "${OPTIX_SDK_DIR}/include/optix.h")
     message(STATUS "OptiX SDK found: ${OPTIX_SDK_DIR}")
     set(OPTIX_FOUND ON)
 else()
-    message(STATUS "OptiX SDK not found — set OPTIX_SDK_DIR in cmake-gui")
+    message(STATUS "OptiX SDK not found ??? set OPTIX_SDK_DIR in cmake-gui")
     set(OPTIX_FOUND OFF)
 endif()
 
-# ── Optional: Intel OIDN denoiser ────────────────────────────────────────────
+# ?????? Optional: Intel OIDN denoiser ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 # Searches common install locations; override with -DOIDN_ROOT=...
-# Houdini 20 ships OIDN 1.4 with headers + lib — auto-detected if installed.
+# Houdini 20 ships OIDN 1.4 with headers + lib ??? auto-detected if installed.
 set(OIDN_ROOT "" CACHE PATH "Path to OIDN SDK root (contains include/OpenImageDenoise/oidn.h)")
 
 # Candidate search paths
@@ -66,15 +66,16 @@ if(OIDN_INCLUDE_DIR AND OIDN_LIBRARY)
     message(STATUS "OIDN found: ${OIDN_LIBRARY}")
     set(OIDN_FOUND ON)
 else()
-    message(STATUS "OIDN not found — denoiser disabled (set OIDN_ROOT)")
+    message(STATUS "OIDN not found ??? denoiser disabled (set OIDN_ROOT)")
     set(OIDN_FOUND OFF)
 endif()
 
-# ── Optional: DLSS via NVIDIA Streamline SDK ──────────────────────────────────
+# ?????? Optional: DLSS via NVIDIA Streamline SDK ??????????????????????????????????????????????????????????????????????????????????????????????????????
 # Download prebuilt SDK from: https://github.com/NVIDIA-RTX/Streamline/releases
 # Set DLSS_SDK_DIR in cmake-gui or -DDLSS_SDK_DIR=... on command line.
 # SDK root must contain include/sl.h and lib/x64/sl.interposer.lib.
 set(DLSS_SDK_DIR "" CACHE PATH "Path to Streamline SDK root (contains include/sl.h)")
+option(STREAMLINE_USE_DEVELOPMENT_DLLS "Use Streamline development DLLs (shows SDK watermark, no app/project ID required)" ON)
 
 # Auto-detect from bundled external/streamline if not set
 if(NOT DLSS_SDK_DIR OR NOT EXISTS "${DLSS_SDK_DIR}/include/sl.h")
@@ -89,13 +90,13 @@ if(EXISTS "${DLSS_SDK_DIR}/include/sl.h")
     message(STATUS "Streamline (DLSS) SDK found at ${DLSS_SDK_DIR}")
     set(DLSS_FOUND ON)
 else()
-    message(STATUS "Streamline SDK not found — DLSS disabled (set DLSS_SDK_DIR)")
+    message(STATUS "Streamline SDK not found ??? DLSS disabled (set DLSS_SDK_DIR)")
     set(DLSS_FOUND OFF)
 endif()
 
 add_subdirectory(external/glfw)
 
-# ── tinygltf (header-only; bundles stb_image + nlohmann/json) ────────────────
+# ?????? tinygltf (header-only; bundles stb_image + nlohmann/json) ????????????????????????????????????????????????
 include(FetchContent)
 FetchContent_Declare(tinygltf
     GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
@@ -107,7 +108,7 @@ set(TINYGLTF_INSTALL              OFF CACHE BOOL "" FORCE)
 set(TINYGLTF_HEADER_ONLY          ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tinygltf)
 
-# ── tinyexr (single-header EXR loader, no build system needed) ───────────────
+# ?????? tinyexr (single-header EXR loader, no build system needed) ?????????????????????????????????????????????
 FetchContent_Declare(tinyexr
     GIT_REPOSITORY https://github.com/syoyo/tinyexr.git
     GIT_TAG        v1.0.9
@@ -115,7 +116,7 @@ FetchContent_Declare(tinyexr
 )
 FetchContent_Populate(tinyexr)
 
-# ImGui sources (docking branch — required for split panels)
+# ImGui sources (docking branch ??? required for split panels)
 set(IMGUI_DIR external/imgui)
 set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui.cpp
@@ -127,9 +128,15 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
-# ── OpenUSD devkit (extracted from MayaUSD 2025) ─────────────────────────────
+# ?????? OpenUSD devkit (extracted from MayaUSD 2025) ???????????????????????????????????????????????????????????????????????????????????????
 set(USD_DEVKIT_DIR "${CMAKE_SOURCE_DIR}/external/usd_devkit")
 set(MAYA_USD_LIB_DIR "C:/Program Files/Autodesk/MayaUSD/Maya2025/0.29.0/mayausd/USD/lib")
+
+# miniz.c redefines WIN32_LEAN_AND_MEAN ??? suppress C4005 for that file only
+set_source_files_properties(
+    ${tinyexr_SOURCE_DIR}/deps/miniz/miniz.c
+    PROPERTIES COMPILE_OPTIONS "/wd4005"
+)
 
 add_executable(pathtracer
     src/main.cpp
@@ -150,6 +157,7 @@ add_executable(pathtracer
     src/tinyexr_impl.cpp
     ${tinyexr_SOURCE_DIR}/deps/miniz/miniz.c
     src/optix_denoiser.cpp
+    src/optix_renderer.cpp
     src/dlss_upscaler.cpp
     src/slang_shader.cpp
     src/stb_write_impl.cpp
@@ -170,7 +178,7 @@ target_include_directories(pathtracer PRIVATE
     ${tinyexr_SOURCE_DIR}
     ${tinyexr_SOURCE_DIR}/deps/miniz
     ${USD_DEVKIT_DIR}/include
-    ${USD_DEVKIT_DIR}/include/Imath         # Imath headers (ImathVec, ImathBox, half…)
+    ${USD_DEVKIT_DIR}/include/Imath         # Imath headers (ImathVec, ImathBox, half???)
     ${USD_DEVKIT_DIR}/include/boost-1_81   # USD's bundled Boost headers
     "C:/Program Files/Python311/include"   # required by Boost.Python in USD headers
 )
@@ -181,18 +189,17 @@ target_link_directories(pathtracer PRIVATE
 )
 
 target_link_libraries(pathtracer PRIVATE
-    Vulkan::Vulkan
     glfw
     CUDA::cudart
     CUDA::cuda_driver
     CUDA::nvml
     CUDA::nvrtc
     ole32 shell32 uuid winhttp
-    # OpenUSD — core libs needed for geometry + shading traversal
+    # OpenUSD ??? core libs needed for geometry + shading traversal
     usd_tf usd_arch usd_vt usd_gf usd_js usd_plug usd_trace
     usd_work usd_sdf usd_pcp usd_usd usd_ar
     usd_usdGeom usd_usdShade usd_usdUtils
-    # OpenEXR (from USD devkit) — supports all EXR compression types (DWAA, PIZ, B44, etc.)
+    # OpenEXR (from USD devkit) ??? supports all EXR compression types (DWAA, PIZ, B44, etc.)
     OpenEXR-3_1 OpenEXRCore-3_1 Iex-3_1 IlmThread-3_1 Imath-3_1
     zlibstatic
 )
@@ -216,15 +223,20 @@ add_custom_command(TARGET pathtracer POST_BUILD
 # Enable device-side linking so __device__ functions can be called across .cu TUs
 set_target_properties(pathtracer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_INCLUDE_DIR_0)
+
 target_compile_definitions(pathtracer PRIVATE
     NOMINMAX          # prevent Windows min/max macros clashing with std::numeric_limits
     WIN32_LEAN_AND_MEAN
 )
 
 if(OPTIX_FOUND)
-    target_compile_definitions(pathtracer PRIVATE OPTIX_ENABLED)
+    target_compile_definitions(pathtracer PRIVATE
+        OPTIX_ENABLED
+        OPTIX_INCLUDE_DIR="${OPTIX_SDK_DIR}/include"
+        CUDA_INCLUDE_DIR="${CUDA_INCLUDE_DIR_0}")
     target_include_directories(pathtracer PRIVATE "${OPTIX_SDK_DIR}/include")
-    message(STATUS "Building with OptiX RT core support")
+    message(STATUS "Building with OptiX SDK support (denoiser and RT renderer integrated)")
 endif()
 
 if(OIDN_FOUND)
@@ -245,12 +257,30 @@ endif()
 if(DLSS_FOUND)
     target_compile_definitions(pathtracer PRIVATE DLSS_ENABLED)
     target_include_directories(pathtracer PRIVATE "${DLSS_SDK_DIR}/include")
-    # Streamline interposer replaces vulkan-1.lib as the Vulkan dispatch layer.
-    # Link sl.interposer.lib BEFORE Vulkan::Vulkan so it wins symbol resolution.
+    # sl.interposer.dll exports all Vulkan symbols and intercepts vkCreateInstance/
+    # vkCreateDevice to inject SL extensions.  It MUST be the first Vulkan provider
+    # in the link order ??? so we removed Vulkan::Vulkan from the base link above and
+    # add it HERE after sl.interposer so sl.interposer wins every Vulkan symbol.
     target_link_directories(pathtracer PRIVATE "${DLSS_SDK_DIR}/lib/x64")
-    target_link_libraries(pathtracer PRIVATE sl.interposer)
-    # Copy all Streamline plugin DLLs next to the exe
-    file(GLOB SL_DLLS "${DLSS_SDK_DIR}/bin/x64/*.dll")
+    target_link_libraries(pathtracer PRIVATE sl.interposer Vulkan::Vulkan)
+else()
+    # No DLSS ??? use the plain Vulkan loader
+    target_link_libraries(pathtracer PRIVATE Vulkan::Vulkan)
+endif()
+
+if(DLSS_FOUND)
+    # Copy Streamline plugin DLLs next to the exe.
+    # Default to development DLLs for local runs. Production DLLs are intended
+    # for signed/onboarded titles and can report the feature as unsupported
+    # without a valid NVIDIA application ID or project ID.
+    set(_sl_dev_dir "${DLSS_SDK_DIR}/bin/x64/development")
+    if(STREAMLINE_USE_DEVELOPMENT_DLLS AND EXISTS "${_sl_dev_dir}/sl.common.dll")
+        file(GLOB SL_DLLS "${_sl_dev_dir}/*.dll")
+        message(STATUS "Using Streamline development DLLs (no app-ID required)")
+    else()
+        file(GLOB SL_DLLS "${DLSS_SDK_DIR}/bin/x64/*.dll")
+        message(STATUS "Using Streamline production DLLs")
+    endif()
     if(SL_DLLS)
         add_custom_command(TARGET pathtracer POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SL_DLLS}
@@ -263,13 +293,22 @@ endif()
 target_compile_options(pathtracer PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --use_fast_math
-        -O3
         --extended-lambda
         -Xcompiler /W3
         -Xcompiler /DNOMINMAX
     >
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:
+        -O0
+    >
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:
+        -O3
+    >
     $<$<COMPILE_LANGUAGE:CXX>:
         /W3
+        # Suppress noisy but harmless warnings from third-party headers (USD devkit, Imath, tinyexr)
+        /wd4244   # double???float/int conversion (USD/Imath)
+        /wd4267   # size_t???int (USD ndr)
+        /wd4305   # double???float truncation (Imath half)
     >
 )
 
@@ -284,10 +323,10 @@ if(GLSLC)
         COMMENT "Compiling shaders"
     )
 else()
-    message(WARNING "glslc not found — shaders won't be compiled automatically")
+    message(WARNING "glslc not found ??? shaders won't be compiled automatically")
 endif()
 
-# ── Optional: Slang shader compiler ─────────────────────────────────────────
+# ?????? Optional: Slang shader compiler ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 set(SLANG_SDK_DIR "" CACHE PATH "Path to Slang SDK root (contains bin/slangc.exe)")
 find_program(SLANGC slangc
     HINTS "${SLANG_SDK_DIR}/bin"
@@ -313,5 +352,9 @@ if(SLANGC)
         COMMENT "Compiling post.slang -> post.spv"
     )
 else()
-    message(WARNING "slangc not found — post.slang won't be compiled (set SLANG_SDK_DIR)")
+    message(WARNING "slangc not found ??? post.slang won't be compiled (set SLANG_SDK_DIR)")
 endif()
+
+
+
+

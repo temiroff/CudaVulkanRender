@@ -1,8 +1,9 @@
 #include "viewport.h"
+#include "control_panel.h"
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
 
-void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor) {
+void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor, ControlPanelState& controls) {
     vp.lmb_clicked    = false;
     vp.lmb_dragging   = false;
     vp.lmb_drag_delta = { 0.f, 0.f };
@@ -13,7 +14,12 @@ void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor) {
     vp.hovered        = false;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("Viewport");
+    ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_MenuBar);
+
+    if (ImGui::BeginMenuBar()) {
+        control_panel_draw_main_menu(controls);
+        ImGui::EndMenuBar();
+    }
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x < 1.f) avail.x = 1.f;
