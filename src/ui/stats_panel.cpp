@@ -209,8 +209,8 @@ void stats_update(NvmlContext& nvml, GpuLiveStats& live, const GpuHardwareInfo& 
     // Active core types — derived from what algorithms are actually running,
     // not checkbox state. GPU% / clocks / power come from NVML (real hardware).
     live.using_cuda_cores     = true;  // path tracer always dispatches CUDA kernels
-    // RT cores: NOT used — path tracer uses software CUDA BVH traversal, not OptiX RT
-    live.using_rt_cores       = false;
+    // RT cores: only active when OptiX RT renderer is selected (hardware BVH traversal)
+    live.using_rt_cores       = optix_rt_on && hw.has_rt_cores;
     // Tensor cores: used by OptiX AI denoiser AND by DLSS neural upscaling
     live.using_tensor_cores   = hw.has_tensor_cores &&
                                 (dlss_on || optix_denoiser_on);
@@ -400,8 +400,9 @@ bool stats_draw(const GpuHardwareInfo& hw, GpuLiveStats& live)
         core_badge("TEX", live.using_tex_units, 0.9f, 0.7f, 0.1f,
             "Texture units — active when sampling material or HDRI textures.");
         core_badge("RT", live.using_rt_cores, 0.4f, 0.8f, 1.f,
-            "RT cores — NOT used. This path tracer uses software CUDA BVH,\n"
-            "not OptiX hardware ray traversal. RT badge will stay off.");
+            "RT cores — active when 'OptiX RT Renderer' is enabled.\n"
+            "Uses hardware BVH traversal instead of software CUDA BVH.\n"
+            "Disabled: software CUDA BVH is used (default path tracer).");
         core_badge("TENSOR", live.using_tensor_cores, 1.f, 0.5f, 0.8f,
             "Tensor cores — active when OptiX AI denoiser or DLSS is running.\n"
             "Both use NVIDIA matrix-multiply units internally.");

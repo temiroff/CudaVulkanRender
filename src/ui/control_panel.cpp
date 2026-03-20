@@ -581,8 +581,21 @@ bool control_panel_draw(ControlPanelState& s) {
         ImGui::SameLine();
         ImGui::TextDisabled("(SDK found)");
         cam_changed |= ImGui::Checkbox("Enable OptiX RT renderer##optix_rt", &s.optix_rt_enabled);
-        ImGui::TextDisabled("Mesh triangles only - uses RT cores for traversal");
-        ImGui::TextDisabled("CUDA ReSTIR stays on the CUDA backend");
+        // Runtime availability status
+        if (s.optix_rt_available) {
+            if (s.optix_rt_scene_ready) {
+                ImGui::TextColored(ImVec4(0.4f,1.f,0.4f,1.f), "  Hardware BVH ready");
+            } else {
+                ImGui::TextColored(ImVec4(1.f,0.85f,0.2f,1.f), "  Load a glTF mesh to use OptiX RT");
+                ImGui::TextDisabled("  (spheres use CUDA path tracer, not OptiX RT)");
+            }
+        } else {
+            ImGui::TextColored(ImVec4(1.f,0.4f,0.4f,1.f), "  Runtime init failed");
+            if (s.optix_rt_last_error[0])
+                ImGui::TextWrapped("  %s", s.optix_rt_last_error);
+        }
+        ImGui::TextDisabled("Mesh triangles only - same visual output, faster via hardware RT cores");
+        ImGui::TextDisabled("CUDA path tracer used for spheres; ReSTIR stays on CUDA");
 #else
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1.f), "(SDK not found)");

@@ -510,12 +510,16 @@ __global__ void dlss_aux_kernel(DlssAuxParams p)
         }
     }
 
-    float depth_value = 1.f;
+    float depth_value = 1.f;  // 1.0 = background sentinel
     float2 motion_value = make_float2(0.f, 0.f);
     if (any_hit) {
         float world_x = 0.f, world_y = 0.f, world_depth = 0.f;
         if (project_world_to_pixel(p.cam, rec.p, p.width, p.height, world_x, world_y, world_depth)) {
-            depth_value = linear_depth_to_device_depth(world_depth, p.camera_near, p.camera_far);
+            // Log-scale depth: spreads near objects across the full 0..1 range.
+            // Linear depth/far compresses everything into the first 1-5% for typical
+            // scenes (far=1000, objects at 2-50 units), giving no visual differentiation.
+            float far = fmaxf(p.camera_near + 1e-3f, p.camera_far);
+            depth_value = fminf(0.9999f, fmaxf(0.f, log1pf(world_depth) / log1pf(far)));
 
             if (p.has_prev_camera) {
                 float prev_x = 0.f, prev_y = 0.f, prev_depth = 0.f;
@@ -757,6 +761,36 @@ void pathtracer_sw_upscale_debug_pip(const float4* d_accum,
     sw_pip_kernel<<<grid, block>>>(d_accum, src_w, src_h, surface, pip_w, pip_h);
 }
 
+// ── Depth auto-range reduction ────────────────────────────────────────────
+// Works for non-negative floats: IEEE 754 positive floats are ordered the
+// same as their unsigned int representations, so int atomics are valid.
+__global__ void depth_range_kernel(const float* depth, int n, float* out_min, float* out_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float d = depth[i];
+    if (d >= 1.f - 1e-4f) return;  // background sentinel — skip
+    atomicMin((int*)out_min, __float_as_int(d));
+    atomicMax((int*)out_max, __float_as_int(d));
+}
+
+void pathtracer_depth_range(const float* d_depth, int n, float* h_min, float* h_max)
+{
+    // Use two dedicated device floats (allocated once, reused each frame).
+    static float* s_buf = nullptr;
+    if (!s_buf) cudaMalloc(&s_buf, 2 * sizeof(float));
+
+    // Init: min = 1.f (will only decrease), max = 0.f (will only increase).
+    float init[2] = { 1.f, 0.f };
+    cudaMemcpy(s_buf, init, sizeof(init), cudaMemcpyHostToDevice);
+    depth_range_kernel<<<(n + 255) / 256, 256>>>(d_depth, n, s_buf, s_buf + 1);
+
+    float result[2];
+    cudaMemcpy(result, s_buf, sizeof(result), cudaMemcpyDeviceToHost); // implicit sync
+    if (result[0] >= result[1]) { *h_min = 0.f; *h_max = 1.f; }      // all background
+    else                         { *h_min = result[0]; *h_max = result[1]; }
+}
+
 __global__ void visualize_depth_kernel(const float* depth, int src_w, int src_h,
                                        float min_depth, float max_depth,
                                        cudaSurfaceObject_t surf, int dst_w, int dst_h)
@@ -768,16 +802,15 @@ __global__ void visualize_depth_kernel(const float* depth, int src_w, int src_h,
     int sx = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
     int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
     float d = depth[sy * src_w + sx];
+    // Auto-normalized: min_depth maps to white (close), max_depth maps to black (far).
+    // Background (d >= 1 - eps) stays black regardless.
     float vis = 0.f;
-    if (d < 0.99999f) {
-        float denom = fmaxf(1e-6f, max_depth - min_depth);
-        vis = (d - min_depth) / denom;
-        vis = fminf(1.f, fmaxf(0.f, vis));
-        vis = 1.f - vis;
-        vis = sqrtf(vis);
+    if (d < 1.f - 1e-4f) {
+        float range = fmaxf(1e-5f, max_depth - min_depth);
+        float t = fminf(1.f, fmaxf(0.f, (d - min_depth) / range));
+        vis = sqrtf(1.f - t);   // close=bright, far=dark, sqrt for perceptual linearity
     }
-    float4 out = make_float4(vis, vis, vis, 1.f);
-    surf2Dwrite(out, surf, dx * (int)sizeof(float4), dy);
+    surf2Dwrite(make_float4(vis, vis, vis, 1.f), surf, dx * (int)sizeof(float4), dy);
 }
 
 void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
@@ -790,7 +823,32 @@ void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
                                             surface, dst_w, dst_h);
 }
 
+// ── Motion max-magnitude reduction ───────────────────────────────────────
+__global__ void motion_maxmag_kernel(const float2* motion, int n, float* out_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float2 mv = motion[i];
+    float mag = sqrtf(mv.x * mv.x + mv.y * mv.y);
+    atomicMax((int*)out_max, __float_as_int(mag));
+}
+
+float pathtracer_motion_maxmag(const float2* d_motion, int n)
+{
+    static float* s_buf = nullptr;
+    if (!s_buf) cudaMalloc(&s_buf, sizeof(float));
+
+    float init = 0.f;
+    cudaMemcpy(s_buf, &init, sizeof(float), cudaMemcpyHostToDevice);
+    motion_maxmag_kernel<<<(n + 255) / 256, 256>>>(d_motion, n, s_buf);
+
+    float result;
+    cudaMemcpy(&result, s_buf, sizeof(float), cudaMemcpyDeviceToHost); // implicit sync
+    return (result < 0.001f) ? 0.f : result;  // 0 = no motion this frame
+}
+
 __global__ void visualize_motion_kernel(const float2* motion, int src_w, int src_h,
+                                        float max_mag,
                                         cudaSurfaceObject_t surf, int dst_w, int dst_h)
 {
     int dx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -801,29 +859,43 @@ __global__ void visualize_motion_kernel(const float2* motion, int src_w, int src
     int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
     float2 mv = motion[sy * src_w + sx];
 
-    // Motion vectors are stored in pixel space. For debug display, normalize them
-    // perceptually so sub-pixel and small camera moves remain visible.
-    float px_x = mv.x;
-    float px_y = mv.y;
+    float px_x  = mv.x;
+    float px_y  = mv.y;
     float mag_px = sqrtf(px_x * px_x + px_y * px_y);
 
-    // tanh gives a readable signed direction map without hard clipping.
-    float dir_x = tanhf(px_x * 0.35f);
-    float dir_y = tanhf(px_y * 0.35f);
-    float mag_v = 1.f - expf(-mag_px * 0.35f);
-
-    float r = fminf(1.f, fmaxf(0.f, 0.5f + 0.5f * dir_x));
-    float g = fminf(1.f, fmaxf(0.f, 0.5f - 0.5f * dir_y));
-    float b = fminf(1.f, fmaxf(0.f, mag_v));
+    // Zero motion → black.  Non-zero → HSV: hue = direction, value = magnitude.
+    // Normalise against the frame's maximum magnitude so even sub-pixel motions
+    // span the full brightness range (0 = no motion, 1 = fastest motion in frame).
+    float r = 0.f, g = 0.f, b = 0.f;
+    if (mag_px > 0.001f) {
+        float norm = (max_mag > 0.001f) ? (mag_px / max_mag) : 1.f;
+        float mag_v = fminf(1.f, norm);                      // normalised [0..1]
+        float angle = atan2f(px_y, px_x);                    // [-pi, pi]
+        float hue   = (angle + 3.14159265f) / (2.f * 3.14159265f);  // [0..1]
+        float h6    = hue * 6.f;
+        int   hi    = (int)h6 % 6;
+        float f     = h6 - floorf(h6);
+        float q     = mag_v * (1.f - f);
+        float t     = mag_v * f;
+        switch (hi) {
+            case 0:  r = mag_v; g = t;     b = 0.f;    break;
+            case 1:  r = q;     g = mag_v; b = 0.f;    break;
+            case 2:  r = 0.f;   g = mag_v; b = t;      break;
+            case 3:  r = 0.f;   g = q;     b = mag_v;  break;
+            case 4:  r = t;     g = 0.f;   b = mag_v;  break;
+            default: r = mag_v; g = 0.f;   b = q;      break;
+        }
+    }
     surf2Dwrite(make_float4(r, g, b, 1.f), surf, dx * (int)sizeof(float4), dy);
 }
 
 void pathtracer_visualize_motion(const float2* d_motion, int src_w, int src_h,
+                                 float max_mag,
                                  cudaSurfaceObject_t surface, int dst_w, int dst_h)
 {
     dim3 block(16, 16);
     dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
-    visualize_motion_kernel<<<grid, block>>>(d_motion, src_w, src_h, surface, dst_w, dst_h);
+    visualize_motion_kernel<<<grid, block>>>(d_motion, src_w, src_h, max_mag, surface, dst_w, dst_h);
 }
 
 __global__ void sw_upscale_tonemap_kernel(

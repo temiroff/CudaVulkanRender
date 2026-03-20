@@ -107,9 +107,13 @@ struct ControlPanelState {
     int  restir_mode       = (int)ReSTIRReuseMode::Spatial;
     int  restir_radius     = 30;    // spatial neighbor radius in pixels
 
-    // OptiX (requires OptiX SDK ??? detected at build time)
-    bool optix_enabled     = false;
-    bool optix_rt_enabled  = false;
+    // OptiX (requires OptiX SDK — detected at build time)
+    bool optix_enabled        = false;
+    bool optix_rt_enabled     = false;
+    // Runtime status — written by main each frame
+    bool optix_rt_available   = false;  // init succeeded
+    bool optix_rt_scene_ready = false;  // GAS built (mesh loaded)
+    char optix_rt_last_error[512] = {}; // non-empty when init failed
 
     // DLSS / Resolution scaling
     bool  dlss_enabled     = false;

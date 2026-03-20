@@ -70,6 +70,8 @@ static void optix_log_cb(unsigned int level, const char* tag, const char* msg, v
 static bool compile_optix_ptx(OptixRendererState& s, std::string& out_ptx)
 {
     const std::filesystem::path src_path = std::filesystem::path(__FILE__).parent_path() / "optix_renderer_device.cu";
+    printf("[optix_rt] Compiling %s via nvrtc...\n", src_path.string().c_str());
+    fflush(stdout);
     const std::string src = read_text_file(src_path);
     if (src.empty()) {
         set_error(s, std::string("failed to read device source: ") + src_path.string());
@@ -114,6 +116,8 @@ static bool compile_optix_ptx(OptixRendererState& s, std::string& out_ptx)
     }
     if (nvr != NVRTC_SUCCESS) {
         set_error(s, log.empty() ? std::string("nvrtcCompileProgram failed: ") + nvrtcGetErrorString(nvr) : log);
+        printf("[optix_rt] nvrtc compile failed: %s\n", s.last_error);
+        fflush(stdout);
         nvrtcDestroyProgram(&prog);
         return false;
     }
@@ -123,6 +127,8 @@ static bool compile_optix_ptx(OptixRendererState& s, std::string& out_ptx)
     out_ptx.resize(ptx_size);
     nvrtcGetPTX(prog, out_ptx.data());
     nvrtcDestroyProgram(&prog);
+    printf("[optix_rt] nvrtc OK — PTX size %zu bytes\n", ptx_size);
+    fflush(stdout);
     return true;
 }
 
@@ -161,9 +167,13 @@ static bool create_pipeline(OptixRendererState& s)
         &log_size,
         &module);
     if (res != OPTIX_SUCCESS) {
+        printf("[optix_rt] optixModuleCreate failed (res=%d): %s\n", (int)res, log);
+        fflush(stdout);
         set_error(s, std::string("optixModuleCreate failed: ") + log);
         return false;
     }
+    printf("[optix_rt] Module created OK.\n");
+    fflush(stdout);
     s.module = module;
 
     OptixProgramGroupOptions pg_opts = {};
@@ -310,12 +320,20 @@ bool optix_renderer_init(OptixRendererState& s, int width, int height)
     s.ctx = ctx;
 
     if (!create_pipeline(s)) {
+        // Preserve the error message before free() resets the struct.
+        char saved_err[512] = {};
+        std::snprintf(saved_err, sizeof(saved_err), "%s", s.last_error);
+        printf("[optix_rt] create_pipeline failed: %s\n", saved_err[0] ? saved_err : "(no message)");
+        fflush(stdout);
         optix_renderer_free(s);
+        std::snprintf(s.last_error, sizeof(s.last_error), "%s", saved_err[0] ? saved_err : "create_pipeline failed");
         return false;
     }
 
     s.available = true;
     s.initialized = true;
+    printf("[optix_rt] Pipeline ready.\n");
+    fflush(stdout);
     return true;
 #else
     (void)s; (void)width; (void)height;

@@ -30,6 +30,10 @@ extern "C" {
 __constant__ OptixLaunchParams params;
 }
 
+// float2 operators not provided by CUDA headers in nvrtc context
+static __forceinline__ __device__ float2 operator*(float2 a, float b) { return make_float2(a.x * b, a.y * b); }
+static __forceinline__ __device__ float2 operator+(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
+
 struct RadiancePRD {
     int       hit;
     HitRecord rec;

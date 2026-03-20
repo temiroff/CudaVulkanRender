@@ -18,6 +18,7 @@
 #include "hdri.h"
 #include "denoiser.h"
 #include "optix_denoiser.h"
+#include "optix_renderer.h"
 #include "dlss_upscaler.h"
 #include "post_process.h"
 #include "nim_vlm.h"
@@ -32,6 +33,8 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <stdexcept>
 #include <iostream>
 #include <vector>
@@ -553,6 +556,9 @@ struct MeshState {
     int                  num_obj_colors = 0;
     size_t               tex_bytes  = 0;   // total device bytes used by all textures
 
+    // Version counter — bumped whenever prims change so OptiX RT re-uploads BVH
+    unsigned long long scene_version = 0;
+
     // ReSTIR
     std::vector<GpuMaterial> host_mats;   // CPU copy of materials (for emissive extraction)
     EmissiveTri*         d_emissive    = nullptr;
@@ -660,6 +666,7 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
 
     ctrl.mesh_loaded   = true;
     ctrl.num_mesh_tris = (int)ms.prims.size();
+    ++ms.scene_version;  // signal OptiX RT to re-build hardware BVH
 
     // Compute AABB directly from the raw triangle list (before BVH reorders them)
     if (!tris.empty()) {
@@ -851,6 +858,13 @@ int main() {
     bvh_upload(bvh_nodes, prims_sorted, &d_bvh, &d_prims);
 
     float4*      d_accum = pathtracer_alloc_accum(rt_w, rt_h);
+
+    // DLSS auxiliary buffers — depth (float) and motion vectors (float2), render-res
+    float*  d_depth  = nullptr;  cudaMalloc(&d_depth,  (size_t)rt_w * rt_h * sizeof(float));
+    float2* d_motion = nullptr;  cudaMalloc(&d_motion, (size_t)rt_w * rt_h * sizeof(float2));
+    Camera prev_cam = {};
+    bool   has_prev_cam = false;
+
     // ReSTIR reservoir buffers (reallocated on resize)
     // Allocated in MeshState lazily at first use so they match actual viewport size
 
@@ -865,8 +879,9 @@ int main() {
     denoiser_init(denoiser, rt_w, rt_h);
     ctrl.denoise_available = denoiser.available;
 
-    OptixDenoiserState optix_dn;
-    DlssState          dlss;
+    OptixDenoiserState  optix_dn;
+    OptixRendererState  optix_rt;
+    DlssState           dlss;
     bool dlss_active = false;   // true when DLSS initialized successfully
 
     NvmlContext     nvml;
@@ -878,6 +893,12 @@ int main() {
 #ifdef OPTIX_ENABLED
     if (optix_denoiser_init(optix_dn, rt_w, rt_h))
         printf("[main] OptiX GPU denoiser available\n");
+
+    // OptiX RT init is deferred: background thread only starts when user enables the
+    // checkbox (lazy init). This avoids competing with model/HDRI loads on startup.
+    std::atomic<bool> optix_rt_init_done{false};
+    std::atomic<bool> optix_rt_init_started{false};
+    std::thread optix_rt_thread;
 #endif
 
     // DLSS — only init when user enables it (done on demand in frame loop)
@@ -1292,8 +1313,11 @@ int main() {
             interop = cuda_interop_create(vk.device, vk.physicalDevice,
                                           vk.commandPool, vk.graphicsQueue, rt_w, rt_h);
             cudaFree(d_accum); cudaFree(d_display);
+            cudaFree(d_depth);  cudaMalloc(&d_depth,  (size_t)rt_w * rt_h * sizeof(float));
+            cudaFree(d_motion); cudaMalloc(&d_motion, (size_t)rt_w * rt_h * sizeof(float2));
             d_accum   = pathtracer_alloc_accum(rt_w, rt_h);
             d_display = pathtracer_alloc_accum(rt_w, rt_h);
+            has_prev_cam = false;
             // ReSTIR reservoir buffers — reallocate on resize
             cudaFree(mesh.d_reservoirs);  mesh.d_reservoirs  = restir_alloc_reservoirs(rt_w, rt_h);
             cudaFree(mesh.d_reservoirs2); mesh.d_reservoirs2 = restir_alloc_reservoirs(rt_w, rt_h);
@@ -1303,6 +1327,8 @@ int main() {
 #ifdef OPTIX_ENABLED
             if (optix_dn.available)
                 optix_denoiser_init(optix_dn, rt_w, rt_h);
+            if (optix_rt.available)
+                optix_renderer_resize(optix_rt, rt_w, rt_h);
 #endif
             // DLSS needs reinit at new resolution
             if (dlss_active) { dlss_free(dlss); dlss_active = false; }
@@ -1610,12 +1636,14 @@ int main() {
                                cudaMemcpyHostToDevice);
                 mesh_moved  = true;
                 cam_changed = true;
+                ++mesh.scene_version;  // OptiX RT re-uploads BVH
             }
 
             // Full BVH rebuild when the user releases the gizmo
             if (drag_released) {
                 rebuild_visible_bvh(mesh);
                 cam_changed = true;
+                ++mesh.scene_version;
             }
         }
 
@@ -1949,23 +1977,63 @@ int main() {
                 render_h = dlss.render_h;
             }
 #else
-            // Software bilinear scaling — use continuous slider value directly
+            // Software bicubic scaling — pathtracer renders small, sw_upscale fills surface.
+            // skip_surface_write=1: suppress the partial top-left write to the full surface.
+            // (Neural DLSS does NOT set this — it reads the partial surface write directly.)
             float sc = std::max(0.01f, std::min(1.f, ctrl.dlss_scale));
             render_w = std::max(1, (int)(rt_w * sc));
             render_h = std::max(1, (int)(rt_h * sc));
+            pt.skip_surface_write = (render_w < rt_w || render_h < rt_h) ? 1 : 0;
 #endif
             pt.width  = render_w;
             pt.height = render_h;
-            // When sw-scaling, pathtracer must NOT write partial pixels to the
-            // full-res surface — sw_upscale will fill it instead.
-            pt.skip_surface_write = (render_w < rt_w || render_h < rt_h) ? 1 : 0;
         } else if (dlss_active) {
             dlss_free(dlss);
             dlss_active = false;
         }
 
-        // ── Dispatch: ReSTIR or standard path tracer ──────────────────
+        // ── OptiX RT: lazy init + pick up result once ready ──────────
+#ifdef OPTIX_ENABLED
+        // Start background init the first time the user enables OptiX RT.
+        if (ctrl.optix_rt_enabled && !optix_rt_init_started.load(std::memory_order_relaxed)) {
+            optix_rt_init_started.store(true, std::memory_order_relaxed);
+            if (optix_rt_thread.joinable()) optix_rt_thread.join(); // safety
+            optix_rt_thread = std::thread([&]() {
+                cudaSetDevice(0);
+                printf("[main] Compiling OptiX RT shaders (nvrtc — may take 30-60s first run)...\n");
+                fflush(stdout);
+                bool ok = optix_renderer_init(optix_rt, rt_w, rt_h);
+                if (ok)  printf("[main] OptiX RT renderer available (hardware RT cores)\n");
+                else     printf("[main] OptiX RT renderer unavailable: %s\n", optix_rt.last_error);
+                fflush(stdout);
+                optix_rt_init_done.store(true, std::memory_order_seq_cst);
+            });
+        }
+
+        // Once the background thread finishes, expose result to UI.
+        if (!ctrl.optix_rt_available && optix_rt_init_done.load(std::memory_order_seq_cst)) {
+            ctrl.optix_rt_available = optix_rt.available;
+            if (!optix_rt.available)
+                std::strncpy(ctrl.optix_rt_last_error, optix_rt.last_error,
+                             sizeof(ctrl.optix_rt_last_error) - 1);
+        }
+
+        // ── OptiX RT: upload scene when mesh changes ──────────────────
+        if (ctrl.optix_rt_enabled && optix_rt.available && !mesh.prims.empty()) {
+            if (optix_rt.scene_version != mesh.scene_version) {
+                if (!optix_renderer_upload_scene(optix_rt, mesh.prims, mesh.scene_version))
+                    printf("[main] OptiX RT scene upload failed: %s\n", optix_rt.last_error);
+            }
+        }
+        // Sync runtime status to UI every frame
+        ctrl.optix_rt_scene_ready = optix_rt.scene_ready;
+        if (optix_rt.last_error[0] && !ctrl.optix_rt_last_error[0])
+            std::strncpy(ctrl.optix_rt_last_error, optix_rt.last_error, sizeof(ctrl.optix_rt_last_error) - 1);
+#endif
+
+        // ── Dispatch: ReSTIR, OptiX RT, or standard path tracer ──────
         bool use_restir = ctrl.restir_enabled && mesh.num_emissive > 0 && mesh.d_bvh;
+        bool use_optix_rt = ctrl.optix_rt_enabled && optix_rt.available && optix_rt.scene_ready;
         if (use_restir) {
             // Lazy-alloc reservoirs if not yet done (first frame or after resize w/o viewport event)
             if (!mesh.d_reservoirs) {
@@ -1998,18 +2066,48 @@ int main() {
             rp.hdri_intensity   = ctrl.hdri_intensity;
             rp.hdri_yaw         = ctrl.hdri_yaw_deg * (3.14159265f / 180.f);
             restir_launch(rp);
+        } else if (use_optix_rt) {
+#ifdef OPTIX_ENABLED
+            optix_renderer_render(optix_rt, pt);
+#endif
         } else {
             pathtracer_launch(pt);
         }
 
+        // ── DLSS aux buffers: depth + motion vectors ─────────────────────────
+        {
+            DlssAuxParams aux{};
+            aux.width         = render_w;
+            aux.height        = render_h;
+            aux.cam           = cam;
+            aux.prev_cam      = prev_cam;
+            aux.has_prev_camera = has_prev_cam ? 1 : 0;
+            aux.camera_near   = 0.01f;
+            aux.camera_far    = 1000.f;
+            aux.bvh           = d_bvh;
+            aux.prims         = d_prims;
+            aux.num_prims     = (int)prims_sorted.size();
+            aux.tri_bvh       = mesh.d_bvh;
+            aux.triangles     = mesh.d_prims;
+            aux.num_triangles = (int)mesh.prims.size();
+            aux.depth_buffer  = d_depth;
+            aux.motion_buffer = d_motion;
+            pathtracer_write_dlss_aux(aux);
+        }
+        prev_cam     = cam;
+        has_prev_cam = true;
+
         cudaDeviceSynchronize();
 
-        // ── Software bicubic upscale (when not using neural DLSS) ────────────
-        if (ctrl.dlss_enabled && pt.skip_surface_write) {
+        // ── Software bicubic upscale (sw-scale mode only, not neural DLSS) ──
+        // skip_surface_write is only set in the #else (no DLSS_ENABLED) branch,
+        // so this never fires when neural DLSS is active.
+        if (ctrl.dlss_enabled && pt.skip_surface_write)
             pathtracer_sw_upscale(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
-            if (ctrl.dlss_debug)
-                pathtracer_sw_upscale_debug_pip(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
-        }
+
+        // ── OptiX RT: blit accum → surface so it's visible (raygen writes d_accum only) ─
+        if (use_optix_rt)
+            pathtracer_blit_surface(d_accum, interop.surface, rt_w, rt_h);
 
         ++frame_count;
 
@@ -2023,28 +2121,31 @@ int main() {
         bool did_denoise = false;
         bool denoising_active = false;
 
-        // Camera/scene moved → drop stale denoised frame so the fresh noisy
-        // path tracer output (already in interop.surface) shows through live.
-        // Keep last denoised frame while camera is moving — only truly invalidate when
-        // denoising is disabled (handled below). cam_changed just triggers an accumulation
-        // reset, but the previous denoised frame is still better than raw 1-sample output.
+        // Camera moved → invalidate stale denoised frame so the fresh pathtracer
+        // output shows through. The denoiser runs immediately this same frame
+        // (every=1 when cam_changed) so d_display_valid goes true again right away.
+        if (cam_changed) d_display_valid = false;
 
 #ifdef OPTIX_ENABLED
         if (ctrl.optix_enabled && optix_dn.available) {
-            // OptiX checkbox is its own on/off — no need to also toggle OIDN "Auto-denoise"
             denoising_active = true;
             bool run_dn = ctrl.denoise_on_demand;
             ctrl.denoise_on_demand = false;
             if (!run_dn && frame_count > 0) {
-                // On cam_changed (frame_count==0 after reset): always run to get fresh denoised frame
+                // cam_changed: always denoise this frame to avoid showing stale result
                 // first 16 frames: run every frame for fast settle; then per user setting
                 int every = (cam_changed || frame_count <= 16) ? 1 : ctrl.denoise_every_n;
                 run_dn = (frame_count % every == 0);
             }
             if (run_dn) {
-                optix_denoiser_run(optix_dn, d_accum, d_display);
-                pathtracer_blit_surface(d_display, interop.surface, rt_w, rt_h);
-                d_display_valid = true;
+                // OptiX denoiser is initialized for rt_w×rt_h and reads d_accum with
+                // rt_w row stride. When DLSS scaling is active (render_w < rt_w),
+                // d_accum has render_w stride — skip to avoid skewed/zoomed output.
+                if (render_w == rt_w && render_h == rt_h) {
+                    optix_denoiser_run(optix_dn, d_accum, d_display);
+                    pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
+                    d_display_valid = true;
+                }
                 did_denoise = true;
             }
         } else
@@ -2059,8 +2160,10 @@ int main() {
                 run_dn = (frame_count % every == 0);
             }
             if (run_dn) {
-                denoiser_run(denoiser, d_accum, d_display, rt_w, rt_h);
-                pathtracer_blit_surface(d_display, interop.surface, rt_w, rt_h);
+                // Pass render dimensions: d_accum is packed at render_w stride when
+                // DLSS scaling is active (render_w < rt_w). OIDN works with any size.
+                denoiser_run(denoiser, d_accum, d_display, render_w, render_h);
+                pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
                 d_display_valid = true;
                 did_denoise = true;
             }
@@ -2069,11 +2172,102 @@ int main() {
         // On non-denoise frames: if denoising is active and we have a valid denoised
         // frame, re-blit it so the viewport always shows the denoised result.
         if (!did_denoise && denoising_active && d_display_valid)
-            pathtracer_blit_surface(d_display, interop.surface, rt_w, rt_h);
+            pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
 
         // When denoising is turned off, invalidate so we don't show stale data.
         if (!denoising_active) d_display_valid = false;
         (void)did_denoise;
+
+        // ── Viewport pass override ────────────────────────────────────
+        {
+            // Compute per-frame depth range and max motion magnitude only when needed.
+            // These are used for auto-normalization so both passes always span 0..1.
+            // Computed lazily: only when depth or motion is actually being displayed.
+            const bool need_depth = (ctrl.viewport_pass == (int)ViewportPassMode::DlssDepth) ||
+                                    (ctrl.dlss_enabled && ctrl.dlss_debug &&
+                                     ctrl.dlss_overlay_pass == (int)ViewportPassMode::DlssDepth);
+            const bool need_motion = (ctrl.viewport_pass == (int)ViewportPassMode::DlssMotion) ||
+                                     (ctrl.dlss_enabled && ctrl.dlss_debug &&
+                                      ctrl.dlss_overlay_pass == (int)ViewportPassMode::DlssMotion);
+
+            float depth_min = 0.f, depth_max = 1.f;
+            if (need_depth)
+                pathtracer_depth_range(d_depth, render_w * render_h, &depth_min, &depth_max);
+
+            float motion_maxmag = 0.f;
+            if (need_motion)
+                motion_maxmag = pathtracer_motion_maxmag(d_motion, render_w * render_h);
+
+            switch ((ViewportPassMode)ctrl.viewport_pass) {
+
+            case ViewportPassMode::RawRender:
+            case ViewportPassMode::DlssInput:
+                // Show the raw pathtracer output (before DLSS) scaled to fill the screen.
+                // At lower render %, image looks blurrier (fewer source pixels).
+                // At 100%, no upscaling — crisp native pixels.
+                pathtracer_sw_upscale(d_accum, render_w, render_h,
+                                      interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::Denoised:
+                // Show denoised if available, else fall back to raw accum.
+                // Use sw_upscale so render_w-stride d_accum/d_display maps correctly
+                // when DLSS scaling is active (render_w < rt_w).
+                if (d_display_valid)
+                    pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
+                else
+                    pathtracer_sw_upscale(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::DlssDepth:
+                // Auto-normalized: closest surface = white, farthest = black.
+                pathtracer_visualize_depth(d_depth, render_w, render_h,
+                                           depth_min, depth_max,
+                                           interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::DlssMotion:
+                // Auto-normalized: fastest pixel = full saturation, static = black.
+                pathtracer_visualize_motion(d_motion, render_w, render_h,
+                                            motion_maxmag,
+                                            interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::Final:
+            default:
+                break;
+            }
+
+            // Debug PiP overlay: small inset of the selected overlay pass.
+            // Always constrain to the top-left pip_w × pip_h region so this
+            // overlay never replaces the main viewport — only adds a small inset.
+            // Show regardless of DLSS % so the pip stays a fixed rt_w/3 size.
+            if (ctrl.dlss_enabled && ctrl.dlss_debug) {
+                int pip_w = rt_w / 3, pip_h = rt_h / 3;
+                switch ((ViewportPassMode)ctrl.dlss_overlay_pass) {
+                case ViewportPassMode::DlssDepth:
+                    pathtracer_visualize_depth(d_depth, render_w, render_h,
+                                               depth_min, depth_max,
+                                               interop.surface, pip_w, pip_h);
+                    break;
+                case ViewportPassMode::DlssMotion:
+                    pathtracer_visualize_motion(d_motion, render_w, render_h,
+                                                motion_maxmag,
+                                                interop.surface, pip_w, pip_h);
+                    break;
+                default:
+                    // Raw Render / DLSS Input: show small native render as PiP
+                    pathtracer_sw_upscale_debug_pip(d_accum, render_w, render_h,
+                                                    interop.surface, rt_w, rt_h);
+                    break;
+                }
+            }
+        }
+
+        // Ensure all CUDA writes to interop.surface are complete before Vulkan reads it.
+        // (First cudaDeviceSynchronize covers the render dispatch; this one covers
+        //  denoiser blits, viewport pass overrides, and debug PiP.)
+        cudaDeviceSynchronize();
 
         // ── GPU Stats update ──────────────────────────────────────────
         {
@@ -2090,7 +2284,8 @@ int main() {
 
             stats_update(nvml, live_stats, hw_info,
                 render_w, render_h,
-                ctrl.optix_enabled, false /*optix_rt: sw BVH, RT cores unused*/,
+                ctrl.optix_enabled,
+                use_optix_rt /*RT cores: hardware traversal via OptiX*/,
                 dlss_active && ctrl.dlss_enabled,
                 mesh.num_texs > 0, hdri.loaded,
                 sz_bvh, sz_tris, sz_mats, sz_texs,
@@ -2114,8 +2309,11 @@ int main() {
         // DLSS reads render_w×render_h from interop.image and blit-backs
         // the upscaled full-res result into interop.image so post-process
         // can read the full-resolution HDR content.
+        // Skip DLSS for all non-Final passes — the viewport overrides above
+        // already wrote the correct full-res debug view; running DLSS on top
+        // would re-read the render_w×render_h sub-region and zoom it back in.
 #ifdef DLSS_ENABLED
-        if (dlss_active && ctrl.dlss_enabled) {
+        if (dlss_active && ctrl.dlss_enabled && ctrl.viewport_pass == (int)ViewportPassMode::Final) {
             dlss_upscale(dlss, cb,
                          interop.image, interop.image_view, interop.memory,
                          ctrl.post.exposure, cam,
@@ -2124,7 +2322,11 @@ int main() {
         }
 #endif
 
-        // Post-processing compute pass — reads interop.image (full-res after DLSS)
+        // Post-processing compute pass — reads interop.image (full-res after DLSS).
+        // Must run every frame regardless of viewport pass: the dispatch includes
+        // Vulkan image-layout transitions that keep post.display_image in the correct
+        // layout. Skipping it on data passes would leave the image in a broken state
+        // for the next frame and black-out the entire viewport.
         if (ctrl.post_enabled && post.pipeline) {
             PostPushConstants pc = ctrl.post;
             post_process_dispatch(post, cb, pc);
@@ -2149,12 +2351,17 @@ int main() {
     vkDeviceWaitIdle(vk.device);
     batch_stop(batch);
     if (nim_thread.joinable()) nim_thread.join();
+#ifdef OPTIX_ENABLED
+    if (optix_rt_thread.joinable()) optix_rt_thread.join();
+#endif
     optix_denoiser_free(optix_dn);
+    optix_renderer_free(optix_rt);
     dlss_free(dlss);
     stats_shutdown(nvml);
     post_process_destroy(post);
     mesh.free_gpu();
     cudaFree(d_accum); cudaFree(d_display);
+    cudaFree(d_depth); cudaFree(d_motion);
     cudaFree(d_bvh); cudaFree(d_prims);
     cuda_interop_destroy(vk.device, interop);
     ImGui_ImplVulkan_Shutdown();

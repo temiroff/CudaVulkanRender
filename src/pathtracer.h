@@ -99,8 +99,16 @@ void pathtracer_sw_upscale_debug_pip(const float4* d_accum, int src_w, int src_h
 void pathtracer_write_dlss_aux(const DlssAuxParams& p, cudaStream_t stream = 0);
 
 // Visualize scalar/motion debug buffers into an RGBA surface.
+// pathtracer_depth_range: compute per-frame [min,max] of non-background depth values.
+// pathtracer_motion_maxmag: compute per-frame max pixel-space motion magnitude.
+// Call these before the corresponding visualize functions to get auto-normalized output.
+void pathtracer_depth_range(const float* d_depth, int n, float* h_min, float* h_max);
+float pathtracer_motion_maxmag(const float2* d_motion, int n);
+
 void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
                                 float min_depth, float max_depth,
                                 cudaSurfaceObject_t surface, int dst_w, int dst_h);
+// max_mag: result of pathtracer_motion_maxmag (0 = no motion this frame → all black).
 void pathtracer_visualize_motion(const float2* d_motion, int src_w, int src_h,
+                                 float max_mag,
                                  cudaSurfaceObject_t surface, int dst_w, int dst_h);
