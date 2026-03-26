@@ -130,14 +130,14 @@ static __forceinline__ __device__ bool scatter_gpu_material(
 {
     float4 base = mat.base_color;
     if (mat.base_color_tex >= 0) {
-        float4 tex = sample_tex(textures, mat.base_color_tex, rec.uv);
+        float4 tex = sample_tex(textures, mat.base_color_tex, make_float2(rec.u, rec.v));
         base = mat.custom_shader ? tex : mul4(base, tex);
     }
 
     float metallic = mat.metallic;
     float roughness = mat.roughness;
     if (mat.metallic_rough_tex >= 0) {
-        float4 mr = sample_tex(textures, mat.metallic_rough_tex, rec.uv);
+        float4 mr = sample_tex(textures, mat.metallic_rough_tex, make_float2(rec.u, rec.v));
         if (mat.custom_shader) {
             roughness = mr.y;
             metallic = mr.z;
@@ -149,7 +149,7 @@ static __forceinline__ __device__ bool scatter_gpu_material(
 
     float4 emis = mat.emissive_factor;
     if (mat.emissive_tex >= 0) {
-        float4 et = sample_tex(textures, mat.emissive_tex, rec.uv);
+        float4 et = sample_tex(textures, mat.emissive_tex, make_float2(rec.u, rec.v));
         if (mat.custom_shader) {
             emis.x = et.x; emis.y = et.y; emis.z = et.z;
         } else {
@@ -160,7 +160,7 @@ static __forceinline__ __device__ bool scatter_gpu_material(
     attenuation = make_float3(base.x, base.y, base.z);
 
     if (mat.normal_tex >= 0 && rec.tangent.w != 0.f) {
-        float4 ns = sample_tex(textures, mat.normal_tex, rec.uv);
+        float4 ns = sample_tex(textures, mat.normal_tex, make_float2(rec.u, rec.v));
         float3 nm = make_float3(ns.x * 2.f - 1.f, ns.y * 2.f - 1.f, ns.z * 2.f - 1.f);
         float nm_len = sqrtf(nm.x * nm.x + nm.y * nm.y + nm.z * nm.z);
         if (nm_len > 1e-7f) {
@@ -384,7 +384,9 @@ extern "C" __global__ void __closesthit__ch()
         outward_n = face_n;
 
     rec.geom_normal = face_n;
-    rec.uv = tri.uv0 * b0 + tri.uv1 * b1 + tri.uv2 * b2;
+    float2 uv_interp = tri.uv0 * b0 + tri.uv1 * b1 + tri.uv2 * b2;
+    rec.u = uv_interp.x;
+    rec.v = uv_interp.y;
     rec.tangent = make_float4(
         tri.t0.x * b0 + tri.t1.x * b1 + tri.t2.x * b2,
         tri.t0.y * b0 + tri.t1.y * b1 + tri.t2.y * b2,

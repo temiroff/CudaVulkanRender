@@ -130,23 +130,28 @@ struct GpuMaterial {
 };
 
 // ─────────────────────────────────────────────
-//  Hit record
+//  Hit record — packed into 16-byte aligned float4 groups.
+//  Each float3 field is paired with a float to fill the 16-byte slot,
+//  eliminating the hidden padding the compiler inserts between float3 and float4.
+//  Old layout: ~124 bytes (31 registers). New: 112 bytes (28 registers).
+//  With 2 instances live in trace_path, this saves ~6 registers total.
 // ─────────────────────────────────────────────
-
 struct HitRecord {
-    float3   p;
-    float3   normal;
-    float3   geom_normal;   // un-interpolated face normal — used for ray-origin offset
-    float4   tangent;       // xyz = world tangent, w = bitangent sign (0 = no tangent)
-    Material mat;           // inline sphere material (used when gpu_mat_idx < 0)
-    float    t;
-    bool     front_face;
-    float2   uv;            // texture coordinates (mesh hits)
-    int      gpu_mat_idx;   // -1 = sphere (use inline mat), >= 0 = mesh GpuMaterial
-    int      obj_id = -1;  // mesh object id for per-object shading modes
+    float3 p;           float t;            // 16 bytes — hit position + ray distance
+    float3 normal;      float u;            // 16 bytes — shading normal + uv.x
+    float3 geom_normal; float v;            // 16 bytes — geometric normal + uv.y
+    float4 tangent;                         // 16 bytes — xyz=tangent, w=bitangent sign
+
+    float3 albedo;      float roughness;    // 16 bytes — sphere mat albedo + roughness
+    float3 emission;    float ior;          // 16 bytes — sphere mat emission + IOR
+
+    int    gpu_mat_idx;                     // -1 = sphere inline mat, >=0 = mesh GpuMaterial
+    int    obj_id;                          // per-object color mode id
+    int    mat_type;                        // MatType enum cast to int (sphere materials)
+    int    front_face;                      // 1 = ray hit front face, 0 = back (was bool)
 
     __host__ __device__ void set_face_normal(const Ray& r, float3 outward_n) {
-        front_face = dot(r.dir, outward_n) < 0.f;
+        front_face = (dot(r.dir, outward_n) < 0.f) ? 1 : 0;
         normal = front_face ? outward_n : make_float3(-outward_n.x, -outward_n.y, -outward_n.z);
     }
 };

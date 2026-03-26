@@ -403,7 +403,7 @@ __device__ float3 shade_pixel(const ReSTIRParams& p, int x, int y,
         const GpuMaterial& mat = p.gpu_materials[rec.gpu_mat_idx];
         float4 bc = mat.base_color;
         if (mat.base_color_tex >= 0) {
-            float4 tx = tex2D<float4>(p.textures[mat.base_color_tex], rec.uv.x, rec.uv.y);
+            float4 tx = tex2D<float4>(p.textures[mat.base_color_tex], rec.u, rec.v);
             bc.x *= tx.x; bc.y *= tx.y; bc.z *= tx.z;
         }
         base_col = make_float3(bc.x, bc.y, bc.z);

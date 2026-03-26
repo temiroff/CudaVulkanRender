@@ -204,9 +204,14 @@ __device__ static bool sphere_hit(const Sphere& s, const Ray& r, float t_min, fl
     float3 outward = (rec.p - s.center) / s.radius;
     rec.set_face_normal(r, outward);
     rec.geom_normal = rec.normal;   // sphere: geometric = shading
-    rec.mat         = s.mat;
+    rec.albedo      = s.mat.albedo;
+    rec.emission    = s.mat.emission;
+    rec.roughness   = s.mat.roughness;
+    rec.ior         = s.mat.ior;
+    rec.mat_type    = (int)s.mat.type;
     rec.gpu_mat_idx = -1;
-    rec.uv          = make_float2(0.f, 0.f);
+    rec.u           = 0.f;
+    rec.v           = 0.f;
     rec.tangent     = make_float4(0.f, 0.f, 0.f, 0.f);
     return true;
 }
@@ -246,9 +251,8 @@ __device__ static bool tri_hit(const Triangle& tri, const Ray& r,
 
     rec.t  = t;
     rec.p  = r.at(t);
-    rec.uv = make_float2(
-        tri.uv0.x * w + tri.uv1.x * u + tri.uv2.x * v,
-        tri.uv0.y * w + tri.uv1.y * u + tri.uv2.y * v);
+    rec.u  = tri.uv0.x * w + tri.uv1.x * u + tri.uv2.x * v;
+    rec.v  = tri.uv0.y * w + tri.uv1.y * u + tri.uv2.y * v;
     rec.gpu_mat_idx = tri.mat_idx;
     rec.obj_id      = tri.obj_id;
     rec.set_face_normal(r, shading_n);

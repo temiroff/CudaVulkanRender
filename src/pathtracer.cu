@@ -132,7 +132,7 @@ __device__ inline bool scatter_lambertian(
         dir = rec.normal;
     float3 d = normalize(dir);
     scattered   = { offset_ray_origin(rec.p, rec.geom_normal, d), d };
-    attenuation = rec.mat.albedo;
+    attenuation = rec.albedo;
     return true;
 }
 
@@ -141,9 +141,9 @@ __device__ inline bool scatter_metal(
     float3& attenuation, Ray& scattered, unsigned int& rng)
 {
     float3 reflected = reflect(normalize(r_in.dir), rec.normal);
-    float3 d = normalize(reflected + rec.mat.roughness * rand_in_unit_sphere(rng));
+    float3 d = normalize(reflected + rec.roughness * rand_in_unit_sphere(rng));
     scattered   = { offset_ray_origin(rec.p, rec.geom_normal, d), d };
-    attenuation = rec.mat.albedo;
+    attenuation = rec.albedo;
     return dot(d, rec.normal) > 0.f;
 }
 
@@ -157,7 +157,7 @@ __device__ inline bool scatter_dielectric(
     float3& attenuation, Ray& scattered, unsigned int& rng)
 {
     attenuation = make_float3(1.f, 1.f, 1.f);
-    float ratio = rec.front_face ? (1.f / rec.mat.ior) : rec.mat.ior;
+    float ratio = rec.front_face ? (1.f / rec.ior) : rec.ior;
     float3 unit_dir = normalize(r_in.dir);
     float cos_theta = fminf(dot(make_float3(-unit_dir.x,-unit_dir.y,-unit_dir.z), rec.normal), 1.f);
     float sin_theta = sqrtf(1.f - cos_theta*cos_theta);
@@ -199,7 +199,7 @@ __device__ bool scatter_gpu_material(
     // Base color
     float4 base = mat.base_color;
     if (mat.base_color_tex >= 0) {
-        float4 tex = sample_tex(textures, mat.base_color_tex, rec.uv);
+        float4 tex = sample_tex(textures, mat.base_color_tex, make_float2(rec.u, rec.v));
         base = mat.custom_shader ? tex : mul4(base, tex);
     }
 
@@ -207,7 +207,7 @@ __device__ bool scatter_gpu_material(
     float metallic  = mat.metallic;
     float roughness = mat.roughness;
     if (mat.metallic_rough_tex >= 0) {
-        float4 mr = sample_tex(textures, mat.metallic_rough_tex, rec.uv);
+        float4 mr = sample_tex(textures, mat.metallic_rough_tex, make_float2(rec.u, rec.v));
         if (mat.custom_shader) {
             roughness = mr.y;   // G channel — direct from shader
             metallic  = mr.z;   // B channel — direct from shader
@@ -220,7 +220,7 @@ __device__ bool scatter_gpu_material(
     // Emissive
     float4 emis = mat.emissive_factor;
     if (mat.emissive_tex >= 0) {
-        float4 et = sample_tex(textures, mat.emissive_tex, rec.uv);
+        float4 et = sample_tex(textures, mat.emissive_tex, make_float2(rec.u, rec.v));
         if (mat.custom_shader) {
             emis.x = et.x; emis.y = et.y; emis.z = et.z;
         } else {
@@ -233,7 +233,7 @@ __device__ bool scatter_gpu_material(
 
     // Normal map — apply before scatter so the modified normal is used everywhere
     if (mat.normal_tex >= 0 && rec.tangent.w != 0.f) {
-        float4 ns = sample_tex(textures, mat.normal_tex, rec.uv);
+        float4 ns = sample_tex(textures, mat.normal_tex, make_float2(rec.u, rec.v));
         // Decode [0,1] → [-1,1], flip Y to match OpenGL convention used by glTF
         float3 nm = make_float3(ns.x * 2.f - 1.f, ns.y * 2.f - 1.f, ns.z * 2.f - 1.f);
         float  nm_len = sqrtf(nm.x*nm.x + nm.y*nm.y + nm.z*nm.z);
@@ -381,18 +381,20 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
     float3 radiance   = make_float3(0.f, 0.f, 0.f);
 
     for (int depth = 0; depth < p.max_depth; ++depth) {
-        // Test sphere BVH (skip if no spheres)
+        // Sequential traversal into one HitRecord — no second copy needed.
+        // Sphere BVH runs first; if it hits, t_max shrinks so the triangle BVH
+        // only overwrites rec when it finds something strictly closer.
         HitRecord rec;
-        bool any_hit = (p.num_prims > 0) && bvh_hit(p.bvh, p.prims, ray, 1e-3f, 1e20f, rec);
-        float t_max  = any_hit ? rec.t : 1e20f;
+        bool any_hit = false;
+        float t_max  = 1e20f;
 
-        // Test triangle BVH (only if mesh is loaded and might be closer)
-        if (p.tri_bvh && p.num_triangles > 0) {
-            HitRecord tri_rec;
-            if (bvh_hit_triangles(p.tri_bvh, p.triangles, ray, 1e-3f, t_max, tri_rec)) {
-                rec     = tri_rec;
-                any_hit = true;
-            }
+        if (p.num_prims > 0 && bvh_hit(p.bvh, p.prims, ray, 1e-3f, t_max, rec)) {
+            any_hit = true;
+            t_max   = rec.t;    // shrink — triangles must beat this
+        }
+        if (p.tri_bvh && p.num_triangles > 0 &&
+                bvh_hit_triangles(p.tri_bvh, p.triangles, ray, 1e-3f, t_max, rec)) {
+            any_hit = true;     // rec already holds the closer triangle hit
         }
 
         if (!any_hit) {
@@ -418,8 +420,8 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
             }
         } else {
             // Sphere inline material
-            emission = rec.mat.emission;
-            switch (rec.mat.type) {
+            emission = rec.emission;
+            switch ((MatType)rec.mat_type) {
                 case MatType::Lambertian:
                     did_scatter = scatter_lambertian(ray, rec, attenuation, scattered, rng); break;
                 case MatType::Metal:
@@ -443,6 +445,8 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
 //  Main kernel
 // ─────────────────────────────────────────────
 
+// Hint to NVCC: 256 threads per block. Keeps scheduling assumptions correct.
+__launch_bounds__(256)
 __global__ void pathtrace_kernel(PathTracerParams p) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
