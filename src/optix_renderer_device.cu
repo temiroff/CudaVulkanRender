@@ -161,7 +161,9 @@ static __forceinline__ __device__ bool scatter_gpu_material(
 
     if (mat.normal_tex >= 0 && rec.tangent.w != 0.f) {
         float4 ns = sample_tex(textures, mat.normal_tex, make_float2(rec.u, rec.v));
-        float3 nm = make_float3(ns.x * 2.f - 1.f, ns.y * 2.f - 1.f, ns.z * 2.f - 1.f);
+        float ny = ns.y * 2.f - 1.f;
+        if (mat.normal_y_flip) ny = -ny;
+        float3 nm = make_float3(ns.x * 2.f - 1.f, ny, ns.z * 2.f - 1.f);
         float nm_len = sqrtf(nm.x * nm.x + nm.y * nm.y + nm.z * nm.z);
         if (nm_len > 1e-7f) {
             nm.x /= nm_len;
@@ -347,6 +349,20 @@ static __forceinline__ __device__ float3 trace_path(Ray ray, unsigned int& rng)
 
         if (params.color_mode == 2 && rec.obj_id >= 0)
             attenuation = hashed_object_color(rec.obj_id);
+        else if (params.color_mode == 3) {
+            const GpuMaterial& m = params.gpu_materials[rec.gpu_mat_idx];
+            float4 bc = m.base_color;
+            if (m.base_color_tex >= 0) {
+                float4 tex = sample_tex(params.textures, m.base_color_tex, make_float2(rec.u, rec.v));
+                bc = make_float4(bc.x*tex.x, bc.y*tex.y, bc.z*tex.z, bc.w*tex.w);
+            }
+            float3 N = rec.normal;
+            float3 L = make_float3(0.4f, 0.7f, -0.5f);
+            float nl = fabsf(N.x*L.x + N.y*L.y + N.z*L.z);
+            float shade = 0.3f + 0.7f * nl;
+            radiance = make_float3(bc.x * shade, bc.y * shade, bc.z * shade);
+            break; // no more bounces
+        }
 
         radiance += throughput * emission;
         if (!did_scatter)

@@ -127,6 +127,8 @@ struct GpuMaterial {
     int    emissive_tex;        // -1 = none
     // 1 = custom shader owns all textures — read them as absolute values, not factors
     int    custom_shader;
+    // 1 = flip normal map Y (DirectX convention); 0 = OpenGL convention (glTF default)
+    int    normal_y_flip;
 };
 
 // ─────────────────────────────────────────────

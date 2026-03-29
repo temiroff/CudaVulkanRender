@@ -10,8 +10,12 @@
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/usd/usdGeom/xformable.h>
+#include <pxr/usd/usdSkel/root.h>
+#include <pxr/usd/usdSkel/bakeSkinning.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/metrics.h>    // UsdGeomGetStageUpAxis
+#include <pxr/usd/usdGeom/tokens.h>    // UsdGeomTokens->leftHanded/rightHanded
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/shader.h>
@@ -36,6 +40,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>  // std::swap
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
@@ -69,6 +74,11 @@ static float3 safe_normalize(float3 v)
     float l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
     if (l < 1e-7f) return make_float3(0.f, 1.f, 0.f);
     return make_float3(v.x/l, v.y/l, v.z/l);
+}
+
+static float dot3(float3 a, float3 b)
+{
+    return a.x*b.x + a.y*b.y + a.z*b.z;
 }
 
 static float3 cross3(float3 a, float3 b)
@@ -250,6 +260,7 @@ static GpuMaterial read_preview_surface(
     gm.metallic_rough_tex = -1;
     gm.normal_tex         = -1;
     gm.emissive_tex       = -1;
+    gm.normal_y_flip      = 1;  // USD normal maps use DirectX convention (Y-flipped)
 
     // Helper: resolve a texture shader's file input to a texture index
     auto get_tex_idx = [&](const UsdShadeShader& texShader, bool is_srgb) -> int {
@@ -296,24 +307,27 @@ static GpuMaterial read_preview_surface(
         return UsdShadeShader();
     };
 
-    // Helper: read a color3 input — either inline value or texture connection.
-    // is_srgb=true for base/emissive (sRGB-encoded), false for data textures.
+    // Helper: read a color3 input — texture connection takes priority,
+    // scalar value is read as fallback/tint.  A UsdPreviewSurface input
+    // can have BOTH a scalar (e.g. white) AND a texture connection.
     auto read_color3 = [&](const char* name, float4& out, bool is_srgb) {
         UsdShadeInput inp = shader.GetInput(TfToken(name));
         if (!inp) return;
-        GfVec3f v;
-        if (inp.Get(&v)) {
-            out = make_float4(v[0], v[1], v[2], 1.f);
-        } else {
-            UsdShadeShader src = get_connected_shader(inp);
-            if (!src) return;
+        // Check texture connection first (takes priority)
+        UsdShadeShader src = get_connected_shader(inp);
+        if (src) {
             int idx = get_tex_idx(src, is_srgb);
-            if (idx < 0) return;
-            if (strcmp(name, "diffuseColor") == 0 || strcmp(name, "baseColor") == 0)
-                gm.base_color_tex = idx;
-            else if (strcmp(name, "emissiveColor") == 0)
-                gm.emissive_tex = idx;
+            if (idx >= 0) {
+                if (strcmp(name, "diffuseColor") == 0 || strcmp(name, "baseColor") == 0)
+                    gm.base_color_tex = idx;
+                else if (strcmp(name, "emissiveColor") == 0)
+                    gm.emissive_tex = idx;
+            }
         }
+        // Also read scalar value (used as tint multiplier or fallback)
+        GfVec3f v;
+        if (inp.Get(&v))
+            out = make_float4(v[0], v[1], v[2], 1.f);
     };
 
     auto read_float = [&](const char* name, float& out) {
@@ -324,20 +338,24 @@ static GpuMaterial read_preview_surface(
 
     // Helper: read a single-channel float input that may be a texture.
     // Stores the texture index in tex_idx_out if connected.
+    // A UsdPreviewSurface input can have BOTH a scalar default AND a texture
+    // connection — always check for a connection first, fall back to scalar.
     auto read_float_tex = [&](const char* name, float& scalar_out, int& tex_idx_out) {
         UsdShadeInput inp = shader.GetInput(TfToken(name));
         if (!inp) return;
-        if (!inp.Get(&scalar_out)) {
-            UsdShadeShader src = get_connected_shader(inp);
-            if (src) tex_idx_out = get_tex_idx(src, /*is_srgb=*/false);
+        // Check texture connection first (takes priority over scalar)
+        UsdShadeShader src = get_connected_shader(inp);
+        if (src) {
+            tex_idx_out = get_tex_idx(src, /*is_srgb=*/false);
         }
+        // Also read scalar (used as multiplier or fallback when no texture)
+        inp.Get(&scalar_out);
     };
 
-    // Print shader id so we can confirm it's UsdPreviewSurface
     {
         TfToken shader_id;
         shader.GetShaderId(&shader_id);
-        std::cerr << "[usd_loader] shader id='" << shader_id << "'\n";
+        std::cerr << "[usd_loader] UsdPreviewSurface id='" << shader_id << "'\n";
     }
 
     read_color3("diffuseColor",  gm.base_color,       /*is_srgb=*/true);
@@ -353,14 +371,70 @@ static GpuMaterial read_preview_surface(
     read_float_tex("metallic",  gm.metallic,  metallic_tex_idx);
     read_float_tex("roughness", gm.roughness, roughness_tex_idx);
 
-    // If metallic and roughness use the same texture (common in USD exports from Blender),
-    // use it as the combined metallic-roughness map (G=roughness, B=metallic like glTF).
-    if (metallic_tex_idx >= 0 && metallic_tex_idx == roughness_tex_idx)
+    // The renderer reads roughness from G and metallic from B (glTF convention).
+    // USD often stores them as separate single-channel textures with data in R.
+    // Pack into a single combined texture with correct channel layout.
+    if (metallic_tex_idx >= 0 && metallic_tex_idx == roughness_tex_idx) {
+        // Same texture — already packed (Blender export style)
         gm.metallic_rough_tex = metallic_tex_idx;
-    else if (roughness_tex_idx >= 0)
-        gm.metallic_rough_tex = roughness_tex_idx;  // roughness in G channel
-    else if (metallic_tex_idx >= 0)
-        gm.metallic_rough_tex = metallic_tex_idx;   // metallic in B channel
+    } else if (metallic_tex_idx >= 0 && roughness_tex_idx >= 0) {
+        // Two separate textures — pack R channels into G=roughness, B=metallic
+        const TextureImage& rough_img = textures_out[roughness_tex_idx];
+        const TextureImage& metal_img = textures_out[metallic_tex_idx];
+        TextureImage packed;
+        packed.width  = rough_img.width;
+        packed.height = rough_img.height;
+        packed.srgb   = false;
+        packed.pixels.resize(packed.width * packed.height * 4);
+        for (int i = 0; i < packed.width * packed.height; ++i) {
+            uint8_t roughness_val = rough_img.pixels[i * 4];  // R channel
+            uint8_t metallic_val  = 0;
+            // Sample metallic texture (may differ in size)
+            int mx = (i % packed.width)  * metal_img.width  / packed.width;
+            int my = (i / packed.width)  * metal_img.height / packed.height;
+            int mi = my * metal_img.width + mx;
+            if (mi >= 0 && mi < metal_img.width * metal_img.height)
+                metallic_val = metal_img.pixels[mi * 4];  // R channel
+            packed.pixels[i * 4 + 0] = 0;              // R (unused)
+            packed.pixels[i * 4 + 1] = roughness_val;  // G = roughness
+            packed.pixels[i * 4 + 2] = metallic_val;   // B = metallic
+            packed.pixels[i * 4 + 3] = 255;
+        }
+        gm.metallic_rough_tex = (int)textures_out.size();
+        textures_out.push_back(std::move(packed));
+    } else if (roughness_tex_idx >= 0) {
+        // Roughness only — remap R→G channel
+        const TextureImage& rough_img = textures_out[roughness_tex_idx];
+        TextureImage packed;
+        packed.width  = rough_img.width;
+        packed.height = rough_img.height;
+        packed.srgb   = false;
+        packed.pixels.resize(packed.width * packed.height * 4);
+        for (int i = 0; i < packed.width * packed.height; ++i) {
+            packed.pixels[i * 4 + 0] = 0;
+            packed.pixels[i * 4 + 1] = rough_img.pixels[i * 4];  // R → G
+            packed.pixels[i * 4 + 2] = (uint8_t)(gm.metallic * 255.f);
+            packed.pixels[i * 4 + 3] = 255;
+        }
+        gm.metallic_rough_tex = (int)textures_out.size();
+        textures_out.push_back(std::move(packed));
+    } else if (metallic_tex_idx >= 0) {
+        // Metallic only — remap R→B channel
+        const TextureImage& metal_img = textures_out[metallic_tex_idx];
+        TextureImage packed;
+        packed.width  = metal_img.width;
+        packed.height = metal_img.height;
+        packed.srgb   = false;
+        packed.pixels.resize(packed.width * packed.height * 4);
+        for (int i = 0; i < packed.width * packed.height; ++i) {
+            packed.pixels[i * 4 + 0] = 0;
+            packed.pixels[i * 4 + 1] = (uint8_t)(gm.roughness * 255.f);
+            packed.pixels[i * 4 + 2] = metal_img.pixels[i * 4];  // R → B
+            packed.pixels[i * 4 + 3] = 255;
+        }
+        gm.metallic_rough_tex = (int)textures_out.size();
+        textures_out.push_back(std::move(packed));
+    }
 
     read_float("opacity",   gm.base_color.w);
 
@@ -376,9 +450,534 @@ static GpuMaterial read_preview_surface(
     return gm;
 }
 
+// ── MDL shader support (Omniverse / Kit exports) ─────────────────────────────
+//
+// MDL shaders in USD have info:id = "mdl" and store the specific material name
+// (e.g. "OmniPBR", "OmniGlass") in info:mdl:sourceAsset:subIdentifier.
+// Inputs are direct scalar/asset values on the shader prim — no UsdUVTexture
+// intermediates like UsdPreviewSurface uses.
+
+static std::string mdl_variant(const UsdShadeShader& shader)
+{
+    UsdPrim prim = shader.GetPrim();
+
+    // 1. info:mdl:sourceAsset:subIdentifier — "OmniPBR", "OmniGlass", etc.
+    //    This is the canonical Omniverse attribute.
+    {
+        UsdAttribute attr = prim.GetAttribute(TfToken("info:mdl:sourceAsset:subIdentifier"));
+        if (attr) {
+            TfToken tok;
+            if (attr.Get(&tok) && !tok.IsEmpty()) return tok.GetString();
+            std::string s;
+            if (attr.Get(&s) && !s.empty()) return s;
+        }
+    }
+
+    // 2. info:mdl:sourceAsset — e.g. @OmniPBR.mdl@ — strip path and extension.
+    {
+        UsdAttribute attr = prim.GetAttribute(TfToken("info:mdl:sourceAsset"));
+        if (attr) {
+            SdfAssetPath ap;
+            if (attr.Get(&ap)) {
+                std::string asset = ap.GetAssetPath();
+                auto sl = asset.rfind('/');
+                if (sl != std::string::npos) asset = asset.substr(sl + 1);
+                auto dot = asset.rfind('.');
+                if (dot != std::string::npos) asset = asset.substr(0, dot);
+                if (!asset.empty()) return asset;
+            }
+        }
+    }
+
+    // 3. info:id fallback (some exporters embed the name here directly)
+    TfToken id; shader.GetShaderId(&id);
+    return id.GetString();
+}
+
+static bool is_mdl_shader(const UsdShadeShader& shader)
+{
+    // Check info:id first (fast path)
+    TfToken id; shader.GetShaderId(&id);
+    const std::string& s = id.GetString();
+    if (s == "mdl")                              return true;
+    if (s.find("OmniPBR")   != std::string::npos) return true;
+    if (s.find("OmniGlass")  != std::string::npos) return true;
+    if (s.find("Omni")       != std::string::npos) return true;
+
+    // Omniverse Kit exports often leave info:id empty and use
+    // info:mdl:sourceAsset / info:mdl:sourceAsset:subIdentifier instead.
+    UsdPrim prim = shader.GetPrim();
+    if (prim.HasAttribute(TfToken("info:mdl:sourceAsset")))            return true;
+    if (prim.HasAttribute(TfToken("info:mdl:sourceAsset:subIdentifier"))) return true;
+
+    return false;
+}
+
+// Parse an OmniPBR .mdl file and extract texture paths + scalar defaults.
+// The MDL format for textures is:   param_name: texture_2d("./path", gamma),
+// and for scalars:                  param_name: value,
+// We do a simple line-by-line scan — no full MDL parser needed.
+static void parse_mdl_file(
+    const std::string&           mdl_path,   // absolute path to the .mdl file
+    GpuMaterial&                 gm,
+    std::vector<TextureImage>&   textures_out,
+    std::unordered_map<std::string,int>& tex_cache,
+    bool                         is_usdz)
+{
+    namespace fs = std::filesystem;
+    std::ifstream f(mdl_path);
+    if (!f.is_open()) return;
+
+    const std::string mdl_dir = fs::path(mdl_path).parent_path().string();
+
+    // Helper: load a texture given a path relative to the .mdl file.
+    auto load_tex = [&](const std::string& rel, bool srgb) -> int {
+        if (rel.empty()) return -1;
+        std::string abs = (fs::path(mdl_dir) / rel).string();
+        // normalise separators
+        for (auto& c : abs) if (c == '\\') c = '/';
+        return load_texture_file(abs, textures_out, tex_cache, srgb);
+    };
+
+    // Extract the quoted path from a texture_2d("./path", ...) token.
+    auto extract_tex_path = [](const std::string& line) -> std::string {
+        auto q1 = line.find('"');
+        if (q1 == std::string::npos) return {};
+        auto q2 = line.find('"', q1 + 1);
+        if (q2 == std::string::npos) return {};
+        std::string p = line.substr(q1 + 1, q2 - q1 - 1);
+        // strip leading "./"
+        if (p.size() >= 2 && p[0] == '.' && (p[1] == '/' || p[1] == '\\'))
+            p = p.substr(2);
+        return p;
+    };
+
+    std::string line;
+    while (std::getline(f, line)) {
+        // trim leading whitespace
+        size_t s = line.find_first_not_of(" \t");
+        if (s == std::string::npos) continue;
+        line = line.substr(s);
+
+        // diffuse / albedo texture
+        if (line.find("diffuse_texture") != std::string::npos ||
+            line.find("albedo_texture")  != std::string::npos) {
+            if (gm.base_color_tex < 0) {
+                std::string p = extract_tex_path(line);
+                if (!p.empty()) gm.base_color_tex = load_tex(p, /*srgb=*/true);
+            }
+        }
+        // roughness texture
+        else if (line.find("reflectionroughness_texture") != std::string::npos ||
+                 line.find("roughness_texture")           != std::string::npos) {
+            if (gm.metallic_rough_tex < 0) {
+                std::string p = extract_tex_path(line);
+                if (!p.empty()) gm.metallic_rough_tex = load_tex(p, false);
+            }
+        }
+        // metallic texture
+        else if (line.find("metallic_texture") != std::string::npos &&
+                 line.find("influence") == std::string::npos) {
+            if (gm.metallic_rough_tex < 0) {
+                std::string p = extract_tex_path(line);
+                if (!p.empty()) gm.metallic_rough_tex = load_tex(p, false);
+            }
+        }
+        // normal map
+        else if (line.find("normalmap_texture") != std::string::npos) {
+            if (gm.normal_tex < 0) {
+                std::string p = extract_tex_path(line);
+                if (!p.empty()) gm.normal_tex = load_tex(p, false);
+            }
+        }
+        // emissive texture
+        else if (line.find("emissive_mask_texture") != std::string::npos ||
+                 line.find("emissive_texture")      != std::string::npos) {
+            if (gm.emissive_tex < 0) {
+                std::string p = extract_tex_path(line);
+                if (!p.empty()) gm.emissive_tex = load_tex(p, true);
+            }
+        }
+        // scalar: diffuse_color_constant: color(r, g, b)
+        else if (line.find("diffuse_color_constant") != std::string::npos) {
+            float r = 0.8f, g = 0.8f, b = 0.8f;
+            auto p = line.find('(');
+            if (p != std::string::npos)
+                sscanf(line.c_str() + p + 1, "%f, %f, %f", &r, &g, &b);
+            gm.base_color = make_float4(r, g, b, gm.base_color.w);
+        }
+        // scalar: reflection_roughness_constant
+        else if (line.find("reflection_roughness_constant") != std::string::npos &&
+                 line.find("influence") == std::string::npos) {
+            auto p = line.find(':');
+            if (p != std::string::npos) sscanf(line.c_str() + p + 1, "%f", &gm.roughness);
+        }
+        // scalar: metallic_constant
+        else if (line.find("metallic_constant") != std::string::npos &&
+                 line.find("texture") == std::string::npos) {
+            auto p = line.find(':');
+            if (p != std::string::npos) sscanf(line.c_str() + p + 1, "%f", &gm.metallic);
+        }
+    }
+}
+
+// Derive the .mdl file path from the inline variant string.
+// ".::materials::FountainGrass_Mat::FountainGrass_Mat" →
+//   {stage_dir}/materials/FountainGrass_Mat.mdl
+static std::string mdl_file_from_variant(const std::string& variant,
+                                          const std::string& stage_dir)
+{
+    // Variant format: .::module_path::MaterialName::MaterialName
+    // Split on "::" and take the second token as the module path.
+    // e.g. [".", "materials", "FountainGrass_Mat", "FountainGrass_Mat"]
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < variant.size()) {
+        size_t end = variant.find("::", pos);
+        if (end == std::string::npos) end = variant.size();
+        std::string tok = variant.substr(pos, end - pos);
+        if (!tok.empty() && tok != ".") parts.push_back(tok);
+        pos = (end == variant.size()) ? end : end + 2;
+    }
+    namespace fs = std::filesystem;
+    if (parts.size() < 2) {
+        // Plain name with no "::" prefix (e.g. "fallleaves", "TreeBark_07").
+        // Convention: look for {stage_dir}/materials/{variant}.mdl
+        if (!variant.empty() && variant.find("::") == std::string::npos)
+            return (fs::path(stage_dir) / "materials" / (variant + ".mdl")).string();
+        return {};
+    }
+    // parts[0] = module dir component (e.g. "materials")
+    // parts[1] = module name (e.g. "FountainGrass_Mat")
+    return (fs::path(stage_dir) / parts[0] / (parts[1] + ".mdl")).string();
+}
+
+static GpuMaterial read_mdl_shader(
+    const UsdShadeShader&         shader,
+    const std::string&            stage_path,
+    std::vector<TextureImage>&    textures_out,
+    std::unordered_map<std::string,int>& tex_cache)
+{
+    namespace fs = std::filesystem;
+    const std::string stage_dir = fs::path(stage_path).parent_path().string();
+    const bool is_usdz = [&]{
+        std::string ext = fs::path(stage_path).extension().string();
+        for (auto& c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return ext == ".usdz";
+    }();
+
+    GpuMaterial gm{};
+    gm.base_color         = make_float4(0.8f, 0.8f, 0.8f, 1.f);
+    gm.metallic           = 0.f;
+    gm.roughness          = 0.5f;
+    gm.emissive_factor    = make_float4(0.f, 0.f, 0.f, 1.f);
+    gm.base_color_tex     = -1;
+    gm.metallic_rough_tex = -1;
+    gm.normal_tex         = -1;
+    gm.emissive_tex       = -1;
+    gm.normal_y_flip      = 1;  // USD/MDL normal maps use DirectX convention
+
+    const std::string variant = mdl_variant(shader);
+    std::cerr << "[usd_loader] MDL variant='" << variant << "'\n";
+
+    // Read an asset-path input directly as a texture.
+    // MDL textures are stored as SdfAssetPath inputs, not through UsdUVTexture nodes.
+    auto get_mdl_tex = [&](const char* input_name, bool is_srgb) -> int {
+        UsdShadeInput inp = shader.GetInput(TfToken(input_name));
+        if (!inp) return -1;
+        SdfAssetPath ap;
+        if (!inp.Get(&ap)) return -1;
+        std::string asset    = ap.GetAssetPath();
+        std::string resolved = ap.GetResolvedPath();
+        if (asset.empty() && resolved.empty()) return -1;
+
+        if (is_usdz) {
+            std::string sub = asset.empty() ? resolved : asset;
+            auto bracket = sub.find('[');
+            if (bracket != std::string::npos && sub.back() == ']')
+                sub = sub.substr(bracket + 1, sub.size() - bracket - 2);
+            else if (sub.size() >= 2 && sub[0] == '.' && (sub[1] == '/' || sub[1] == '\\'))
+                sub = sub.substr(2);
+            for (auto& c : sub) if (c == '\\') c = '/';
+            return sub.empty() ? -1
+                               : load_texture_usdz(stage_path, sub, textures_out, tex_cache, is_srgb);
+        }
+        if (resolved.empty()) resolved = resolve_asset(asset, stage_dir);
+        return load_texture_file(resolved, textures_out, tex_cache, is_srgb);
+    };
+
+    auto read_color3 = [&](const char* name, float4& out) {
+        UsdShadeInput inp = shader.GetInput(TfToken(name));
+        if (!inp) return;
+        GfVec3f v;
+        if (inp.Get(&v)) out = make_float4(v[0], v[1], v[2], out.w);
+    };
+
+    auto read_float = [&](const char* name, float& out) {
+        UsdShadeInput inp = shader.GetInput(TfToken(name));
+        if (!inp) return;
+        inp.Get(&out);
+    };
+
+    bool is_glass = variant.find("Glass") != std::string::npos ||
+                    variant.find("glass") != std::string::npos;
+
+    if (is_glass) {
+        // OmniGlass: map to low-roughness transparent PBR
+        // (no dedicated dielectric path in GpuMaterial, so we approximate)
+        gm.roughness    = 0.f;
+        gm.metallic     = 0.f;
+        gm.base_color.w = 0.08f;   // mostly transparent
+        read_color3("glass_color",        gm.base_color);
+        read_float ("frosting_roughness", gm.roughness);
+        // Keep alpha low to approximate transmission
+        float depth = 1.f;
+        read_float("depth", depth);
+        gm.base_color.w = std::max(0.02f, std::min(0.35f, 1.f / std::max(depth, 0.01f)));
+    } else {
+        // Try OmniPBR names first, then fall back to common aliases used by
+        // inline MDL materials and other Omniverse exporters.
+
+        // ── Diffuse / base color ──────────────────────────────────────────────
+        static const char* DIFFUSE_NAMES[] = {
+            "diffuse_color_constant", "albedo_color", "diffuse_color",
+            "base_color", "baseColor", "diffuse", nullptr };
+        for (int i = 0; DIFFUSE_NAMES[i]; i++) {
+            UsdShadeInput inp = shader.GetInput(TfToken(DIFFUSE_NAMES[i]));
+            if (!inp) continue;
+            GfVec3f v;
+            if (inp.Get(&v)) { gm.base_color = make_float4(v[0], v[1], v[2], 1.f); break; }
+        }
+        // albedo_brightness — scalar multiplier on the base color (inline MDL convention)
+        bool has_albedo_brightness = false;
+        {
+            UsdShadeInput inp = shader.GetInput(TfToken("albedo_brightness"));
+            if (inp) {
+                has_albedo_brightness = true;
+                float brightness = 1.f;
+                if (inp.Get(&brightness) && brightness != 1.f) {
+                    gm.base_color.x *= brightness;
+                    gm.base_color.y *= brightness;
+                    gm.base_color.z *= brightness;
+                }
+            }
+        }
+
+        bool got_scalar = false;
+
+        // ── Roughness ────────────────────────────────────────────────────────
+        static const char* ROUGH_NAMES[] = {
+            "reflection_roughness_constant", "roughness_constant", "roughness",
+            "specular_roughness", "specularRoughness", nullptr };
+        for (int i = 0; ROUGH_NAMES[i]; i++) {
+            UsdShadeInput inp = shader.GetInput(TfToken(ROUGH_NAMES[i]));
+            if (inp && inp.Get(&gm.roughness)) { got_scalar = true; break; }
+        }
+
+        // ── Metallic ─────────────────────────────────────────────────────────
+        static const char* METAL_NAMES[] = {
+            "metallic_constant", "metallic", "metallicAmount",
+            "metalness", "reflectivity", nullptr };
+        for (int i = 0; METAL_NAMES[i]; i++) {
+            UsdShadeInput inp = shader.GetInput(TfToken(METAL_NAMES[i]));
+            if (inp && inp.Get(&gm.metallic)) { got_scalar = true; break; }
+        }
+
+        // ── Opacity ──────────────────────────────────────────────────────────
+        static const char* OPACITY_NAMES[] = {
+            "opacity_constant", "opacity", "alpha", nullptr };
+        for (int i = 0; OPACITY_NAMES[i]; i++) {
+            UsdShadeInput inp = shader.GetInput(TfToken(OPACITY_NAMES[i]));
+            if (inp && inp.Get(&gm.base_color.w)) { got_scalar = true; break; }
+        }
+
+        // ── Textures ─────────────────────────────────────────────────────────
+        // Diffuse / albedo texture
+        static const char* DIFF_TEX_NAMES[] = {
+            "diffuse_texture", "albedo_texture", "base_color_texture",
+            "diffuseColorMap", "albedoMap", "baseColorMap", nullptr };
+        for (int i = 0; DIFF_TEX_NAMES[i]; i++) {
+            int idx = get_mdl_tex(DIFF_TEX_NAMES[i], /*srgb=*/true);
+            if (idx >= 0) { gm.base_color_tex = idx; break; }
+        }
+
+        // Roughness texture
+        static const char* ROUGH_TEX_NAMES[] = {
+            "reflectionroughness_texture", "roughness_texture",
+            "roughnessMap", "specularRoughnessMap", nullptr };
+        int rough_tex = -1;
+        for (int i = 0; ROUGH_TEX_NAMES[i]; i++) {
+            rough_tex = get_mdl_tex(ROUGH_TEX_NAMES[i], /*srgb=*/false);
+            if (rough_tex >= 0) break;
+        }
+
+        // Metallic texture
+        static const char* METAL_TEX_NAMES[] = {
+            "metallic_texture", "metallicMap", "metalnessMap", nullptr };
+        int metal_tex = -1;
+        for (int i = 0; METAL_TEX_NAMES[i]; i++) {
+            metal_tex = get_mdl_tex(METAL_TEX_NAMES[i], /*srgb=*/false);
+            if (metal_tex >= 0) break;
+        }
+
+        // Normal map
+        static const char* NORM_TEX_NAMES[] = {
+            "normalmap_texture", "normal_texture", "normalMap",
+            "bumpMap", "bump_texture", nullptr };
+        for (int i = 0; NORM_TEX_NAMES[i]; i++) {
+            int idx = get_mdl_tex(NORM_TEX_NAMES[i], /*srgb=*/false);
+            if (idx >= 0) { gm.normal_tex = idx; break; }
+        }
+
+        // Emissive texture
+        static const char* EMIS_TEX_NAMES[] = {
+            "emissive_color_texture", "emissive_texture",
+            "emissiveMap", "emissiveColorMap", nullptr };
+        int emis_tex = -1;
+        for (int i = 0; EMIS_TEX_NAMES[i]; i++) {
+            emis_tex = get_mdl_tex(EMIS_TEX_NAMES[i], /*srgb=*/true);
+            if (emis_tex >= 0) { gm.emissive_tex = emis_tex; break; }
+        }
+
+        // ORM (Occlusion/Roughness/Metallic) combined texture — used by TreeBark etc.
+        {
+            bool orm_enabled = false;
+            UsdShadeInput ein = shader.GetInput(TfToken("enable_ORM_texture"));
+            if (ein) ein.Get(&orm_enabled);
+            if (orm_enabled && rough_tex < 0 && metal_tex < 0) {
+                static const char* ORM_NAMES[] = {
+                    "ORM_texture", "orm_texture", "ORMMap", nullptr };
+                for (int i = 0; ORM_NAMES[i]; i++) {
+                    int orm_tex = get_mdl_tex(ORM_NAMES[i], /*srgb=*/false);
+                    if (orm_tex >= 0) { rough_tex = orm_tex; metal_tex = orm_tex; break; }
+                }
+            }
+        }
+
+        // Pack metallic + roughness into glTF layout (G=roughness, B=metallic).
+        // Same logic as read_preview_surface: USD stores them as separate R-channel
+        // textures, but the renderer reads G and B.
+        if (metal_tex >= 0 && metal_tex == rough_tex) {
+            gm.metallic_rough_tex = metal_tex;  // already packed (e.g. ORM)
+        } else if (metal_tex >= 0 && rough_tex >= 0) {
+            const TextureImage& ri = textures_out[rough_tex];
+            const TextureImage& mi = textures_out[metal_tex];
+            TextureImage packed;
+            packed.width = ri.width; packed.height = ri.height; packed.srgb = false;
+            packed.pixels.resize(packed.width * packed.height * 4);
+            for (int i = 0; i < packed.width * packed.height; ++i) {
+                int mx = (i % packed.width) * mi.width / packed.width;
+                int my = (i / packed.width) * mi.height / packed.height;
+                int mi_idx = my * mi.width + mx;
+                packed.pixels[i*4+0] = 0;
+                packed.pixels[i*4+1] = ri.pixels[i*4];  // R → G (roughness)
+                packed.pixels[i*4+2] = (mi_idx >= 0 && mi_idx < mi.width*mi.height)
+                                       ? mi.pixels[mi_idx*4] : 0;  // R → B (metallic)
+                packed.pixels[i*4+3] = 255;
+            }
+            gm.metallic_rough_tex = (int)textures_out.size();
+            textures_out.push_back(std::move(packed));
+        } else if (rough_tex >= 0) {
+            const TextureImage& ri = textures_out[rough_tex];
+            TextureImage packed;
+            packed.width = ri.width; packed.height = ri.height; packed.srgb = false;
+            packed.pixels.resize(packed.width * packed.height * 4);
+            for (int i = 0; i < packed.width * packed.height; ++i) {
+                packed.pixels[i*4+0] = 0;
+                packed.pixels[i*4+1] = ri.pixels[i*4];  // R → G
+                packed.pixels[i*4+2] = (uint8_t)(gm.metallic * 255.f);
+                packed.pixels[i*4+3] = 255;
+            }
+            gm.metallic_rough_tex = (int)textures_out.size();
+            textures_out.push_back(std::move(packed));
+        } else if (metal_tex >= 0) {
+            const TextureImage& mi = textures_out[metal_tex];
+            TextureImage packed;
+            packed.width = mi.width; packed.height = mi.height; packed.srgb = false;
+            packed.pixels.resize(packed.width * packed.height * 4);
+            for (int i = 0; i < packed.width * packed.height; ++i) {
+                packed.pixels[i*4+0] = 0;
+                packed.pixels[i*4+1] = (uint8_t)(gm.roughness * 255.f);
+                packed.pixels[i*4+2] = mi.pixels[i*4];  // R → B
+                packed.pixels[i*4+3] = 255;
+            }
+            gm.metallic_rough_tex = (int)textures_out.size();
+            textures_out.push_back(std::move(packed));
+        }
+
+        // Emissive scalar
+        bool enable_emission = false;
+        {
+            UsdShadeInput ein = shader.GetInput(TfToken("enable_emission"));
+            if (ein) ein.Get(&enable_emission);
+        }
+        if (enable_emission) {
+            static const char* EMIS_COLOR_NAMES[] = {
+                "emissive_color", "emissiveColor", "emission_color", nullptr };
+            for (int i = 0; EMIS_COLOR_NAMES[i]; i++) {
+                UsdShadeInput inp = shader.GetInput(TfToken(EMIS_COLOR_NAMES[i]));
+                if (!inp) continue;
+                GfVec3f v;
+                if (inp.Get(&v)) { gm.emissive_factor = make_float4(v[0], v[1], v[2], 1.f); break; }
+            }
+            float intensity = 1.f;
+            read_float("emissive_intensity", intensity);
+            gm.emissive_factor.x *= intensity;
+            gm.emissive_factor.y *= intensity;
+            gm.emissive_factor.z *= intensity;
+        }
+
+        // For inline MDL variants (variant starts with ".::"), the .mdl file is
+        // the authoritative source for textures — USD inputs only carry scalar
+        // overrides.  Always parse the .mdl when any texture slot is still empty.
+        {
+            std::string mdl_path = mdl_file_from_variant(variant, stage_dir);
+            if (!mdl_path.empty() &&
+                (gm.base_color_tex < 0 || gm.metallic_rough_tex < 0 || gm.normal_tex < 0)) {
+                parse_mdl_file(mdl_path, gm, textures_out, tex_cache, is_usdz);
+            }
+        }
+
+        bool got_anything = (gm.base_color_tex >= 0 || gm.metallic_rough_tex >= 0
+                          || gm.normal_tex >= 0 || gm.emissive_tex >= 0
+                          || gm.metallic != 0.f || has_albedo_brightness
+                          || got_scalar);
+        if (!got_anything) {
+            auto all_inputs = shader.GetInputs();
+            if (!all_inputs.empty()) {
+                std::cerr << "[usd_loader] MDL '" << variant
+                          << "' — no recognised inputs found. Available inputs:";
+                for (auto& inp : all_inputs)
+                    std::cerr << "  " << inp.GetBaseName();
+                std::cerr << '\n';
+            }
+        }
+    }
+
+    return gm;
+}
+
 // ─────────────────────────────────────────────
 //  Main loader
 // ─────────────────────────────────────────────
+
+// USD emits a warning when ComputeBoundMaterial() is called on a prim that has
+// a material:binding relationship but the MaterialBindingAPI schema is not applied.
+// This is a common Omniverse Kit / AECO exporter issue.  When the API is missing
+// we read the relationship directly — same result, no warning.
+static UsdShadeMaterial get_bound_material(const UsdPrim& prim)
+{
+    if (prim.HasAPI<UsdShadeMaterialBindingAPI>())
+        return UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
+
+    // Direct relationship fallback — handles prims with the rel but no applied API.
+    UsdRelationship rel = prim.GetRelationship(TfToken("material:binding"));
+    if (!rel) return UsdShadeMaterial(UsdPrim{});
+    SdfPathVector targets;
+    rel.GetForwardedTargets(&targets);
+    if (targets.empty()) return UsdShadeMaterial(UsdPrim{});
+    return UsdShadeMaterial(prim.GetStage()->GetPrimAtPath(targets[0]));
+}
 
 bool usd_load(const std::string&          path,
               std::vector<Triangle>&      triangles_out,
@@ -427,6 +1026,7 @@ bool usd_load(const std::string&          path,
     default_mat.metallic_rough_tex= -1;
     default_mat.normal_tex        = -1;
     default_mat.emissive_tex      = -1;
+    default_mat.normal_y_flip     = 1;
     int default_mat_idx = 0;
     materials_out.push_back(default_mat);
 
@@ -457,21 +1057,26 @@ bool usd_load(const std::string&          path,
                     surface_shader = UsdShadeShader(src.GetPrim());
             }
         }
-        // Last resort: walk descendants looking for a UsdPreviewSurface shader
+        // Last resort: walk descendants for any known shader type
         if (!surface_shader) {
             for (const UsdPrim& child : mat.GetPrim().GetDescendants()) {
                 UsdShadeShader sh(child);
                 if (!sh) continue;
                 TfToken id; sh.GetShaderId(&id);
                 if (id == TfToken("UsdPreviewSurface") ||
-                    id == TfToken("ND_UsdPreviewSurface_surfaceshader")) {
+                    id == TfToken("ND_UsdPreviewSurface_surfaceshader") ||
+                    is_mdl_shader(sh)) {
                     surface_shader = sh; break;
                 }
             }
         }
-        GpuMaterial gm = surface_shader
-            ? read_preview_surface(surface_shader, path, textures_out, tex_cache)
-            : default_mat;
+        GpuMaterial gm = default_mat;
+        if (surface_shader) {
+            if (is_mdl_shader(surface_shader))
+                gm = read_mdl_shader(surface_shader, path, textures_out, tex_cache);
+            else
+                gm = read_preview_surface(surface_shader, path, textures_out, tex_cache);
+        }
         int idx = (int)materials_out.size();
         materials_out.push_back(gm);
         mat_cache[mat_path] = idx;
@@ -485,10 +1090,21 @@ bool usd_load(const std::string&          path,
 
         UsdGeomMesh geom(prim);
 
+        // ── Orientation: leftHanded meshes need winding reversal ──────
+        // USD default is rightHanded; USDZ from Apple/Reality Composer
+        // often uses leftHanded.  Detect via attribute or world xform sign.
+        TfToken orientation = UsdGeomTokens->rightHanded;
+        geom.GetOrientationAttr().Get(&orientation);
+        bool flip_winding = (orientation == UsdGeomTokens->leftHanded);
+
         // ── World transform ───────────────────────────────────────────
         // Post-multiply: world * correction so correction applies AFTER world transform.
         // (USD row-vector convention: point is transformed as  p * matrix)
         GfMatrix4d world = xform_cache.GetLocalToWorldTransform(prim) * axis_correction;
+
+        // A negative-determinant world transform also flips winding
+        if (world.GetDeterminant() < 0.0)
+            flip_winding = !flip_winding;
 
         // ── Topology ──────────────────────────────────────────────────
         VtIntArray face_vertex_counts, face_vertex_indices;
@@ -499,11 +1115,26 @@ bool usd_load(const std::string&          path,
         geom.GetPointsAttr().Get(&points);
         if (points.empty()) continue;
 
-        // ── Normals (optional) ────────────────────────────────────────
+        // ── Normals ───────────────────────────────────────────────────
+        // 1. Try the mesh 'normals' attribute
+        // 2. Try primvars:normals (some exporters store normals as primvar)
+        // 3. Compute smooth vertex normals by averaging face normals
         VtVec3fArray normals;
         TfToken normals_interp;
         geom.GetNormalsAttr().Get(&normals);
         normals_interp = geom.GetNormalsInterpolation();
+
+        if (normals.empty()) {
+            UsdGeomPrimvarsAPI nAPI(prim);
+            UsdGeomPrimvar nPv = nAPI.GetPrimvar(TfToken("normals"));
+            if (nPv && nPv.IsDefined()) {
+                nPv.Get(&normals);
+                normals_interp = nPv.GetInterpolation();
+            }
+        }
+
+        // If no normals found, leave empty — flat normals are computed
+        // per-triangle in the loop below as fallback.
 
         // ── UVs: look for st or st0 primvar ──────────────────────────
         UsdGeomPrimvarsAPI pvAPI(prim);
@@ -541,8 +1172,7 @@ bool usd_load(const std::string&          path,
         // Mesh-level fallback binding
         int mat_idx = default_mat_idx;
         {
-            UsdShadeMaterialBindingAPI binding(prim);
-            UsdShadeMaterial mat = binding.ComputeBoundMaterial();
+            UsdShadeMaterial mat = get_bound_material(prim);
             if (mat) {
                 mat_idx = resolve_material(mat);
                 std::cerr << "[usd_loader] mesh '" << prim.GetPath()
@@ -567,8 +1197,7 @@ bool usd_load(const std::string&          path,
             VtIntArray face_indices;
             subset.GetIndicesAttr().Get(&face_indices);
 
-            UsdShadeMaterialBindingAPI sub_bind(child);
-            UsdShadeMaterial sub_mat = sub_bind.ComputeBoundMaterial();
+            UsdShadeMaterial sub_mat = get_bound_material(child);
             int sub_mat_idx = sub_mat ? resolve_material(sub_mat) : mat_idx;
             for (int fi : face_indices)
                 face_mat_map[fi] = sub_mat_idx;
@@ -643,17 +1272,55 @@ bool usd_load(const std::string&          path,
                     return make_float2(uvs[ui][0], 1.f - uvs[ui][1]);
                 };
 
+                // Flip winding for leftHanded orientation or negative-det xform
+                if (flip_winding) {
+                    std::swap(wv1, wv2);
+                    std::swap(wn1, wn2);
+                }
+
                 Triangle tri{};
                 tri.v0 = wv0; tri.v1 = wv1; tri.v2 = wv2;
                 tri.n0 = safe_normalize(wn0);
                 tri.n1 = safe_normalize(wn1);
                 tri.n2 = safe_normalize(wn2);
-                tri.uv0 = get_uv(fv_cursor,     i0);
-                tri.uv1 = get_uv(fv_cursor + t, i1);
-                tri.uv2 = get_uv(fv_cursor+t+1, i2);
-                tri.t0 = make_float4(0.f, 0.f, 0.f, 0.f);  // no tangents yet
-                tri.t1 = make_float4(0.f, 0.f, 0.f, 0.f);
-                tri.t2 = make_float4(0.f, 0.f, 0.f, 0.f);
+
+                float2 tuv0 = get_uv(fv_cursor,     i0);
+                float2 tuv1 = get_uv(fv_cursor + t, i1);
+                float2 tuv2 = get_uv(fv_cursor+t+1, i2);
+                if (flip_winding) std::swap(tuv1, tuv2);
+                tri.uv0 = tuv0; tri.uv1 = tuv1; tri.uv2 = tuv2;
+
+                // Compute tangent from UV edges (MikkTSpace-style)
+                // Required for normal mapping — shader skips when tangent.w == 0
+                {
+                    float3 e1 = make_float3(wv1.x-wv0.x, wv1.y-wv0.y, wv1.z-wv0.z);
+                    float3 e2 = make_float3(wv2.x-wv0.x, wv2.y-wv0.y, wv2.z-wv0.z);
+                    float du1 = tuv1.x - tuv0.x, dv1 = tuv1.y - tuv0.y;
+                    float du2 = tuv2.x - tuv0.x, dv2 = tuv2.y - tuv0.y;
+                    float det = du1*dv2 - du2*dv1;
+                    float3 T;
+                    if (fabsf(det) > 1e-8f) {
+                        float inv = 1.f / det;
+                        T = safe_normalize(make_float3(
+                            (dv2*e1.x - dv1*e2.x) * inv,
+                            (dv2*e1.y - dv1*e2.y) * inv,
+                            (dv2*e1.z - dv1*e2.z) * inv));
+                    } else {
+                        // Degenerate UV — pick an arbitrary tangent perpendicular to normal
+                        float3 n = tri.n0;
+                        float3 up = (fabsf(n.z) < 0.999f)
+                            ? make_float3(0.f,0.f,1.f) : make_float3(1.f,0.f,0.f);
+                        T = safe_normalize(cross3(up, n));
+                    }
+                    // Bitangent sign: +1 if (T × N) agrees with B, else -1
+                    float3 B = cross3(tri.n0, T);
+                    float3 e2cross = cross3(e1, e2);
+                    float bsign = (dot3(B, make_float3(
+                        (du2*e1.x - du1*e2.x), (du2*e1.y - du1*e2.y),
+                        (du2*e1.z - du1*e2.z))) >= 0.f) ? 1.f : -1.f;
+                    float4 tang = make_float4(T.x, T.y, T.z, bsign);
+                    tri.t0 = tang; tri.t1 = tang; tri.t2 = tang;
+                }
                 // Per-face material from GeomSubset overrides mesh-level mat
                 auto fm = face_mat_map.find(face_idx);
                 tri.mat_idx = (fm != face_mat_map.end()) ? fm->second : mat_idx;
@@ -693,4 +1360,349 @@ bool usd_load(const std::string&          path,
               << objects_out.size()   << " objects  from " << path << '\n';
 
     return !triangles_out.empty();
+}
+
+// ─────────────────────────────────────────────
+//  USD Animation support
+// ─────────────────────────────────────────────
+
+// Per-mesh cached topology (time-invariant data)
+struct MeshCache {
+    SdfPath              prim_path;
+    VtIntArray           face_vertex_counts;
+    VtIntArray           face_vertex_indices;
+    TfToken              orientation;
+    TfToken              subdiv_scheme;
+    VtVec2fArray         uvs;
+    VtIntArray           uv_indices;
+    TfToken              uv_interp;
+    int                  mat_idx;
+    std::unordered_map<int,int> face_mat_map;
+    int                  obj_id;
+    int                  tri_start;   // offset into output triangle array
+    int                  tri_count;   // number of triangles this mesh produces
+
+};
+
+struct UsdAnimHandle {
+    UsdStageRefPtr           stage;
+    GfMatrix4d               axis_correction;
+    std::vector<MeshCache>   meshes;
+    bool                     has_time_samples;
+    bool                     skinning_baked = false;
+};
+
+UsdAnimHandle* usd_anim_open(const std::string& path,
+                             const std::vector<Triangle>& initial_tris)
+{
+    UsdStageRefPtr stage = UsdStage::Open(path);
+    if (!stage) return nullptr;
+
+    auto* h = new UsdAnimHandle();
+    h->stage = stage;
+
+    // Axis correction (same as usd_load)
+    TfToken up_axis = UsdGeomGetStageUpAxis(stage);
+    h->axis_correction = GfMatrix4d(1.0);
+    if (up_axis == UsdGeomTokens->z) {
+        h->axis_correction = GfMatrix4d(
+            1,  0,  0, 0,
+            0,  0, -1, 0,
+            0,  1,  0, 0,
+            0,  0,  0, 1);
+    }
+
+    h->has_time_samples = false;
+    int tri_cursor = 0;
+    int next_obj_id = 0;
+
+    // Bake skeletal skinning: deforms rest-pose points into time-sampled
+    // world-space points directly on the stage.  After baking, GetPointsAttr()
+    // returns deformed points at any time code — no manual LBS needed.
+    for (const UsdPrim& p : stage->Traverse(UsdTraverseInstanceProxies())) {
+        if (p.IsA<UsdSkelRoot>()) {
+            std::cerr << "[usd_anim] baking skeletal skinning for SkelRoot '"
+                      << p.GetPath() << "'...\n";
+            UsdSkelBakeSkinning(UsdSkelRoot(p));
+            h->skinning_baked = true;
+            h->has_time_samples = true;
+        }
+    }
+    if (h->skinning_baked)
+        std::cerr << "[usd_anim] skinning bake complete\n";
+
+    // Traverse in the same order as usd_load to match triangle layout
+    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
+        if (!prim.IsA<UsdGeomMesh>()) continue;
+        UsdGeomMesh geom(prim);
+
+        MeshCache mc;
+        mc.prim_path = prim.GetPath();
+        geom.GetFaceVertexCountsAttr().Get(&mc.face_vertex_counts);
+        geom.GetFaceVertexIndicesAttr().Get(&mc.face_vertex_indices);
+        mc.orientation = UsdGeomTokens->rightHanded;
+        geom.GetOrientationAttr().Get(&mc.orientation);
+        mc.subdiv_scheme = TfToken();
+        geom.GetSubdivisionSchemeAttr().Get(&mc.subdiv_scheme);
+
+        // Check for time samples on points, xform, or any ancestor xform
+        if (geom.GetPointsAttr().GetNumTimeSamples() > 1)
+            h->has_time_samples = true;
+        // Walk up the prim hierarchy — animations often live on parent xforms
+        for (UsdPrim p = prim; p.IsValid(); p = p.GetParent()) {
+            UsdGeomXformable xf(p);
+            if (!xf) continue;
+            std::vector<double> times;
+            xf.GetTimeSamples(&times);
+            if (times.size() > 1) {
+                h->has_time_samples = true;
+                break;
+            }
+        }
+
+        // Cache UVs
+        mc.uv_interp = UsdGeomTokens->faceVarying;
+        {
+            UsdGeomPrimvarsAPI pvAPI(prim);
+            static const char* UV_NAMES[] = { "st", "st0", "UVMap", "map1", nullptr };
+            for (int ui = 0; UV_NAMES[ui]; ++ui) {
+                UsdGeomPrimvar pv = pvAPI.GetPrimvar(TfToken(UV_NAMES[ui]));
+                if (pv && pv.IsDefined()) {
+                    pv.Get(&mc.uvs);
+                    pv.GetIndices(&mc.uv_indices);
+                    mc.uv_interp = pv.GetInterpolation();
+                    break;
+                }
+            }
+        }
+
+        // Match obj_id and material from initial load
+        mc.obj_id = next_obj_id++;
+
+        // Find mat_idx from the initial triangles (first tri of this mesh)
+        // Count triangles this mesh produces
+        int tri_count = 0;
+        for (int fvc : mc.face_vertex_counts)
+            tri_count += std::max(0, fvc - 2);
+
+        mc.tri_start = tri_cursor;
+        mc.tri_count = tri_count;
+
+        // Read mat_idx and face_mat_map from initial triangles
+        if (tri_cursor < (int)initial_tris.size())
+            mc.mat_idx = initial_tris[tri_cursor].mat_idx;
+        else
+            mc.mat_idx = 0;
+
+        // Build face_mat_map by scanning initial tris for varying mat_idx
+        {
+            int fv = 0, fi = 0, ti = tri_cursor;
+            for (int fvc : mc.face_vertex_counts) {
+                for (int t = 1; t < fvc - 1; ++t) {
+                    if (ti < (int)initial_tris.size()) {
+                        int m = initial_tris[ti].mat_idx;
+                        if (m != mc.mat_idx)
+                            mc.face_mat_map[fi] = m;
+                        ti++;
+                    }
+                }
+                fv += fvc;
+                fi++;
+            }
+        }
+
+        tri_cursor += tri_count;
+        h->meshes.push_back(std::move(mc));
+    }
+
+    // Also check the stage's time code range — if start != end, it's animated
+    if (!h->has_time_samples) {
+        double start = stage->GetStartTimeCode();
+        double end   = stage->GetEndTimeCode();
+        if (end > start)
+            h->has_time_samples = true;
+    }
+
+    std::cout << "[usd_anim] opened stage with " << h->meshes.size()
+              << " meshes, " << tri_cursor << " triangles, "
+              << (h->has_time_samples ? "ANIMATED" : "static") << "\n";
+    return h;
+}
+
+bool usd_load_frame(UsdAnimHandle* h, float time,
+                    std::vector<Triangle>& triangles_out)
+{
+    if (!h || !h->stage) return false;
+
+    UsdTimeCode tc(time);
+    UsdGeomXformCache xform_cache(tc);
+
+    for (const MeshCache& mc : h->meshes) {
+        UsdPrim prim = h->stage->GetPrimAtPath(mc.prim_path);
+        if (!prim) continue;
+        UsdGeomMesh geom(prim);
+
+        // Time-varying: xform + points
+        GfMatrix4d world = xform_cache.GetLocalToWorldTransform(prim) * h->axis_correction;
+
+        VtVec3fArray points;
+        geom.GetPointsAttr().Get(&points, tc);
+        if (points.empty()) continue;
+
+        // Skinning is already baked into the stage — GetPointsAttr().Get()
+        // returns deformed points at any time code.  No manual LBS needed.
+
+        bool flip_winding = (mc.orientation == UsdGeomTokens->leftHanded);
+        if (world.GetDeterminant() < 0.0)
+            flip_winding = !flip_winding;
+
+        // Normals (re-evaluate at this time code)
+        VtVec3fArray normals;
+        TfToken normals_interp;
+        geom.GetNormalsAttr().Get(&normals, tc);
+        normals_interp = geom.GetNormalsInterpolation();
+
+        if (normals.empty()) {
+            UsdGeomPrimvarsAPI nAPI(prim);
+            UsdGeomPrimvar nPv = nAPI.GetPrimvar(TfToken("normals"));
+            if (nPv && nPv.IsDefined()) {
+                nPv.Get(&normals, tc);
+                normals_interp = nPv.GetInterpolation();
+            }
+        }
+
+        // If no normals, flat normals computed per-triangle below as fallback.
+
+        // Build triangles using cached topology
+        int tri_idx = mc.tri_start;
+        int fv_cursor = 0;
+        int face_idx = 0;
+
+        for (int fvc : mc.face_vertex_counts) {
+            for (int t = 1; t < fvc - 1; ++t) {
+                if (tri_idx >= (int)triangles_out.size()) break;
+
+                int i0 = mc.face_vertex_indices[fv_cursor];
+                int i1 = mc.face_vertex_indices[fv_cursor + t];
+                int i2 = mc.face_vertex_indices[fv_cursor + t + 1];
+                if (i0 >= (int)points.size() || i1 >= (int)points.size() || i2 >= (int)points.size()) {
+                    tri_idx++;
+                    continue;
+                }
+
+                float3 wv0 = transform_point(world, points[i0]);
+                float3 wv1 = transform_point(world, points[i1]);
+                float3 wv2 = transform_point(world, points[i2]);
+
+                // Normals
+                auto get_norm = [&](int face_v_idx, int vert_idx) -> float3 {
+                    if (normals.empty()) return make_float3(0.f, 0.f, 0.f);
+                    int ni = -1;
+                    if (normals_interp == UsdGeomTokens->faceVarying)
+                        ni = face_v_idx;
+                    else if (normals_interp == UsdGeomTokens->vertex)
+                        ni = vert_idx;
+                    else if (normals_interp == UsdGeomTokens->uniform)
+                        ni = face_idx;
+                    if (ni < 0 || ni >= (int)normals.size()) return make_float3(0.f,0.f,0.f);
+                    return transform_normal(world, normals[ni]);
+                };
+
+                float3 wn0 = get_norm(fv_cursor,       i0);
+                float3 wn1 = get_norm(fv_cursor + t,   i1);
+                float3 wn2 = get_norm(fv_cursor+t+1,   i2);
+
+                float3 flat = safe_normalize(cross3(
+                    make_float3(wv1.x-wv0.x, wv1.y-wv0.y, wv1.z-wv0.z),
+                    make_float3(wv2.x-wv0.x, wv2.y-wv0.y, wv2.z-wv0.z)));
+                if (wn0.x == 0.f && wn0.y == 0.f && wn0.z == 0.f) wn0 = flat;
+                if (wn1.x == 0.f && wn1.y == 0.f && wn1.z == 0.f) wn1 = flat;
+                if (wn2.x == 0.f && wn2.y == 0.f && wn2.z == 0.f) wn2 = flat;
+
+                if (flip_winding) {
+                    std::swap(wv1, wv2);
+                    std::swap(wn1, wn2);
+                }
+
+                Triangle& tri = triangles_out[tri_idx];
+                tri.v0 = wv0; tri.v1 = wv1; tri.v2 = wv2;
+                tri.n0 = safe_normalize(wn0);
+                tri.n1 = safe_normalize(wn1);
+                tri.n2 = safe_normalize(wn2);
+
+                // UVs from cache
+                auto get_uv = [&](int face_v_idx, int vert_idx) -> float2 {
+                    if (mc.uvs.empty()) return make_float2(0.f, 0.f);
+                    int ui = -1;
+                    if (!mc.uv_indices.empty()) {
+                        if (mc.uv_interp == UsdGeomTokens->faceVarying && face_v_idx < (int)mc.uv_indices.size())
+                            ui = mc.uv_indices[face_v_idx];
+                        else if (mc.uv_interp == UsdGeomTokens->vertex && vert_idx < (int)mc.uv_indices.size())
+                            ui = mc.uv_indices[vert_idx];
+                    } else {
+                        if (mc.uv_interp == UsdGeomTokens->faceVarying)
+                            ui = face_v_idx;
+                        else if (mc.uv_interp == UsdGeomTokens->vertex)
+                            ui = vert_idx;
+                    }
+                    if (ui < 0 || ui >= (int)mc.uvs.size()) return make_float2(0.f, 0.f);
+                    return make_float2(mc.uvs[ui][0], 1.f - mc.uvs[ui][1]);
+                };
+
+                float2 tuv0 = get_uv(fv_cursor,     i0);
+                float2 tuv1 = get_uv(fv_cursor + t, i1);
+                float2 tuv2 = get_uv(fv_cursor+t+1, i2);
+                if (flip_winding) std::swap(tuv1, tuv2);
+                tri.uv0 = tuv0; tri.uv1 = tuv1; tri.uv2 = tuv2;
+
+                // Tangent
+                {
+                    float3 e1 = make_float3(wv1.x-wv0.x, wv1.y-wv0.y, wv1.z-wv0.z);
+                    float3 e2 = make_float3(wv2.x-wv0.x, wv2.y-wv0.y, wv2.z-wv0.z);
+                    float du1 = tuv1.x - tuv0.x, dv1 = tuv1.y - tuv0.y;
+                    float du2 = tuv2.x - tuv0.x, dv2 = tuv2.y - tuv0.y;
+                    float det = du1*dv2 - du2*dv1;
+                    float3 T;
+                    if (fabsf(det) > 1e-8f) {
+                        float inv = 1.f / det;
+                        T = safe_normalize(make_float3(
+                            (dv2*e1.x - dv1*e2.x) * inv,
+                            (dv2*e1.y - dv1*e2.y) * inv,
+                            (dv2*e1.z - dv1*e2.z) * inv));
+                    } else {
+                        float3 n = tri.n0;
+                        float3 up = (fabsf(n.z) < 0.999f)
+                            ? make_float3(0.f,0.f,1.f) : make_float3(1.f,0.f,0.f);
+                        T = safe_normalize(cross3(up, n));
+                    }
+                    float3 B = cross3(tri.n0, T);
+                    float bsign = (dot3(B, make_float3(
+                        (du2*e1.x - du1*e2.x), (du2*e1.y - du1*e2.y),
+                        (du2*e1.z - du1*e2.z))) >= 0.f) ? 1.f : -1.f;
+                    float4 tang = make_float4(T.x, T.y, T.z, bsign);
+                    tri.t0 = tang; tri.t1 = tang; tri.t2 = tang;
+                }
+
+                // Material from cache
+                auto fm = mc.face_mat_map.find(face_idx);
+                tri.mat_idx = (fm != mc.face_mat_map.end()) ? fm->second : mc.mat_idx;
+                tri.obj_id  = mc.obj_id;
+
+                tri_idx++;
+            }
+            fv_cursor += fvc;
+            face_idx++;
+        }
+    }
+    return true;
+}
+
+bool usd_has_animation(UsdAnimHandle* h)
+{
+    return h && h->has_time_samples;
+}
+
+void usd_anim_close(UsdAnimHandle* h)
+{
+    delete h;
 }

@@ -8,6 +8,9 @@
 
 #include "vulkan_context.h"
 #include "cuda_interop.h"
+#include "ui/gpu_arch_window.h"
+#include "ui/gpu_arch_sm_tracker.h"
+#include "cupti_profiler.h"
 #include "pathtracer.h"
 #include "bvh.h"
 #include "scene.h"
@@ -30,6 +33,8 @@
 #include "ui/outliner.h"
 #include "ui/stats_panel.h"
 #include "ui/material_panel.h"
+#include "ui/anim_panel.h"
+#include "ui/hydra_preview.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -46,6 +51,142 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
+
+static bool env_flag_enabled(const char* name)
+{
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value || !value[0]) {
+        free(value);
+        return false;
+    }
+    const char c = value[0];
+    free(value);
+    return c == '1' || c == 'y' || c == 'Y' ||
+           c == 't' || c == 'T' || c == 'o' || c == 'O';
+}
+
+static LONG WINAPI win_unhandled_exception_filter(EXCEPTION_POINTERS* ep)
+{
+    if (ep && ep->ExceptionRecord) {
+        fprintf(stderr, "[fatal] SEH 0x%08X at %p\n",
+                (unsigned)ep->ExceptionRecord->ExceptionCode,
+                ep->ExceptionRecord->ExceptionAddress);
+    } else {
+        fprintf(stderr, "[fatal] SEH (no exception record)\n");
+    }
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static bool safe_cupti_init(CuptiProfiler& profiler, int device_index)
+{
+#ifdef _WIN32
+    __try {
+        return profiler.init(device_index);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[cupti] init crashed (SEH); disabling CUPTI profiler\n";
+        return false;
+    }
+#else
+    return profiler.init(device_index);
+#endif
+}
+
+static void safe_cupti_begin_frame(CuptiProfiler& profiler)
+{
+#ifdef _WIN32
+    __try {
+        profiler.begin_frame();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[cupti] begin_frame crashed (SEH); skipping CUPTI sample\n";
+    }
+#else
+    profiler.begin_frame();
+#endif
+}
+
+static void safe_cupti_end_frame(CuptiProfiler& profiler)
+{
+#ifdef _WIN32
+    __try {
+        profiler.end_frame();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[cupti] end_frame crashed (SEH); skipping CUPTI sample\n";
+    }
+#else
+    profiler.end_frame();
+#endif
+}
+
+static bool safe_hydra_preview_init(
+    HydraPreviewState& hp,
+    VkDevice device,
+    VkPhysicalDevice physical_device,
+    VkQueue graphics_queue,
+    uint32_t graphics_queue_family,
+    VkCommandPool command_pool)
+{
+#ifdef _WIN32
+    __try {
+        return hydra_preview_init(
+            hp, device, physical_device, graphics_queue, graphics_queue_family, command_pool);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[hydra_preview] init crashed (SEH), preview disabled\n";
+        return false;
+    }
+#else
+    return hydra_preview_init(
+        hp, device, physical_device, graphics_queue, graphics_queue_family, command_pool);
+#endif
+}
+
+static bool safe_hydra_preview_tick(
+    HydraPreviewState& hp,
+    const AnimPanelState& anim,
+    int width,
+    int height)
+{
+#ifdef _WIN32
+    __try {
+        return hydra_preview_tick(hp, anim, width, height);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[hydra_preview] tick crashed (SEH), closing preview\n";
+        return false;
+    }
+#else
+    return hydra_preview_tick(hp, anim, width, height);
+#endif
+}
+
+static bool safe_hydra_preview_load(HydraPreviewState& hp, const std::string& path)
+{
+#ifdef _WIN32
+    __try {
+        hydra_preview_load(hp, path);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[hydra_preview] load crashed (SEH), closing preview\n";
+        return false;
+    }
+#else
+    hydra_preview_load(hp, path);
+    return true;
+#endif
+}
+
+static void safe_hydra_preview_destroy(HydraPreviewState& hp)
+{
+#ifdef _WIN32
+    __try {
+        hydra_preview_destroy(hp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::cerr << "[hydra_preview] destroy crashed (SEH)\n";
+    }
+#else
+    hydra_preview_destroy(hp);
+#endif
+}
 
 // ─────────────────────────────────────────────
 //  Scene
@@ -586,6 +727,13 @@ struct MeshState {
     }
 };
 
+static bool is_usd_scene_path(const std::string& path)
+{
+    auto ext = std::filesystem::path(path).extension().string();
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    return (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz");
+}
+
 static bool load_gltf_into(const std::string& path, MeshState& ms,
                             ControlPanelState& ctrl)
 {
@@ -596,9 +744,7 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
     std::vector<TextureImage> tex_images;
 
     // Route by extension
-    auto ext = std::filesystem::path(path).extension().string();
-    for (auto& c : ext) c = (char)tolower((unsigned char)c);
-    bool is_usd = (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz");
+    const bool is_usd = is_usd_scene_path(path);
 
     bool load_ok = is_usd
         ? usd_load (path, tris, mats, tex_images, ms.objects)
@@ -701,6 +847,15 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
         ctrl.pos[1] = cy + dist * 0.3f;
         ctrl.pos[2] = cz + dist;
 
+        // Also update cam_from/cam_at immediately so any same-frame sync
+        // (e.g. Hydra preview) gets the correct auto-fit camera right away.
+        ctrl.cam_from[0] = ctrl.pos[0];
+        ctrl.cam_from[1] = ctrl.pos[1];
+        ctrl.cam_from[2] = ctrl.pos[2];
+        ctrl.cam_at[0]   = ctrl.orbit_pivot[0];
+        ctrl.cam_at[1]   = ctrl.orbit_pivot[1];
+        ctrl.cam_at[2]   = ctrl.orbit_pivot[2];
+
         // Auto-scale move speed to ~5% of scene diagonal so navigation feels
         // natural regardless of whether the scene is centimetres or kilometres.
         ctrl.move_speed = fmaxf(1.5f, diag * 0.15f);
@@ -748,7 +903,7 @@ static std::filesystem::path exe_dir_main()
     return std::filesystem::path(buf).parent_path();
 }
 
-struct WinState { int x, y, w, h; bool maximized; };
+struct WinState { int x, y, w, h; bool maximized; bool show_gpu_arch = false; };
 
 static WinState load_win_state()
 {
@@ -757,6 +912,7 @@ static WinState load_win_state()
     std::ifstream f(path);
     if (!f) return s;
     f >> s.x >> s.y >> s.w >> s.h >> s.maximized;
+    f >> s.show_gpu_arch;  // optional field — silently ignored if absent (old window.ini)
 
     // Clamp degenerate sizes
     if (s.w < 400) s.w = 1600;
@@ -771,7 +927,7 @@ static WinState load_win_state()
     return s;
 }
 
-static void save_win_state(GLFWwindow* win)
+static void save_win_state(GLFWwindow* win, bool s_show_gpu_arch)
 {
     // GetWindowPlacement returns rcNormalPosition — the restored rect —
     // correctly even when the window is currently maximized (no async issues).
@@ -792,7 +948,8 @@ static void save_win_state(GLFWwindow* win)
 
     auto path = exe_dir_main() / "window.ini";
     std::ofstream f(path);
-    if (f) f << s.x << ' ' << s.y << ' ' << s.w << ' ' << s.h << ' ' << s.maximized << '\n';
+    if (f) f << s.x << ' ' << s.y << ' ' << s.w << ' ' << s.h << ' '
+               << s.maximized << ' ' << s_show_gpu_arch << '\n';
 }
 
 // ─────────────────────────────────────────────
@@ -800,15 +957,23 @@ static void save_win_state(GLFWwindow* win)
 // ─────────────────────────────────────────────
 
 int main() {
-    if (!glfwInit()) throw std::runtime_error("GLFW init failed");
+    try {
+    SetUnhandledExceptionFilter(win_unhandled_exception_filter);
+    const bool streamline_disabled = env_flag_enabled("CUDA_VK_DISABLE_STREAMLINE");
+    const bool cupti_enabled = !env_flag_enabled("CUDA_VK_DISABLE_CUPTI");
+
     // Streamline DLSS: slInit() must be called before any vkCreateInstance.
     // plugin_dir = exe directory where sl.dlss.dll, sl.common.dll etc. are deployed.
-    {
+    if (!streamline_disabled) {
         char exe_buf[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, exe_buf, MAX_PATH);
         std::filesystem::path exe_dir = std::filesystem::path(exe_buf).parent_path();
         dlss_pre_vulkan_init(exe_dir.string().c_str());
+    } else {
+        fprintf(stderr, "[dlss] Streamline disabled by CUDA_VK_DISABLE_STREAMLINE\n");
+        fflush(stderr);
     }
+    if (!glfwInit()) throw std::runtime_error("GLFW init failed");
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
@@ -824,6 +989,7 @@ int main() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // allow tearing off to second monitor
     // Persist panel layout next to the exe so it survives working-dir changes
     static std::string imgui_ini_path = (exe_dir_main() / "imgui.ini").string();
     io.IniFilename = imgui_ini_path.c_str();
@@ -870,9 +1036,18 @@ int main() {
 
     ViewportPanel            vp;
     ControlPanelState        ctrl;
+    ctrl.show_gpu_arch = wstate.show_gpu_arch;
+    AnimPanelState           anim;
+    HydraPreviewState        hp_preview;
+    bool                     hydra_preview_ready = false;
+    std::string              hydra_loaded_scene_path;
     MeshState                mesh;
     std::unordered_set<int>  multi_sel;   // obj indices currently selected
     int frame_count = 0;
+
+    // USD animation — persistent stage handle for per-frame geometry re-evaluation
+    UsdAnimHandle*           usd_anim_handle = nullptr;
+    float                    usd_last_frame_time = -1e30f;
 
     HdriMap        hdri;
     DenoiserState  denoiser;
@@ -889,6 +1064,25 @@ int main() {
     GpuLiveStats    live_stats;
     stats_init(nvml, hw_info);
 
+    GpuArchWindowState arch_state{};
+    gpu_arch_window_init(arch_state,
+                         hw_info.compute_major, hw_info.compute_minor,
+                         hw_info.l2_cache_bytes / (1024 * 1024));
+    arch_state.vram_total = hw_info.total_vram_bytes;
+
+    SmTracker sm_tracker{};
+    sm_tracker_init(sm_tracker, hw_info.sm_count);
+
+    CuptiProfiler cupti_profiler;
+    arch_state.cupti_available = cupti_enabled ? safe_cupti_init(cupti_profiler, 0) : false;
+    arch_state.profiling_enabled = arch_state.cupti_available; // default ON when CUPTI is available
+    if (arch_state.cupti_available)
+        printf("[main] CUPTI hardware counters available\n");
+    else
+        printf("[main] CUPTI not available — using NVML estimates\n");
+
+    float arch_timer_ms = 0.f;   // accumulates frame_ms; snapshot every 500ms
+
     // OptiX GPU denoiser (replaces OIDN when available and enabled)
 #ifdef OPTIX_ENABLED
     if (optix_denoiser_init(optix_dn, rt_w, rt_h))
@@ -903,7 +1097,7 @@ int main() {
 
     // DLSS — only init when user enables it (done on demand in frame loop)
 #ifdef DLSS_ENABLED
-    ctrl.dlss_has_sdk = true;
+    ctrl.dlss_has_sdk = !streamline_disabled;
 #endif
 
     PostProcess post;
@@ -954,6 +1148,8 @@ int main() {
                 std::cout << "Auto-loading " << p << "\n";
                 strncpy_s(ctrl.gltf_path, sizeof(ctrl.gltf_path), p, _TRUNCATE);
                 load_gltf_into(p, mesh, ctrl);
+                if (is_usd_scene_path(p))
+                    usd_anim_handle = usd_anim_open(p, mesh.all_prims);
                 break;
             }
         }
@@ -961,6 +1157,9 @@ int main() {
 
     double prev_mx = 0.0, prev_my = 0.0;
     bool   rmb_was_down = false;
+    bool   pending_rt_resize = false;
+    int    pending_rt_w = 0;
+    int    pending_rt_h = 0;
 
     auto t_last = std::chrono::high_resolution_clock::now();
 
@@ -972,6 +1171,48 @@ int main() {
         if (frame_ms < 0.001f) frame_ms = 0.001f;
         t_last = t_now;
 
+        if (pending_rt_resize && pending_rt_w > 0 && pending_rt_h > 0) {
+            vkDeviceWaitIdle(vk.device);
+            cuda_interop_destroy(vk.device, interop);
+            rt_w = pending_rt_w; rt_h = pending_rt_h;
+            interop = cuda_interop_create(vk.device, vk.physicalDevice,
+                                          vk.commandPool, vk.graphicsQueue, rt_w, rt_h);
+            cudaFree(d_accum); cudaFree(d_display);
+            cudaFree(d_depth);  cudaMalloc(&d_depth,  (size_t)rt_w * rt_h * sizeof(float));
+            cudaFree(d_motion); cudaMalloc(&d_motion, (size_t)rt_w * rt_h * sizeof(float2));
+            d_accum   = pathtracer_alloc_accum(rt_w, rt_h);
+            d_display = pathtracer_alloc_accum(rt_w, rt_h);
+            has_prev_cam = false;
+            // ReSTIR reservoir buffers — reallocate on resize
+            cudaFree(mesh.d_reservoirs);  mesh.d_reservoirs  = restir_alloc_reservoirs(rt_w, rt_h);
+            cudaFree(mesh.d_reservoirs2); mesh.d_reservoirs2 = restir_alloc_reservoirs(rt_w, rt_h);
+            // Denoiser re-init for new resolution
+            denoiser_init(denoiser, rt_w, rt_h);
+            ctrl.denoise_available = denoiser.available;
+#ifdef OPTIX_ENABLED
+            if (optix_dn.available)
+                optix_denoiser_init(optix_dn, rt_w, rt_h);
+            if (optix_rt.available)
+                optix_renderer_resize(optix_rt, rt_w, rt_h);
+#endif
+            // DLSS needs reinit at new resolution
+            if (dlss_active) { dlss_free(dlss); dlss_active = false; }
+            post_process_resize(post, vk.physicalDevice,
+                vk.descriptorPool,
+                vk.commandPool, vk.graphicsQueue,
+                interop.image_view, interop.sampler,
+                rt_w, rt_h);
+            frame_count = 0;
+            pending_rt_resize = false;
+        }
+
+        // Animation tick + Hydra preview panel state
+        anim_tick(anim, frame_ms * 0.001f);
+        const std::string active_scene_path = ctrl.gltf_path;
+        const bool active_scene_is_usd = !active_scene_path.empty() && is_usd_scene_path(active_scene_path);
+        if (anim.preview_open && !active_scene_is_usd)
+            anim.preview_open = false;
+
         uint32_t img_idx = vk_begin_frame(vk);
         if (img_idx == UINT32_MAX) { vk_recreate_swapchain(vk, window); continue; }
 
@@ -981,11 +1222,191 @@ int main() {
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
         bool cam_changed = control_panel_draw(ctrl);
+
+        // USD animation: re-evaluate geometry when the time code changes.
+        // Runs whenever the timeline moves (play or scrub), even if no
+        // time samples were auto-detected (skeletal anim may not flag).
+        if (usd_anim_handle && active_scene_is_usd &&
+            anim.current_time != usd_last_frame_time)
+        {
+            usd_last_frame_time = anim.current_time;
+            if (usd_load_frame(usd_anim_handle, anim.current_time, mesh.all_prims)) {
+                rebuild_visible_bvh(mesh);
+                ++mesh.scene_version;  // trigger OptiX RT re-upload
+                cam_changed = true;    // reset accumulation
+            }
+        }
+        anim_panel_draw(anim, ctrl.gltf_path, active_scene_is_usd);
         viewport_draw(vp, (ctrl.post_enabled && post.imgui_desc) ? post.imgui_desc : interop.descriptor, ctrl);
+        if (anim.preview_open && active_scene_is_usd) {
+            if (!hydra_preview_ready) {
+                hydra_preview_ready = safe_hydra_preview_init(
+                    hp_preview,
+                    vk.device,
+                    vk.physicalDevice,
+                    vk.graphicsQueue,
+                    vk.graphicsFamily,
+                    vk.commandPool);
+                if (!hydra_preview_ready)
+                    anim.preview_open = false;
+            }
+            if (hydra_preview_ready && hydra_loaded_scene_path != active_scene_path) {
+                hydra_preview_ready = safe_hydra_preview_load(hp_preview, active_scene_path);
+                if (hydra_preview_ready) hydra_loaded_scene_path = active_scene_path;
+                else anim.preview_open = false;
+            }
+
+            ImGui::Begin("Hydra Preview");
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            // Always render at the current window size so it tracks resize.
+            int hw = std::max(1, (int)avail.x);
+            int hh = std::max(1, (int)avail.y);
+
+            // Always sync Hydra camera FROM the main viewport state.
+            // The Hydra local camera controls below may override this,
+            // and if they do they write back to ctrl.pos/orbit_pivot.
+            hp_preview.pos[0] = ctrl.pos[0];
+            hp_preview.pos[1] = ctrl.pos[1];
+            hp_preview.pos[2] = ctrl.pos[2];
+            hp_preview.pivot[0] = ctrl.orbit_pivot[0];
+            hp_preview.pivot[1] = ctrl.orbit_pivot[1];
+            hp_preview.pivot[2] = ctrl.orbit_pivot[2];
+            hp_preview.vfov = ctrl.vfov;
+
+            // Camera controls — identical to main viewport: LMB=orbit, MMB=pan, scroll=zoom.
+            // These override the synced values above and write back to ctrl.
+            ImVec2 cursor_before_cam = ImGui::GetCursorPos();
+            if (avail.x > 4.0f && avail.y > 4.0f) {
+                ImGui::InvisibleButton("##hydra_cam", avail,
+                    ImGuiButtonFlags_MouseButtonLeft |
+                    ImGuiButtonFlags_MouseButtonMiddle |
+                    ImGuiButtonFlags_MouseButtonRight);
+                bool hydra_cam_changed = false;
+                if (ImGui::IsItemActive()) {
+                    ImVec2 delta = ImGui::GetIO().MouseDelta;
+
+                    // LMB — arcball orbit (identical to main viewport)
+                    if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        float ox = hp_preview.pos[0] - hp_preview.pivot[0];
+                        float oy = hp_preview.pos[1] - hp_preview.pivot[1];
+                        float oz = hp_preview.pos[2] - hp_preview.pivot[2];
+                        float d  = sqrtf(ox*ox + oy*oy + oz*oz);
+                        if (d < 0.001f) d = 0.001f;
+                        float theta = atan2f(ox, -oz);
+                        float phi   = asinf(std::clamp(oy / d, -1.f, 1.f));
+                        theta += delta.x * ctrl.look_sens * (3.14159265f / 180.f);
+                        phi   += delta.y * ctrl.look_sens * (3.14159265f / 180.f);
+                        phi    = std::clamp(phi, -1.552f, 1.552f);
+                        hp_preview.pos[0] = hp_preview.pivot[0] + d * cosf(phi) * sinf(theta);
+                        hp_preview.pos[1] = hp_preview.pivot[1] + d * sinf(phi);
+                        hp_preview.pos[2] = hp_preview.pivot[2] - d * cosf(phi) * cosf(theta);
+                        hydra_cam_changed = true;
+
+                    // MMB — screen-space pan (identical to main viewport)
+                    } else if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
+                        float ox = hp_preview.pos[0] - hp_preview.pivot[0];
+                        float oy = hp_preview.pos[1] - hp_preview.pivot[1];
+                        float oz = hp_preview.pos[2] - hp_preview.pivot[2];
+                        float d  = sqrtf(ox*ox + oy*oy + oz*oz);
+                        if (d < 0.001f) d = 0.001f;
+                        float fx = -ox/d, fy = -oy/d, fz = -oz/d;
+                        float ux = -fz, uy = 0.f, uz = fx;
+                        float ulen = sqrtf(ux*ux + uz*uz);
+                        if (ulen > 1e-4f) { ux /= ulen; uz /= ulen; }
+                        float vx = uy*fz - uz*fy;
+                        float vy = uz*fx - ux*fz;
+                        float vz = ux*fy - uy*fx;
+                        float half_h = tanf(hp_preview.vfov * 0.5f * 3.14159265f / 180.f);
+                        float scale  = d * 2.f * half_h / hh;
+                        float pdx = (-delta.x * ux + delta.y * vx) * scale;
+                        float pdy = (-delta.x * uy + delta.y * vy) * scale;
+                        float pdz = (-delta.x * uz + delta.y * vz) * scale;
+                        hp_preview.pos[0]   += pdx; hp_preview.pivot[0] += pdx;
+                        hp_preview.pos[1]   += pdy; hp_preview.pivot[1] += pdy;
+                        hp_preview.pos[2]   += pdz; hp_preview.pivot[2] += pdz;
+                        hydra_cam_changed = true;
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    float scroll = ImGui::GetIO().MouseWheel;
+                    if (scroll != 0.0f) {
+                        float ox = hp_preview.pos[0] - hp_preview.pivot[0];
+                        float oy = hp_preview.pos[1] - hp_preview.pivot[1];
+                        float oz = hp_preview.pos[2] - hp_preview.pivot[2];
+                        float scale = 1.f - scroll * 0.1f;
+                        if (scale < 0.01f) scale = 0.01f;
+                        hp_preview.pos[0] = hp_preview.pivot[0] + ox * scale;
+                        hp_preview.pos[1] = hp_preview.pivot[1] + oy * scale;
+                        hp_preview.pos[2] = hp_preview.pivot[2] + oz * scale;
+                        hydra_cam_changed = true;
+                    }
+                }
+                if (hydra_cam_changed) {
+                    ctrl.pos[0] = hp_preview.pos[0];
+                    ctrl.pos[1] = hp_preview.pos[1];
+                    ctrl.pos[2] = hp_preview.pos[2];
+                    ctrl.orbit_pivot[0] = hp_preview.pivot[0];
+                    ctrl.orbit_pivot[1] = hp_preview.pivot[1];
+                    ctrl.orbit_pivot[2] = hp_preview.pivot[2];
+                    cam_changed = true;
+                }
+                // RMB click (no drag) → pick focus distance at that pixel.
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    ImVec2 mp = ImGui::GetMousePos();
+                    ImVec2 rm = ImGui::GetItemRectMin();
+                    hp_preview.pick_px = (int)(mp.x - rm.x);
+                    hp_preview.pick_py = (int)(mp.y - rm.y);
+                    hp_preview.pick_requested = true;
+                }
+                // Rewind cursor so Image() draws over the same region.
+                ImGui::SetCursorPos(cursor_before_cam);
+            }
+
+            if (hydra_preview_ready) {
+                hydra_preview_ready = safe_hydra_preview_tick(hp_preview, anim, hw, hh);
+                if (!hydra_preview_ready)
+                    anim.preview_open = false;
+            }
+
+            // RMB pick result: move orbit pivot to surface hit (same as viewport RMB),
+            // and update focus distance to match the hit depth.
+            if (hp_preview.pick_result_dist > 0.f) {
+                ctrl.orbit_pivot[0] = hp_preview.pick_result_hit[0];
+                ctrl.orbit_pivot[1] = hp_preview.pick_result_hit[1];
+                ctrl.orbit_pivot[2] = hp_preview.pick_result_hit[2];
+                ctrl.focus_dist     = hp_preview.pick_result_dist;
+                // Also update the Hydra camera pivot so the preview
+                // orbits around the new hit point (window is focused,
+                // so the normal sync path is skipped).
+                hp_preview.pivot[0] = hp_preview.pick_result_hit[0];
+                hp_preview.pivot[1] = hp_preview.pick_result_hit[1];
+                hp_preview.pivot[2] = hp_preview.pick_result_hit[2];
+                cam_changed = true;
+            }
+
+            VkDescriptorSet hydra_desc = hydra_preview_descriptor(hp_preview);
+            if (hydra_preview_ready && hydra_desc && avail.x > 4.0f && avail.y > 4.0f) {
+                ImGui::Image((ImTextureID)hydra_desc, avail, ImVec2(0,1), ImVec2(1,0));
+            } else if (!hydra_preview_ready) {
+                ImGui::TextDisabled("Hydra preview unavailable.");
+            }
+            ImGui::End();
+        }
         // Outliner — selection from here doesn't reset accumulation
         outliner_draw(prims_sorted, mesh.objects,
                       ctrl.selected_sphere, ctrl.selected_mesh_obj, multi_sel);
         stats_draw(hw_info, live_stats);
+
+        // GPU Architecture Viewer (toggled from Tools menu)
+        arch_state.cupti_available = cupti_profiler.is_initialized();
+        if (ctrl.show_gpu_arch) {
+            arch_state.gpu_util_pct = live_stats.gpu_util_pct;
+            arch_state.mem_util_pct = live_stats.mem_util_pct;
+            arch_state.vram_used    = live_stats.vram_used_bytes;
+            arch_state.vram_total   = hw_info.total_vram_bytes;
+            gpu_arch_window_draw(arch_state, hw_info.name, hw_info.sm_count, &ctrl.show_gpu_arch);
+        }
+
         batch_panel_draw(batch);
 
         // Material panel — edit / reassign / custom shader for selected object
@@ -1077,6 +1498,13 @@ int main() {
                 ctrl.selected_sphere = -1;
                 multi_sel.clear();
                 cam_changed = true;
+
+                // Open persistent USD stage for animation playback
+                if (usd_anim_handle) { usd_anim_close(usd_anim_handle); usd_anim_handle = nullptr; }
+                usd_last_frame_time = -1e30f;
+                if (is_usd_scene_path(ctrl.gltf_path)) {
+                    usd_anim_handle = usd_anim_open(ctrl.gltf_path, mesh.all_prims);
+                }
             }
         }
 
@@ -1143,9 +1571,9 @@ int main() {
                 header.num_channels = 3;
                 header.channels     = static_cast<EXRChannelInfo*>(
                     malloc(sizeof(EXRChannelInfo) * 3));
-                strncpy(header.channels[0].name, "B", 255);
-                strncpy(header.channels[1].name, "G", 255);
-                strncpy(header.channels[2].name, "R", 255);
+                strncpy_s(header.channels[0].name, sizeof(header.channels[0].name), "B", _TRUNCATE);
+                strncpy_s(header.channels[1].name, sizeof(header.channels[1].name), "G", _TRUNCATE);
+                strncpy_s(header.channels[2].name, sizeof(header.channels[2].name), "R", _TRUNCATE);
                 header.pixel_types           = static_cast<int*>(malloc(sizeof(int) * 3));
                 header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * 3));
                 for (int i = 0; i < 3; ++i) {
@@ -1200,6 +1628,11 @@ int main() {
                 ctrl.selected_sphere   = -1;
                 ctrl.selected_mesh_obj = -1;
                 multi_sel.clear();
+                // Open USD anim handle for batch
+                if (usd_anim_handle) { usd_anim_close(usd_anim_handle); usd_anim_handle = nullptr; }
+                usd_last_frame_time = -1e30f;
+                if (is_usd_scene_path(model_path))
+                    usd_anim_handle = usd_anim_open(model_path, mesh.all_prims);
             }
             pathtracer_reset_accum(d_accum, rt_w, rt_h);
             frame_count = 0;
@@ -1307,37 +1740,9 @@ int main() {
 
         // ── Resize ───────────────────────────────────────────────────
         if (vp.resized && (int)vp.size.x > 0 && (int)vp.size.y > 0) {
-            vkDeviceWaitIdle(vk.device);
-            cuda_interop_destroy(vk.device, interop);
-            rt_w = (int)vp.size.x; rt_h = (int)vp.size.y;
-            interop = cuda_interop_create(vk.device, vk.physicalDevice,
-                                          vk.commandPool, vk.graphicsQueue, rt_w, rt_h);
-            cudaFree(d_accum); cudaFree(d_display);
-            cudaFree(d_depth);  cudaMalloc(&d_depth,  (size_t)rt_w * rt_h * sizeof(float));
-            cudaFree(d_motion); cudaMalloc(&d_motion, (size_t)rt_w * rt_h * sizeof(float2));
-            d_accum   = pathtracer_alloc_accum(rt_w, rt_h);
-            d_display = pathtracer_alloc_accum(rt_w, rt_h);
-            has_prev_cam = false;
-            // ReSTIR reservoir buffers — reallocate on resize
-            cudaFree(mesh.d_reservoirs);  mesh.d_reservoirs  = restir_alloc_reservoirs(rt_w, rt_h);
-            cudaFree(mesh.d_reservoirs2); mesh.d_reservoirs2 = restir_alloc_reservoirs(rt_w, rt_h);
-            // Denoiser re-init for new resolution
-            denoiser_init(denoiser, rt_w, rt_h);
-            ctrl.denoise_available = denoiser.available;
-#ifdef OPTIX_ENABLED
-            if (optix_dn.available)
-                optix_denoiser_init(optix_dn, rt_w, rt_h);
-            if (optix_rt.available)
-                optix_renderer_resize(optix_rt, rt_w, rt_h);
-#endif
-            // DLSS needs reinit at new resolution
-            if (dlss_active) { dlss_free(dlss); dlss_active = false; }
-            post_process_resize(post, vk.physicalDevice,
-                vk.descriptorPool,
-                vk.commandPool, vk.graphicsQueue,
-                interop.image_view, interop.sampler,
-                rt_w, rt_h);
-            frame_count = 0;
+            pending_rt_w = (int)vp.size.x;
+            pending_rt_h = (int)vp.size.y;
+            pending_rt_resize = true;
         }
 
         // ── Look direction ────────────────────────────────────────────
@@ -1902,7 +2307,10 @@ int main() {
                 ctrl.orbit_pivot[0] = hit.x;
                 ctrl.orbit_pivot[1] = hit.y;
                 ctrl.orbit_pivot[2] = hit.z;
-                // Camera position unchanged — only the look-at point shifts
+                float dx = hit.x - cam.origin.x;
+                float dy = hit.y - cam.origin.y;
+                float dz = hit.z - cam.origin.z;
+                ctrl.focus_dist = sqrtf(dx*dx + dy*dy + dz*dz);
                 cam_changed = true;
             }
         }
@@ -1948,7 +2356,8 @@ int main() {
         pt.hdri_tex         = hdri.loaded ? hdri.tex : 0;
         pt.hdri_intensity   = ctrl.hdri_intensity;
         pt.hdri_yaw         = ctrl.hdri_yaw_deg * (3.14159265f / 180.f);
-        pt.firefly_clamp    = ctrl.firefly_clamp;
+        pt.firefly_clamp        = ctrl.firefly_clamp;
+        pt.sm_tracker_bitmask   = sm_tracker.d_bitmask;
 
         // ── DLSS / resolution scaling ─────────────────────────────────────────
         int render_w = rt_w, render_h = rt_h;
@@ -2014,8 +2423,8 @@ int main() {
         if (!ctrl.optix_rt_available && optix_rt_init_done.load(std::memory_order_seq_cst)) {
             ctrl.optix_rt_available = optix_rt.available;
             if (!optix_rt.available)
-                std::strncpy(ctrl.optix_rt_last_error, optix_rt.last_error,
-                             sizeof(ctrl.optix_rt_last_error) - 1);
+                strncpy_s(ctrl.optix_rt_last_error, sizeof(ctrl.optix_rt_last_error),
+                          optix_rt.last_error, _TRUNCATE);
         }
 
         // ── OptiX RT: upload scene when mesh changes ──────────────────
@@ -2028,12 +2437,17 @@ int main() {
         // Sync runtime status to UI every frame
         ctrl.optix_rt_scene_ready = optix_rt.scene_ready;
         if (optix_rt.last_error[0] && !ctrl.optix_rt_last_error[0])
-            std::strncpy(ctrl.optix_rt_last_error, optix_rt.last_error, sizeof(ctrl.optix_rt_last_error) - 1);
+            strncpy_s(ctrl.optix_rt_last_error, sizeof(ctrl.optix_rt_last_error),
+                      optix_rt.last_error, _TRUNCATE);
 #endif
 
         // ── Dispatch: ReSTIR, OptiX RT, or standard path tracer ──────
         bool use_restir = ctrl.restir_enabled && mesh.num_emissive > 0 && mesh.d_bvh;
         bool use_optix_rt = ctrl.optix_rt_enabled && optix_rt.available && optix_rt.scene_ready;
+
+        // CUPTI: start profiling pass when checkbox is enabled
+        if (arch_state.profiling_enabled && arch_state.cupti_available)
+            safe_cupti_begin_frame(cupti_profiler);
         if (use_restir) {
             // Lazy-alloc reservoirs if not yet done (first frame or after resize w/o viewport event)
             if (!mesh.d_reservoirs) {
@@ -2109,6 +2523,22 @@ int main() {
         if (use_optix_rt)
             pathtracer_blit_surface(d_accum, interop.surface, rt_w, rt_h);
 
+        // CUPTI: end profiling pass and update real metrics
+        if (arch_state.profiling_enabled && arch_state.cupti_available) {
+            safe_cupti_end_frame(cupti_profiler);
+            CuptiMetrics cm = cupti_profiler.get_metrics();
+            if (cm.valid) {
+                arch_state.cuda_active_pct   = cm.cuda_active_pct;
+                arch_state.tex_active_pct    = cm.tex_active_pct;
+                arch_state.ldst_active_pct   = cm.ldst_active_pct;
+                arch_state.sfu_active_pct    = cm.sfu_active_pct;
+                arch_state.tensor_active_pct = cm.tensor_active_pct;
+                arch_state.has_unit_counters = true;
+            }
+        } else {
+            arch_state.has_unit_counters = false;
+        }
+
         ++frame_count;
 
         // ── Denoiser: always reads d_accum, writes to d_display ──────────────
@@ -2120,6 +2550,18 @@ int main() {
         static bool d_display_valid = false;
         bool did_denoise = false;
         bool denoising_active = false;
+        const bool dlss_final_input = dlss_active &&
+                                      ctrl.dlss_enabled &&
+                                      ctrl.viewport_pass == (int)ViewportPassMode::Final;
+        auto present_for_viewport = [&](const float4* src) {
+            if (dlss_final_input) {
+                // For DLSS final mode, keep render-res data in the top-left region.
+                // DLSS reads this region as input and writes the full-res result later.
+                pathtracer_blit_surface(src, interop.surface, render_w, render_h);
+            } else {
+                pathtracer_sw_upscale(src, render_w, render_h, interop.surface, rt_w, rt_h);
+            }
+        };
 
         // Camera moved → invalidate stale denoised frame so the fresh pathtracer
         // output shows through. The denoiser runs immediately this same frame
@@ -2143,7 +2585,7 @@ int main() {
                 // d_accum has render_w stride — skip to avoid skewed/zoomed output.
                 if (render_w == rt_w && render_h == rt_h) {
                     optix_denoiser_run(optix_dn, d_accum, d_display);
-                    pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
+                    present_for_viewport(d_display);
                     d_display_valid = true;
                 }
                 did_denoise = true;
@@ -2163,7 +2605,7 @@ int main() {
                 // Pass render dimensions: d_accum is packed at render_w stride when
                 // DLSS scaling is active (render_w < rt_w). OIDN works with any size.
                 denoiser_run(denoiser, d_accum, d_display, render_w, render_h);
-                pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
+                present_for_viewport(d_display);
                 d_display_valid = true;
                 did_denoise = true;
             }
@@ -2172,7 +2614,7 @@ int main() {
         // On non-denoise frames: if denoising is active and we have a valid denoised
         // frame, re-blit it so the viewport always shows the denoised result.
         if (!did_denoise && denoising_active && d_display_valid)
-            pathtracer_sw_upscale(d_display, render_w, render_h, interop.surface, rt_w, rt_h);
+            present_for_viewport(d_display);
 
         // When denoising is turned off, invalidate so we don't show stale data.
         if (!denoising_active) d_display_valid = false;
@@ -2346,6 +2788,48 @@ int main() {
         vkEndCommandBuffer(cb);
 
         vk_end_frame(vk, img_idx);
+
+        // Multi-viewport: render any ImGui windows torn off to a second monitor
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
+
+        // SM tracker snapshot every 500ms
+        arch_timer_ms += frame_ms;
+        if (arch_timer_ms >= 500.f) {
+            arch_timer_ms = 0.f;
+            sm_tracker_read_reset(sm_tracker, arch_state.sm_active);
+
+            // Fallback: when OptiX RT (or other non-CUDA path) is active the
+            // pathtrace_kernel never fires, so the bitmask stays zero.
+            // Approximate SM activity from NVML GPU utilisation instead.
+            bool any_active = false;
+            for (int w = 0; w < GpuArchWindowState::MAX_SM_WORDS; w++)
+                if (arch_state.sm_active[w]) { any_active = true; break; }
+            if (!any_active && arch_state.gpu_util_pct > 0 && hw_info.sm_count > 0) {
+                int n = (hw_info.sm_count * (int)arch_state.gpu_util_pct + 99) / 100;
+                n = std::min(n, hw_info.sm_count);
+                // Spread active SMs evenly across all GPCs rather than filling
+                // linearly (linear would make all early GPCs look 100% busy while
+                // later GPCs stay dark — not representative of real scheduling).
+                for (int i = 0; i < n; i++) {
+                    int idx = (int)((int64_t)i * hw_info.sm_count / n);
+                    arch_state.sm_active[idx >> 5] |= (1u << (idx & 31));
+                }
+            }
+
+            // Workload-specific fallback activity (only when CUPTI unit counters
+            // are not available). Do not override real hardware counter samples.
+            if (!arch_state.has_unit_counters) {
+                float util = (float)arch_state.gpu_util_pct;
+                arch_state.rt_active_pct     = use_optix_rt ? util : 0.f;
+                arch_state.tensor_active_pct = dlss_active  ? util : 0.f;
+                // Texture units can be exercised by mesh textures and HDRI sampling.
+                const bool uses_textures = (mesh.num_texs > 0) || hdri.loaded;
+                arch_state.tex_active_pct = (util > 0.f && uses_textures) ? util : 0.f;
+            }
+        }
     }
 
     vkDeviceWaitIdle(vk.device);
@@ -2357,19 +2841,31 @@ int main() {
     optix_denoiser_free(optix_dn);
     optix_renderer_free(optix_rt);
     dlss_free(dlss);
+    dlss_shutdown();
+    sm_tracker_destroy(sm_tracker);
     stats_shutdown(nvml);
     post_process_destroy(post);
+    if (usd_anim_handle) { usd_anim_close(usd_anim_handle); usd_anim_handle = nullptr; }
     mesh.free_gpu();
     cudaFree(d_accum); cudaFree(d_display);
     cudaFree(d_depth); cudaFree(d_motion);
     cudaFree(d_bvh); cudaFree(d_prims);
     cuda_interop_destroy(vk.device, interop);
+    if (hydra_preview_ready)
+        safe_hydra_preview_destroy(hp_preview);
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     vk_destroy(vk);
-    save_win_state(window);   // write window.ini before destroying the window
+    save_win_state(window, ctrl.show_gpu_arch);   // write window.ini before destroying the window
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[fatal] %s\n", e.what());
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[fatal] Unknown exception\n");
+        return 1;
+    }
 }

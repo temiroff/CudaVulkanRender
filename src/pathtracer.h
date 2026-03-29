@@ -31,7 +31,7 @@ struct PathTracerParams {
     int                 spp;          // samples per pixel per frame
     int                 max_depth;    // max ray bounce depth
 
-    // Color mode: 0 = shaders, 1 = greyscale, 2 = random per object
+    // Color mode: 0 = shaders, 1 = greyscale, 2 = random per object, 3 = USD base color
     int                 color_mode;
     float3*             obj_colors;     // device array indexed by obj_id
     int                 num_obj_colors;
@@ -47,6 +47,10 @@ struct PathTracerParams {
     // If true, skip the surf2Dwrite — caller will upscale d_accum to surface separately.
     // Use when render_w < viewport_w so the partial surface write doesn't flicker.
     int                 skip_surface_write;
+
+    // SM activity tracker — device bitmask; bit i set when SM i executes this kernel.
+    // Null-safe: macro checks for null before writing.
+    uint32_t*           sm_tracker_bitmask;  // may be nullptr
 };
 
 struct DlssAuxParams {

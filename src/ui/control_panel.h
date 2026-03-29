@@ -42,7 +42,7 @@ struct ControlPanelState {
     float focus_dist   = 10.f;
     int   spp          = 1;
     int   max_depth    = 2;
-    int   color_mode   = 0;   // 0=shaders, 1=greyscale, 2=random per object
+    int   color_mode   = 0;   // 0=shaders, 1=greyscale, 2=random per object, 3=USD base color
     float firefly_clamp = 10.f; // max per-sample luminance (0 = disabled)
 
     // ?????? Stats (written each frame) ????????????????????????????????????
@@ -145,6 +145,9 @@ struct ControlPanelState {
     bool overlay_gizmo      = true;  // move gizmo arrows
     bool overlay_orbit      = true;  // orbit pivot crosshair
     bool overlay_nim        = true;  // NIM VLM recognition result card
+
+    // Tools windows
+    bool show_gpu_arch      = false; // GPU Architecture Viewer
 };
 
 bool control_panel_draw(ControlPanelState& s);

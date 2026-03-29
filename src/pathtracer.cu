@@ -1,4 +1,5 @@
 #include "pathtracer.h"
+#include "ui/gpu_arch_sm_tracker.h"
 #include <cuda_runtime.h>
 #include <cstring>
 
@@ -234,8 +235,10 @@ __device__ bool scatter_gpu_material(
     // Normal map — apply before scatter so the modified normal is used everywhere
     if (mat.normal_tex >= 0 && rec.tangent.w != 0.f) {
         float4 ns = sample_tex(textures, mat.normal_tex, make_float2(rec.u, rec.v));
-        // Decode [0,1] → [-1,1], flip Y to match OpenGL convention used by glTF
-        float3 nm = make_float3(ns.x * 2.f - 1.f, ns.y * 2.f - 1.f, ns.z * 2.f - 1.f);
+        // Decode [0,1] → [-1,1]; flip Y for DirectX-convention normal maps (USD)
+        float ny = ns.y * 2.f - 1.f;
+        if (mat.normal_y_flip) ny = -ny;
+        float3 nm = make_float3(ns.x * 2.f - 1.f, ny, ns.z * 2.f - 1.f);
         float  nm_len = sqrtf(nm.x*nm.x + nm.y*nm.y + nm.z*nm.z);
         if (nm_len > 1e-7f) { nm.x /= nm_len; nm.y /= nm_len; nm.z /= nm_len; }
         // Reconstruct TBN basis in world space
@@ -417,6 +420,20 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
                        rec.obj_id >= 0 && rec.obj_id < p.num_obj_colors) {
                 // Random per-object color
                 attenuation = p.obj_colors[rec.obj_id];
+            } else if (p.color_mode == 3) {
+                // USD base color: flat unlit — return color directly, no bouncing
+                const GpuMaterial& m = p.gpu_materials[rec.gpu_mat_idx];
+                float4 bc = m.base_color;
+                if (m.base_color_tex >= 0) {
+                    float4 tex = sample_tex(p.textures, m.base_color_tex, make_float2(rec.u, rec.v));
+                    bc = make_float4(bc.x*tex.x, bc.y*tex.y, bc.z*tex.z, bc.w*tex.w);
+                }
+                // Simple N·L shading so you can see the shape
+                float3 N = rec.normal;
+                float3 L = make_float3(0.4f, 0.7f, -0.5f); // fixed light dir
+                float nl = fabsf(N.x*L.x + N.y*L.y + N.z*L.z);
+                float shade = 0.3f + 0.7f * nl;
+                return make_float3(bc.x * shade, bc.y * shade, bc.z * shade);
             }
         } else {
             // Sphere inline material
@@ -451,6 +468,11 @@ __global__ void pathtrace_kernel(PathTracerParams p) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= p.width || y >= p.height) return;
+
+    // Record which SM this thread executes on for the architecture visualiser.
+    // Only one thread per warp needs to write — threadIdx.x == 0 avoids redundant atomics.
+    if (threadIdx.x == 0 && threadIdx.y == 0 && p.sm_tracker_bitmask)
+        SM_TRACKER_RECORD(p.sm_tracker_bitmask);
 
     int idx = y * p.width + x;
     // PCG seed: unique per pixel × frame — no global RNG state needed
@@ -859,9 +881,23 @@ __global__ void visualize_motion_kernel(const float2* motion, int src_w, int src
     int dy = blockIdx.y * blockDim.y + threadIdx.y;
     if (dx >= dst_w || dy >= dst_h) return;
 
-    int sx = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
-    int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
-    float2 mv = motion[sy * src_w + sx];
+    // Bilinear sample the motion field for smoother debug output when upscaling.
+    float sx = ((float)dx + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+    float sy = ((float)dy + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+    int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+    int x1 = x0 + 1, y1 = y0 + 1;
+    float tx = sx - (float)x0;
+    float ty = sy - (float)y0;
+    x0 = min(src_w - 1, max(0, x0)); x1 = min(src_w - 1, max(0, x1));
+    y0 = min(src_h - 1, max(0, y0)); y1 = min(src_h - 1, max(0, y1));
+
+    float2 m00 = motion[y0 * src_w + x0];
+    float2 m10 = motion[y0 * src_w + x1];
+    float2 m01 = motion[y1 * src_w + x0];
+    float2 m11 = motion[y1 * src_w + x1];
+    float2 m0  = make_float2(m00.x + (m10.x - m00.x) * tx, m00.y + (m10.y - m00.y) * tx);
+    float2 m1  = make_float2(m01.x + (m11.x - m01.x) * tx, m01.y + (m11.y - m01.y) * tx);
+    float2 mv  = make_float2(m0.x + (m1.x - m0.x) * ty,  m0.y + (m1.y - m0.y) * ty);
 
     float px_x  = mv.x;
     float px_y  = mv.y;
@@ -871,23 +907,31 @@ __global__ void visualize_motion_kernel(const float2* motion, int src_w, int src
     // Normalise against the frame's maximum magnitude so even sub-pixel motions
     // span the full brightness range (0 = no motion, 1 = fastest motion in frame).
     float r = 0.f, g = 0.f, b = 0.f;
-    if (mag_px > 0.001f) {
-        float norm = (max_mag > 0.001f) ? (mag_px / max_mag) : 1.f;
-        float mag_v = fminf(1.f, norm);                      // normalised [0..1]
-        float angle = atan2f(px_y, px_x);                    // [-pi, pi]
+    if (mag_px > 0.001f && max_mag > 0.001f) {
+        float norm = fminf(1.f, mag_px / max_mag);           // normalised [0..1]
+        const float dead_zone = 0.03f;                       // suppress tiny shimmer
+        if (norm <= dead_zone) {
+            surf2Dwrite(make_float4(0.f, 0.f, 0.f, 1.f), surf, dx * (int)sizeof(float4), dy);
+            return;
+        }
+        norm = (norm - dead_zone) / (1.f - dead_zone);
+        float mag_v = powf(norm, 0.65f);                     // perceptual boost for mid motion
+        float sat   = 0.90f;
+        float angle = atan2f(-px_y, px_x);                   // screen-space: +Y down
         float hue   = (angle + 3.14159265f) / (2.f * 3.14159265f);  // [0..1]
         float h6    = hue * 6.f;
         int   hi    = (int)h6 % 6;
         float f     = h6 - floorf(h6);
-        float q     = mag_v * (1.f - f);
-        float t     = mag_v * f;
+        float p     = mag_v * (1.f - sat);
+        float q     = mag_v * (1.f - sat * f);
+        float t     = mag_v * (1.f - sat * (1.f - f));
         switch (hi) {
-            case 0:  r = mag_v; g = t;     b = 0.f;    break;
-            case 1:  r = q;     g = mag_v; b = 0.f;    break;
-            case 2:  r = 0.f;   g = mag_v; b = t;      break;
-            case 3:  r = 0.f;   g = q;     b = mag_v;  break;
-            case 4:  r = t;     g = 0.f;   b = mag_v;  break;
-            default: r = mag_v; g = 0.f;   b = q;      break;
+            case 0:  r = mag_v; g = t;     b = p;      break;
+            case 1:  r = q;     g = mag_v; b = p;      break;
+            case 2:  r = p;     g = mag_v; b = t;      break;
+            case 3:  r = p;     g = q;     b = mag_v;  break;
+            case 4:  r = t;     g = p;     b = mag_v;  break;
+            default: r = mag_v; g = p;     b = q;      break;
         }
     }
     surf2Dwrite(make_float4(r, g, b, 1.f), surf, dx * (int)sizeof(float4), dy);

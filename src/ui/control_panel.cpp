@@ -163,6 +163,10 @@ bool control_panel_draw(ControlPanelState& s) {
             ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Tools")) {
+            ImGui::MenuItem("GPU Architecture Viewer", nullptr, &s.show_gpu_arch);
+            ImGui::EndMenu();
+        }
         ImGui::EndMenuBar();
     }
 
@@ -196,8 +200,8 @@ bool control_panel_draw(ControlPanelState& s) {
         cam_changed |= ImGui::SliderFloat("Look Sens",  &s.look_sens,  0.01f, 1.f);
         ImGui::Separator();
         cam_changed |= ImGui::SliderFloat("VFov",       &s.vfov,       5.f, 120.f);
-        cam_changed |= ImGui::SliderFloat("Aperture",   &s.aperture,   0.f,   0.5f);
-        cam_changed |= ImGui::SliderFloat("Focus Dist", &s.focus_dist, 0.5f, 50.f);
+        cam_changed |= ImGui::SliderFloat("Aperture",   &s.aperture,   0.f,   5.0f);
+        cam_changed |= ImGui::DragFloat("Focus Dist", &s.focus_dist, 0.01f, 0.001f, 100000.f, "%.3f", ImGuiSliderFlags_Logarithmic);
     }
 
     ImGui::Separator();
@@ -223,8 +227,8 @@ bool control_panel_draw(ControlPanelState& s) {
     if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
         cam_changed |= ImGui::SliderInt("SPP / frame", &s.spp,       1, 32);
         cam_changed |= ImGui::SliderInt("Max Depth",   &s.max_depth, 1, 32);
-        static const char* color_modes[] = { "Shaders", "Greyscale", "Random Colors" };
-        cam_changed |= ImGui::Combo("Color Mode", &s.color_mode, color_modes, 3);
+        static const char* color_modes[] = { "Shaders", "Greyscale", "Random Colors", "USD Colors" };
+        cam_changed |= ImGui::Combo("Color Mode", &s.color_mode, color_modes, 4);
         ImGui::Separator();
         cam_changed |= ImGui::SliderFloat("Firefly Clamp", &s.firefly_clamp, 0.f, 100.f);
         if (ImGui::IsItemHovered())
@@ -783,6 +787,10 @@ void control_panel_draw_main_menu(ControlPanelState& s) {
         ImGui::MenuItem("Move gizmo",             nullptr, &s.overlay_gizmo);
         ImGui::MenuItem("Orbit pivot",            nullptr, &s.overlay_orbit);
         ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Tools")) {
+        ImGui::MenuItem("GPU Architecture Viewer", nullptr, &s.show_gpu_arch);
         ImGui::EndMenu();
     }
 }

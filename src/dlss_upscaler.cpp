@@ -649,11 +649,14 @@ void dlss_upscale(DlssState& s, VkCommandBuffer cmd_buf,
 
     // ── Build Streamline resource descriptors ─────────────────────────────────
     // ResourceType::eTex2d is used for VkImage resources in SL v2.x
-    // Color input (render-res, in GENERAL layout after CUDA write)
+    // Color input: physical image is display_w × display_h (rt_w × rt_h).
+    // The resource dimensions must match the actual VkImage allocation so that
+    // Streamline computes correct row strides. renderExtent tells DLSS which
+    // sub-region to read (the render_w × render_h top-left that the pathtracer wrote).
     sl::Resource colorRes = make_vk_resource(
         input_image, input_memory, input_view,
         VK_IMAGE_LAYOUT_GENERAL,
-        (uint32_t)s.render_w, (uint32_t)s.render_h,
+        (uint32_t)s.display_w, (uint32_t)s.display_h,
         VK_FORMAT_R32G32B32A32_SFLOAT,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     // DLSS output (display-res)

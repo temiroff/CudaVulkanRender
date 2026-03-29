@@ -8,6 +8,28 @@ set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 = Ada Lovelace = sm_89
 find_package(Vulkan REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
+# ?????? Optional: CUPTI Profiler (real per-unit hardware counters) ???????????????????????????????????????????????????????????????????
+# Ships with CUDA Toolkit in extras/CUPTI.  Auto-detected from CUDAToolkit path.
+# Adds "Real counters" checkbox to the GPU arch visualizer.
+# Note: enabling profiling serialises GPU execution — expect ~5-15% throughput drop.
+get_filename_component(_cuda_root "${CUDAToolkit_INCLUDE_DIRS}" DIRECTORY)
+set(_cupti_root "${_cuda_root}/extras/CUPTI")
+find_path(CUPTI_INCLUDE_DIR
+    NAMES cupti_profiler_target.h
+    HINTS "${_cupti_root}/include" "${CUDAToolkit_INCLUDE_DIRS}"
+)
+find_library(CUPTI_LIBRARY    NAMES cupti    HINTS "${_cupti_root}/lib64" "${_cupti_root}/lib")
+find_library(NVPERF_HOST_LIB  NAMES nvperf_host  HINTS "${_cupti_root}/lib64" "${_cupti_root}/lib")
+find_library(NVPERF_TARGET_LIB NAMES nvperf_target HINTS "${_cupti_root}/lib64" "${_cupti_root}/lib")
+
+if(CUPTI_INCLUDE_DIR AND CUPTI_LIBRARY AND NVPERF_HOST_LIB)
+    message(STATUS "CUPTI found: ${CUPTI_LIBRARY}")
+    set(CUPTI_FOUND ON)
+else()
+    message(STATUS "CUPTI not found (GPU arch real-counters disabled)")
+    set(CUPTI_FOUND OFF)
+endif()
+
 # ?????? Optional: OptiX SDK ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 # Set OPTIX_SDK_DIR in cmake-gui or -DOPTIX_SDK_DIR=... on command line.
 # Auto-detected from standard NVIDIA install locations if left empty.
@@ -118,6 +140,10 @@ FetchContent_Populate(tinyexr)
 
 # ImGui sources (docking branch ??? required for split panels)
 set(IMGUI_DIR external/imgui)
+set(IMGUI_SOURCES_OPENGL3
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
 set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -128,9 +154,23 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
-# ?????? OpenUSD devkit (extracted from MayaUSD 2025) ???????????????????????????????????????????????????????????????????????????????????????
-set(USD_DEVKIT_DIR "${CMAKE_SOURCE_DIR}/external/usd_devkit")
-set(MAYA_USD_LIB_DIR "C:/Program Files/Autodesk/MayaUSD/Maya2025/0.29.0/mayausd/USD/lib")
+# OpenUSD runtime/development root.
+# Prefer locally built Vulkan-enabled USD when available.
+set(_USD_ROOT_DEFAULT "${CMAKE_SOURCE_DIR}/external/usd_devkit")
+if(EXISTS "${CMAKE_SOURCE_DIR}/external/usd_vulkan/include/pxr/pxr.h")
+    set(_USD_ROOT_DEFAULT "${CMAKE_SOURCE_DIR}/external/usd_vulkan")
+endif()
+set(USD_ROOT "${_USD_ROOT_DEFAULT}" CACHE PATH "Path to USD install root (contains include/pxr and lib/usd_*.lib)")
+set(USD_LIB_DIR "${USD_ROOT}/lib")
+set(USD_RUNTIME_DIR "${USD_ROOT}/bin")
+if(NOT EXISTS "${USD_RUNTIME_DIR}")
+    set(USD_RUNTIME_DIR "${USD_LIB_DIR}")
+endif()
+set(USD_PLUGIN_DIR "${USD_ROOT}/plugin/usd")
+set(USD_LIB_PLUGIN_DIR "${USD_ROOT}/lib/usd")
+
+# Keep legacy devkit around for OpenEXR headers/libs used by hdri.cpp.
+set(OPENEXR_FALLBACK_DIR "${CMAKE_SOURCE_DIR}/external/usd_devkit")
 
 # miniz.c redefines WIN32_LEAN_AND_MEAN ??? suppress C4005 for that file only
 set_source_files_properties(
@@ -141,6 +181,8 @@ set_source_files_properties(
 add_executable(pathtracer
     src/main.cpp
     src/vulkan_context.cpp
+    src/ui/gpu_arch_window.cpp
+    src/ui/gpu_arch_sm_tracker.cu
     src/cuda_interop.cu
     src/pathtracer.cu
     src/bvh.cu
@@ -161,12 +203,16 @@ add_executable(pathtracer
     src/dlss_upscaler.cpp
     src/slang_shader.cpp
     src/stb_write_impl.cpp
+    src/cupti_profiler.cpp
     src/ui/viewport.cpp
     src/ui/control_panel.cpp
     src/ui/outliner.cpp
     src/ui/stats_panel.cpp
     src/ui/material_panel.cpp
+    src/ui/anim_panel.cpp
+    src/ui/hydra_preview.cpp
     ${IMGUI_SOURCES}
+    ${IMGUI_SOURCES_OPENGL3}
 )
 
 target_include_directories(pathtracer PRIVATE
@@ -177,14 +223,16 @@ target_include_directories(pathtracer PRIVATE
     ${tinygltf_SOURCE_DIR}
     ${tinyexr_SOURCE_DIR}
     ${tinyexr_SOURCE_DIR}/deps/miniz
-    ${USD_DEVKIT_DIR}/include
-    ${USD_DEVKIT_DIR}/include/Imath         # Imath headers (ImathVec, ImathBox, half???)
-    ${USD_DEVKIT_DIR}/include/boost-1_81   # USD's bundled Boost headers
+    ${USD_ROOT}/include
+    ${OPENEXR_FALLBACK_DIR}/include
+    ${OPENEXR_FALLBACK_DIR}/include/Imath
+    ${USD_ROOT}/include/boost-1_81
     "C:/Program Files/Python311/include"   # required by Boost.Python in USD headers
 )
 
 target_link_directories(pathtracer PRIVATE
-    ${USD_DEVKIT_DIR}/lib
+    ${USD_LIB_DIR}
+    ${OPENEXR_FALLBACK_DIR}/lib
     "C:/Program Files/Python311/libs"
 )
 
@@ -198,19 +246,46 @@ target_link_libraries(pathtracer PRIVATE
     # OpenUSD ??? core libs needed for geometry + shading traversal
     usd_tf usd_arch usd_vt usd_gf usd_js usd_plug usd_trace
     usd_work usd_sdf usd_pcp usd_usd usd_ar
-    usd_usdGeom usd_usdShade usd_usdUtils
+    usd_usdGeom usd_usdShade usd_usdUtils usd_usdLux
     # OpenEXR (from USD devkit) ??? supports all EXR compression types (DWAA, PIZ, B44, etc.)
     OpenEXR-3_1 OpenEXRCore-3_1 Iex-3_1 IlmThread-3_1 Imath-3_1
     zlibstatic
+    # Hydra / HdStorm for USD animation preview window
+    usd_hd usd_hdSt usd_hdx usd_hdGp usd_hdMtlx usd_hdsi usd_hdar
+    usd_garch usd_glf usd_hgi usd_hgiGL usd_hgiVulkan usd_hgiInterop
+    usd_usdImaging usd_usdImagingGL usd_usdSkelImaging usd_usdSkel
+    opengl32
 )
 
-# Copy MayaUSD runtime DLLs next to the exe so it can find them
-add_custom_command(TARGET pathtracer POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${MAYA_USD_LIB_DIR}"
-        "$<TARGET_FILE_DIR:pathtracer>"
-    COMMENT "Copying MayaUSD runtime DLLs"
-)
+# Copy USD runtime DLLs next to the exe.
+if(EXISTS "${USD_RUNTIME_DIR}")
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${USD_RUNTIME_DIR}"
+            "$<TARGET_FILE_DIR:pathtracer>"
+        COMMENT "Copying USD runtime DLLs"
+    )
+endif()
+
+# Copy OpenUSD plugin descriptors + plugin DLLs/resources so Hydra can discover render delegates.
+if(EXISTS "${USD_PLUGIN_DIR}")
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${USD_PLUGIN_DIR}"
+            "$<TARGET_FILE_DIR:pathtracer>/usd"
+        COMMENT "Copying OpenUSD plugins (plugin/usd)"
+    )
+endif()
+
+# Some USD builds (including Vulkan-enabled source builds) place plugins under lib/usd.
+if(EXISTS "${USD_LIB_PLUGIN_DIR}")
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${USD_LIB_PLUGIN_DIR}"
+            "$<TARGET_FILE_DIR:pathtracer>/usd"
+        COMMENT "Copying OpenUSD plugins (lib/usd)"
+    )
+endif()
 
 # Copy full Blender color management folder next to the exe
 add_custom_command(TARGET pathtracer POST_BUILD
@@ -228,6 +303,8 @@ list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_INCLUDE_DIR_0)
 target_compile_definitions(pathtracer PRIVATE
     NOMINMAX          # prevent Windows min/max macros clashing with std::numeric_limits
     WIN32_LEAN_AND_MEAN
+    _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING  # USD hd/dataSource.h uses deprecated std::atomic_load<shared_ptr>
+    _CRT_SECURE_NO_WARNINGS  # sscanf etc. are safe in our usage
 )
 
 if(OPTIX_FOUND)
@@ -237,6 +314,28 @@ if(OPTIX_FOUND)
         CUDA_INCLUDE_DIR="${CUDA_INCLUDE_DIR_0}")
     target_include_directories(pathtracer PRIVATE "${OPTIX_SDK_DIR}/include")
     message(STATUS "Building with OptiX SDK support (denoiser and RT renderer integrated)")
+endif()
+
+if(CUPTI_FOUND)
+    target_compile_definitions(pathtracer PRIVATE CUPTI_ENABLED)
+    target_include_directories(pathtracer PRIVATE "${CUPTI_INCLUDE_DIR}")
+    target_link_libraries(pathtracer PRIVATE "${CUPTI_LIBRARY}" "${NVPERF_HOST_LIB}")
+    if(NVPERF_TARGET_LIB)
+        target_link_libraries(pathtracer PRIVATE "${NVPERF_TARGET_LIB}")
+    endif()
+
+    # Copy CUPTI + NvPerf runtime DLLs next to the exe.
+    # cupti64_YYYY.X.Y.dll must be in the same directory as the executable.
+    get_filename_component(_cupti_lib_dir "${CUPTI_LIBRARY}" DIRECTORY)
+    file(GLOB _CUPTI_DLLS "${_cupti_lib_dir}/*.dll")
+    if(_CUPTI_DLLS)
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_CUPTI_DLLS}
+                    "$<TARGET_FILE_DIR:pathtracer>"
+            COMMENT "Copying CUPTI runtime DLLs (cupti64, nvperf_host, nvperf_target)")
+    endif()
+
+    message(STATUS "Building with CUPTI real hardware counters")
 endif()
 
 if(OIDN_FOUND)
@@ -308,6 +407,7 @@ target_compile_options(pathtracer PRIVATE
         # Suppress noisy but harmless warnings from third-party headers (USD devkit, Imath, tinyexr)
         /wd4244   # double???float/int conversion (USD/Imath)
         /wd4267   # size_t???int (USD ndr)
+        /wd4251   # dll-interface (USD TfSingleton std::atomic)
         /wd4305   # double???float truncation (Imath half)
     >
 )
@@ -355,6 +455,43 @@ else()
     message(WARNING "slangc not found ??? post.slang won't be compiled (set SLANG_SDK_DIR)")
 endif()
 
+# ── GPU Architecture Viewer (standalone dev tool) ─────────────────────────────
+# Fast-iteration target: no Vulkan, no OptiX, no path tracer.
+# Run gpu_arch_viewer.exe to develop the arch UI independently.
+set(IMGUI_OPENGL_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
 
+add_executable(gpu_arch_viewer
+    tools/gpu_arch_main.cpp
+    src/ui/gpu_arch_window.cpp
+    ${IMGUI_OPENGL_SOURCES}
+)
 
+target_include_directories(gpu_arch_viewer PRIVATE
+    src/
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
 
+target_link_libraries(gpu_arch_viewer PRIVATE
+    glfw
+    CUDA::cudart
+    CUDA::nvml
+    opengl32
+)
+
+target_compile_definitions(gpu_arch_viewer PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
+target_compile_options(gpu_arch_viewer PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/W3 /wd4244 /wd4267>
+)
