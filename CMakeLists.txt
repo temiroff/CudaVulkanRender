@@ -194,6 +194,7 @@ add_executable(pathtracer
     src/usd_loader.cpp
     src/post_process.cpp
     src/nim_vlm.cpp
+    src/nim_cosmos.cpp
     src/batch_processor.cpp
     src/custom_shader.cpp
     src/tinyexr_impl.cpp

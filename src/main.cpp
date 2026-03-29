@@ -25,7 +25,9 @@
 #include "dlss_upscaler.h"
 #include "post_process.h"
 #include "nim_vlm.h"
+#include "nim_cosmos.h"
 #include "slang_shader.h"
+#include "stb_image_write.h"
 #include "batch_processor.h"
 #include <tinyexr.h>
 #include "ui/viewport.h"
@@ -920,28 +922,60 @@ static WinState load_win_state()
 
     // Make sure the title bar is reachable on some monitor (32px safety margin)
     POINT pt{ s.x + s.w / 2, s.y + 16 };
-    if (!MonitorFromPoint(pt, MONITOR_DEFAULTTONULL)) {
+    HMONITOR hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+    if (!hmon) {
         // Saved position is offscreen — reset to primary monitor default
         s.x = 100; s.y = 100;
+        hmon = MonitorFromPoint(POINT{s.x, s.y}, MONITOR_DEFAULTTOPRIMARY);
+    }
+
+    // Clamp to monitor work area — prevents the window from opening
+    // larger than the screen (catches stale window.ini from old bugs).
+    if (hmon) {
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoA(hmon, &mi)) {
+            int mw = mi.rcWork.right  - mi.rcWork.left;
+            int mh = mi.rcWork.bottom - mi.rcWork.top;
+            if (s.w > mw) s.w = mw;
+            if (s.h > mh) s.h = mh;
+            // Also clamp position so window stays on-screen
+            if (s.x < mi.rcWork.left)   s.x = mi.rcWork.left;
+            if (s.y < mi.rcWork.top)    s.y = mi.rcWork.top;
+            if (s.x + s.w > mi.rcWork.right)  s.x = mi.rcWork.right  - s.w;
+            if (s.y + s.h > mi.rcWork.bottom) s.y = mi.rcWork.bottom - s.h;
+        }
     }
     return s;
 }
 
 static void save_win_state(GLFWwindow* win, bool s_show_gpu_arch)
 {
-    // GetWindowPlacement returns rcNormalPosition — the restored rect —
-    // correctly even when the window is currently maximized (no async issues).
     HWND hwnd = glfwGetWin32Window(win);
+
+    // Check maximized state via Win32 (works even if GLFW already started teardown).
     WINDOWPLACEMENT wp{};
     wp.length = sizeof(wp);
-    if (!GetWindowPlacement(hwnd, &wp)) return;
+    bool is_max = GetWindowPlacement(hwnd, &wp) && (wp.showCmd == SW_SHOWMAXIMIZED);
 
     WinState s{};
-    s.maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
-    s.x = wp.rcNormalPosition.left;
-    s.y = wp.rcNormalPosition.top;
-    s.w = wp.rcNormalPosition.right  - wp.rcNormalPosition.left;
-    s.h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    s.maximized = is_max;
+
+    if (is_max) {
+        // When maximized, glfwGetWindowPos/Size return the maximized rect.
+        // Save the restored rect from GetWindowPlacement instead so we
+        // restore to the correct non-maximized size next launch.
+        s.x = wp.rcNormalPosition.left;
+        s.y = wp.rcNormalPosition.top;
+        s.w = wp.rcNormalPosition.right  - wp.rcNormalPosition.left;
+        s.h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    } else {
+        // Use GLFW getters — these return the visible window rect without
+        // the invisible DWP extended-frame borders that GetWindowPlacement
+        // includes on Windows 10/11, preventing the window from growing
+        // by ~14px on every save→load cycle.
+        glfwGetWindowPos(win, &s.x, &s.y);
+        glfwGetWindowSize(win, &s.w, &s.h);
+    }
 
     // Sanity: don't save a degenerate size
     if (s.w < 400 || s.h < 300) return;
@@ -989,7 +1023,6 @@ int main() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // allow tearing off to second monitor
     // Persist panel layout next to the exe so it survives working-dir changes
     static std::string imgui_ini_path = (exe_dir_main() / "imgui.ini").string();
     io.IniFilename = imgui_ini_path.c_str();
@@ -1122,6 +1155,8 @@ int main() {
 
     // NIM VLM recognition thread
     std::thread nim_thread;
+    // Cosmos Transfer thread
+    std::thread cosmos_thread;
 
     // Auto-ping NIM endpoint on startup (background, non-blocking)
     nim_thread = std::thread([cfg = ctrl.nim_cfg, &ctrl]() {
@@ -1219,7 +1254,8 @@ int main() {
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
+                                     ImGuiDockNodeFlags_NoUndocking);
 
         bool cam_changed = control_panel_draw(ctrl);
 
@@ -1257,6 +1293,20 @@ int main() {
             }
 
             ImGui::Begin("Hydra Preview");
+            {
+                static const char* hydra_aov_items[] = {
+                    "Color", "Depth", "Neye", "PrimId"
+                };
+                // Map combo index → aov_mode: 0=color, 1=depth, 2=Neye, 3=primId
+                static const int hydra_aov_map[] = { 0, 1, 2, 3 };
+                int combo_idx = 0;
+                for (int i = 0; i < IM_ARRAYSIZE(hydra_aov_map); ++i)
+                    if (hydra_aov_map[i] == hp_preview.aov_mode) { combo_idx = i; break; }
+                ImGui::SetNextItemWidth(90.f);
+                if (ImGui::Combo("AOV##hydra", &combo_idx,
+                                 hydra_aov_items, IM_ARRAYSIZE(hydra_aov_items)))
+                    hp_preview.aov_mode = hydra_aov_map[combo_idx];
+            }
             ImVec2 avail = ImGui::GetContentRegionAvail();
             // Always render at the current window size so it tracks resize.
             int hw = std::max(1, (int)avail.x);
@@ -2541,6 +2591,113 @@ int main() {
 
         ++frame_count;
 
+        // ── Cosmos Transfer: readback AOVs and send to Cosmos ────────
+        if (ctrl.cosmos_request && !ctrl.cosmos_busy) {
+            ctrl.cosmos_request = false;
+            ctrl.cosmos_busy    = true;
+            ctrl.cosmos_error[0] = '\0';
+            snprintf(ctrl.cosmos_cfg.status, sizeof(ctrl.cosmos_cfg.status), "Reading back AOVs...");
+
+            int cw = render_w, ch = render_h;
+
+            // Readback beauty — read d_accum at rt_w stride, apply same ACES
+            // tonemap as the viewport so the PNG matches what you see on screen.
+            std::vector<uint8_t> beauty(cw * ch * 4);
+            {
+                std::vector<float> cpu_accum((size_t)rt_w * rt_h * 4);
+                cudaMemcpy(cpu_accum.data(), d_accum,
+                           cpu_accum.size() * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                float inv = (frame_count > 0) ? 1.f / (float)frame_count : 1.f;
+                float exp_scale = exp2f(ctrl.post.exposure);
+                // ACES filmic tonemap — same curve as tonemap_for_viewport modes 2-5
+                auto aces = [](float x) -> float {
+                    x = std::max(0.f, x);
+                    return std::min(1.f, (x * (2.51f * x + 0.03f)) /
+                                         (x * (2.43f * x + 0.59f) + 0.14f));
+                };
+                // Linear → sRGB gamma
+                auto to_srgb = [](float c) -> uint8_t {
+                    c = std::max(0.f, std::min(1.f, c));
+                    // sRGB transfer function
+                    float s = (c <= 0.0031308f)
+                        ? c * 12.92f
+                        : 1.055f * powf(c, 1.f / 2.4f) - 0.055f;
+                    return (uint8_t)(s * 255.f + 0.5f);
+                };
+                for (int y = 0; y < ch; ++y) {
+                    for (int x = 0; x < cw; ++x) {
+                        int ai = y * rt_w + x;  // accum stride = rt_w
+                        int oi = y * cw + x;
+                        float r = cpu_accum[ai*4+0] * inv * exp_scale;
+                        float g = cpu_accum[ai*4+1] * inv * exp_scale;
+                        float b = cpu_accum[ai*4+2] * inv * exp_scale;
+                        beauty[oi*4+0] = to_srgb(aces(r));
+                        beauty[oi*4+1] = to_srgb(aces(g));
+                        beauty[oi*4+2] = to_srgb(aces(b));
+                        beauty[oi*4+3] = 255;
+                    }
+                }
+            }
+
+            // Readback depth
+            float dmin = 0.f, dmax = 1.f;
+            pathtracer_depth_range(d_depth, cw * ch, &dmin, &dmax);
+            std::vector<uint8_t> depth_aov(cw * ch * 4);
+            pathtracer_readback_depth(d_depth, cw, ch, dmin, dmax, depth_aov.data());
+
+            // Readback segmentation
+            std::vector<uint8_t> seg_aov(cw * ch * 4);
+            pathtracer_readback_seg(cw, ch, cam,
+                d_bvh, d_prims, (int)prims_sorted.size(),
+                mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                mesh.d_obj_colors, mesh.num_obj_colors, seg_aov.data());
+
+            cudaDeviceSynchronize();
+            snprintf(ctrl.cosmos_cfg.status, sizeof(ctrl.cosmos_cfg.status), "Sending to Cosmos...");
+
+            // Save AOVs to disk for debugging
+            std::filesystem::create_directories("debug");
+            stbi_write_png("debug/cosmos_beauty.png", cw, ch, 4, beauty.data(), cw * 4);
+            stbi_write_png("debug/cosmos_depth.png",  cw, ch, 4, depth_aov.data(), cw * 4);
+            stbi_write_png("debug/cosmos_seg.png",    cw, ch, 4, seg_aov.data(), cw * 4);
+            std::cout << "[cosmos] Saved AOV PNGs to debug/\n";
+
+            if (cosmos_thread.joinable()) cosmos_thread.join();
+            cosmos_thread = std::thread([
+                cfg = ctrl.cosmos_cfg,
+                beauty_data = std::move(beauty),
+                depth_data  = std::move(depth_aov),
+                seg_data    = std::move(seg_aov),
+                cw, ch, &ctrl]()
+            {
+                CosmosResult r = cosmos_transfer(cfg,
+                    beauty_data.data(), depth_data.data(), seg_data.data(), cw, ch);
+
+                if (r.success) {
+                    if (ctrl.cosmos_result_pixels) {
+                        delete[] ctrl.cosmos_result_pixels;
+                        ctrl.cosmos_result_pixels = nullptr;
+                    }
+                    ctrl.cosmos_result_pixels = r.pixels;
+                    ctrl.cosmos_result_w      = r.width;
+                    ctrl.cosmos_result_h      = r.height;
+                    ctrl.cosmos_has_result    = true;
+                    ctrl.cosmos_show_result   = true;
+                    ctrl.cosmos_error[0]      = '\0';
+                    stbi_write_png("debug/cosmos_result.png",
+                                   r.width, r.height, 4, r.pixels, r.width * 4);
+                    snprintf(ctrl.cosmos_cfg.status, sizeof(ctrl.cosmos_cfg.status),
+                             "Saved to debug/cosmos_result.png");
+                } else {
+                    strncpy_s(ctrl.cosmos_error, sizeof(ctrl.cosmos_error),
+                              r.error, _TRUNCATE);
+                    snprintf(ctrl.cosmos_cfg.status, sizeof(ctrl.cosmos_cfg.status), "Failed");
+                }
+                ctrl.cosmos_busy = false;
+            });
+        }
+
         // ── Denoiser: always reads d_accum, writes to d_display ──────────────
         // d_accum is NEVER modified — it stays as the raw accumulated data.
         // d_display is blitted to the surface so the viewport shows the denoised result.
@@ -2673,6 +2830,55 @@ int main() {
                 pathtracer_visualize_motion(d_motion, render_w, render_h,
                                             motion_maxmag,
                                             interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::Normal:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    0, interop.surface, rt_w, rt_h);
+                break;
+            case ViewportPassMode::Albedo:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    1, interop.surface, rt_w, rt_h);
+                break;
+            case ViewportPassMode::Metallic:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    2, interop.surface, rt_w, rt_h);
+                break;
+            case ViewportPassMode::Roughness:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    3, interop.surface, rt_w, rt_h);
+                break;
+            case ViewportPassMode::Emission:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    4, interop.surface, rt_w, rt_h);
+                break;
+            case ViewportPassMode::Segmentation:
+                pathtracer_visualize_material(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    5, interop.surface, rt_w, rt_h);
                 break;
 
             case ViewportPassMode::Final:
@@ -2832,9 +3038,14 @@ int main() {
         }
     }
 
+    // Save window position/size FIRST — before any cleanup can alter window state
+    save_win_state(window, ctrl.show_gpu_arch);
+
     vkDeviceWaitIdle(vk.device);
     batch_stop(batch);
     if (nim_thread.joinable()) nim_thread.join();
+    if (cosmos_thread.joinable()) cosmos_thread.join();
+    if (ctrl.cosmos_result_pixels) { delete[] ctrl.cosmos_result_pixels; ctrl.cosmos_result_pixels = nullptr; }
 #ifdef OPTIX_ENABLED
     if (optix_rt_thread.joinable()) optix_rt_thread.join();
 #endif
@@ -2857,7 +3068,6 @@ int main() {
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     vk_destroy(vk);
-    save_win_state(window, ctrl.show_gpu_arch);   // write window.ini before destroying the window
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;

@@ -319,7 +319,12 @@ __device__ bool scatter_gpu_material(
         float3 L = reflect(r_in.dir, H);   // reflect view around H
 
         float NdotL = dot(N, L);
-        if (NdotL <= 0.f) return false;    // below hemisphere
+        if (NdotL <= 0.f) {
+            // Below hemisphere — clamp to grazing instead of killing the ray.
+            // This prevents black pixels on smooth metallic surfaces.
+            L = normalize(N + H * 0.01f);
+            NdotL = fmaxf(dot(N, L), 0.001f);
+        }
 
         // Weight: F / F_lum (cancel the probability; F already accounts for color)
         attenuation = make_float3(F.x / fmaxf(F_lum, 1e-5f),
@@ -828,15 +833,20 @@ __global__ void visualize_depth_kernel(const float* depth, int src_w, int src_h,
     int sx = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
     int sy = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
     float d = depth[sy * src_w + sx];
-    // Auto-normalized: min_depth maps to white (close), max_depth maps to black (far).
-    // Background (d >= 1 - eps) stays black regardless.
+    // Auto-normalized depth with log-scale for better mid/far range visibility.
+    // Background (d >= 1 - eps) → transparent black.
+    bool is_bg = (d >= 1.f - 1e-4f);
     float vis = 0.f;
-    if (d < 1.f - 1e-4f) {
+    float alpha = 0.f;
+    if (!is_bg) {
         float range = fmaxf(1e-5f, max_depth - min_depth);
         float t = fminf(1.f, fmaxf(0.f, (d - min_depth) / range));
-        vis = sqrtf(1.f - t);   // close=bright, far=dark, sqrt for perceptual linearity
+        // Log-scale: spreads near/mid range, compresses far — shows dark areas
+        float log_t = log1pf(t * 99.f) / log1pf(99.f);
+        vis = 1.f - log_t;  // close=bright, far=dark
+        alpha = 1.f;
     }
-    surf2Dwrite(make_float4(vis, vis, vis, 1.f), surf, dx * (int)sizeof(float4), dy);
+    surf2Dwrite(make_float4(vis, vis, vis, alpha), surf, dx * (int)sizeof(float4), dy);
 }
 
 void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
@@ -989,4 +999,356 @@ void pathtracer_sw_upscale_tonemap(const float4* d_accum,
     dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
     sw_upscale_tonemap_kernel<<<grid, block>>>(d_accum, src_w, src_h, surface, dst_w, dst_h,
                                                exposure, tone_map_mode);
+}
+
+// ── AOV readback kernels (GPU → CPU RGBA8 for Cosmos Transfer) ──────────
+
+// Beauty: accum buffer (HDR float4 sum) → tonemapped RGBA8
+// Uses the same tonemap_for_viewport as the main display path.
+__global__ void readback_beauty_kernel(const float4* accum, int w, int h,
+                                       int frame_count, float exposure,
+                                       int tone_map_mode, uint8_t* out_rgba8)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int idx = y * w + x;
+    float4 v = accum[idx];
+    float inv = (frame_count > 0) ? 1.f / (float)frame_count : 1.f;
+    float3 hdr = make_float3(v.x * inv, v.y * inv, v.z * inv);
+    float3 ldr = tonemap_for_viewport(hdr, exposure, tone_map_mode);
+    int oi = idx * 4;
+    out_rgba8[oi + 0] = (uint8_t)fminf(255.f, ldr.x * 255.f + 0.5f);
+    out_rgba8[oi + 1] = (uint8_t)fminf(255.f, ldr.y * 255.f + 0.5f);
+    out_rgba8[oi + 2] = (uint8_t)fminf(255.f, ldr.z * 255.f + 0.5f);
+    out_rgba8[oi + 3] = 255;
+}
+
+// Depth: float [0..1] → greyscale RGBA8 (auto-normalized, log-scale)
+// Readback for Cosmos/PNG: always opaque (alpha=255), background=black.
+__global__ void readback_depth_kernel(const float* depth, int w, int h,
+                                      float min_d, float max_d, uint8_t* out_rgba8)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int idx = y * w + x;
+    float d = depth[idx];
+    uint8_t val = 0;  // background = black
+    if (d < 1.f - 1e-4f) {
+        float range = fmaxf(1e-5f, max_d - min_d);
+        float t = fminf(1.f, fmaxf(0.f, (d - min_d) / range));
+        float log_t = log1pf(t * 99.f) / log1pf(99.f);
+        val = (uint8_t)((1.f - log_t) * 255.f + 0.5f);
+    }
+    int oi = idx * 4;
+    out_rgba8[oi + 0] = val;
+    out_rgba8[oi + 1] = val;
+    out_rgba8[oi + 2] = val;
+    out_rgba8[oi + 3] = 255;  // always opaque for Cosmos
+}
+
+// Segmentation: re-shade with obj_colors palette → RGBA8
+// Uses the same primary-ray intersection as DLSS aux.
+__global__ void readback_seg_kernel(int w, int h, Camera cam,
+                                    BVHNode* bvh, Sphere* prims, int num_prims,
+                                    BVHNode* tri_bvh, Triangle* triangles, int num_triangles,
+                                    float3* obj_colors, int num_obj_colors,
+                                    uint8_t* out_rgba8)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    float u = ((float)x + 0.5f) / (float)max(1, w);
+    float v = 1.f - ((float)y + 0.5f) / (float)max(1, h);
+    Ray ray = camera_ray_center(cam, u, v);
+
+    HitRecord rec;
+    bool any_hit = (num_prims > 0) && bvh_hit(bvh, prims, ray, 1e-3f, 1e20f, rec);
+    float t_max = any_hit ? rec.t : 1e20f;
+    if (tri_bvh && num_triangles > 0) {
+        HitRecord tri_rec;
+        if (bvh_hit_triangles(tri_bvh, triangles, ray, 1e-3f, t_max, tri_rec)) {
+            rec = tri_rec;
+            any_hit = true;
+        }
+    }
+
+    int idx = y * w + x;
+    int oi = idx * 4;
+    if (any_hit && obj_colors && rec.obj_id >= 0 && rec.obj_id < num_obj_colors) {
+        float3 c = obj_colors[rec.obj_id];
+        out_rgba8[oi + 0] = (uint8_t)fminf(255.f, c.x * 255.f + 0.5f);
+        out_rgba8[oi + 1] = (uint8_t)fminf(255.f, c.y * 255.f + 0.5f);
+        out_rgba8[oi + 2] = (uint8_t)fminf(255.f, c.z * 255.f + 0.5f);
+    } else {
+        out_rgba8[oi + 0] = 0;
+        out_rgba8[oi + 1] = 0;
+        out_rgba8[oi + 2] = 0;
+    }
+    out_rgba8[oi + 3] = 255;
+}
+
+// ── Unified material AOV readback kernel ────────────────────────────────
+// mode: 0=normal, 1=albedo, 2=metallic, 3=roughness, 4=emission
+__global__ void readback_material_kernel(
+    int w, int h, Camera cam,
+    BVHNode* bvh, Sphere* prims, int num_prims,
+    BVHNode* tri_bvh, Triangle* triangles, int num_triangles,
+    GpuMaterial* materials, int num_materials,
+    cudaTextureObject_t* textures,
+    int mode, uint8_t* out_rgba8)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    float u = ((float)x + 0.5f) / (float)max(1, w);
+    float v = 1.f - ((float)y + 0.5f) / (float)max(1, h);
+    Ray ray = camera_ray_center(cam, u, v);
+
+    HitRecord rec;
+    bool any_hit = (num_prims > 0) && bvh_hit(bvh, prims, ray, 1e-3f, 1e20f, rec);
+    float t_max = any_hit ? rec.t : 1e20f;
+    if (tri_bvh && num_triangles > 0) {
+        HitRecord tri_rec;
+        if (bvh_hit_triangles(tri_bvh, triangles, ray, 1e-3f, t_max, tri_rec)) {
+            rec = tri_rec;
+            any_hit = true;
+        }
+    }
+
+    int idx = y * w + x;
+    int oi = idx * 4;
+    float3 c = make_float3(0.f, 0.f, 0.f);
+
+    if (any_hit && rec.gpu_mat_idx >= 0 && rec.gpu_mat_idx < num_materials) {
+        const GpuMaterial& m = materials[rec.gpu_mat_idx];
+        switch (mode) {
+        case 0: { // Normal — remap [-1,1] to [0,1]
+            float3 n = rec.normal;
+            c = make_float3(n.x * 0.5f + 0.5f, n.y * 0.5f + 0.5f, n.z * 0.5f + 0.5f);
+        } break;
+        case 1: { // Albedo (base_color * texture)
+            float4 bc = m.base_color;
+            if (m.base_color_tex >= 0 && textures) {
+                float4 t = tex2D<float4>(textures[m.base_color_tex],
+                                          rec.u, rec.v);
+                bc = make_float4(bc.x*t.x, bc.y*t.y, bc.z*t.z, bc.w*t.w);
+            }
+            // sRGB gamma
+            c = make_float3(powf(fmaxf(0.f,bc.x), 1.f/2.2f),
+                            powf(fmaxf(0.f,bc.y), 1.f/2.2f),
+                            powf(fmaxf(0.f,bc.z), 1.f/2.2f));
+        } break;
+        case 2: { // Metallic — greyscale
+            float met = m.metallic;
+            if (m.metallic_rough_tex >= 0 && textures) {
+                float4 mr = tex2D<float4>(textures[m.metallic_rough_tex],
+                                           rec.u, rec.v);
+                met *= mr.z; // B channel = metallic in glTF
+            }
+            c = make_float3(met, met, met);
+        } break;
+        case 3: { // Roughness — greyscale
+            float rough = m.roughness;
+            if (m.metallic_rough_tex >= 0 && textures) {
+                float4 mr = tex2D<float4>(textures[m.metallic_rough_tex],
+                                           rec.u, rec.v);
+                rough *= mr.y; // G channel = roughness in glTF
+            }
+            c = make_float3(rough, rough, rough);
+        } break;
+        case 4: { // Emission
+            float4 ef = m.emissive_factor;
+            float3 e = make_float3(ef.x, ef.y, ef.z);
+            // Reinhard to compress HDR emission into [0,1]
+            c = make_float3(e.x/(1.f+e.x), e.y/(1.f+e.y), e.z/(1.f+e.z));
+        } break;
+        }
+    } else if (any_hit && mode == 0) {
+        // Sphere normal
+        float3 n = rec.normal;
+        c = make_float3(n.x * 0.5f + 0.5f, n.y * 0.5f + 0.5f, n.z * 0.5f + 0.5f);
+    }
+
+    out_rgba8[oi + 0] = (uint8_t)fminf(255.f, c.x * 255.f + 0.5f);
+    out_rgba8[oi + 1] = (uint8_t)fminf(255.f, c.y * 255.f + 0.5f);
+    out_rgba8[oi + 2] = (uint8_t)fminf(255.f, c.z * 255.f + 0.5f);
+    out_rgba8[oi + 3] = 255;
+}
+
+// ── Material AOV → surface (for viewport display) ──────────────────────
+// Same logic as readback_material_kernel but writes to a cudaSurface.
+__global__ void visualize_material_kernel(
+    int src_w, int src_h, Camera cam,
+    BVHNode* bvh, Sphere* prims, int num_prims,
+    BVHNode* tri_bvh, Triangle* triangles, int num_triangles,
+    GpuMaterial* materials, int num_materials,
+    cudaTextureObject_t* textures,
+    float3* obj_colors, int num_obj_colors,
+    int mode, cudaSurfaceObject_t surf, int dst_w, int dst_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    // Map destination pixel to source coordinate (handles DLSS upscale)
+    int x = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
+    int y = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
+
+    float u = ((float)x + 0.5f) / (float)max(1, src_w);
+    float v = 1.f - ((float)y + 0.5f) / (float)max(1, src_h);
+    Ray ray = camera_ray_center(cam, u, v);
+
+    HitRecord rec;
+    bool any_hit = (num_prims > 0) && bvh_hit(bvh, prims, ray, 1e-3f, 1e20f, rec);
+    float t_max = any_hit ? rec.t : 1e20f;
+    if (tri_bvh && num_triangles > 0) {
+        HitRecord tri_rec;
+        if (bvh_hit_triangles(tri_bvh, triangles, ray, 1e-3f, t_max, tri_rec)) {
+            rec = tri_rec;
+            any_hit = true;
+        }
+    }
+
+    float3 c = make_float3(0.f, 0.f, 0.f);
+    if (any_hit) {
+        if (mode == 5 && obj_colors && rec.obj_id >= 0 && rec.obj_id < num_obj_colors) {
+            // Segmentation
+            c = obj_colors[rec.obj_id];
+        } else if (mode == 0) {
+            // Normal
+            float3 n = rec.normal;
+            c = make_float3(n.x*0.5f+0.5f, n.y*0.5f+0.5f, n.z*0.5f+0.5f);
+        } else if (rec.gpu_mat_idx >= 0 && rec.gpu_mat_idx < num_materials) {
+            const GpuMaterial& m = materials[rec.gpu_mat_idx];
+            switch (mode) {
+            case 1: { // Albedo
+                float4 bc = m.base_color;
+                if (m.base_color_tex >= 0 && textures) {
+                    float4 t = tex2D<float4>(textures[m.base_color_tex], rec.u, rec.v);
+                    bc = make_float4(bc.x*t.x, bc.y*t.y, bc.z*t.z, bc.w*t.w);
+                }
+                c = make_float3(powf(fmaxf(0.f,bc.x),1.f/2.2f),
+                                powf(fmaxf(0.f,bc.y),1.f/2.2f),
+                                powf(fmaxf(0.f,bc.z),1.f/2.2f));
+            } break;
+            case 2: { // Metallic
+                float met = m.metallic;
+                if (m.metallic_rough_tex >= 0 && textures) {
+                    float4 mr = tex2D<float4>(textures[m.metallic_rough_tex], rec.u, rec.v);
+                    met *= mr.z;
+                }
+                c = make_float3(met, met, met);
+            } break;
+            case 3: { // Roughness
+                float rough = m.roughness;
+                if (m.metallic_rough_tex >= 0 && textures) {
+                    float4 mr = tex2D<float4>(textures[m.metallic_rough_tex], rec.u, rec.v);
+                    rough *= mr.y;
+                }
+                c = make_float3(rough, rough, rough);
+            } break;
+            case 4: { // Emission
+                float4 ef = m.emissive_factor;
+                float3 e = make_float3(ef.x, ef.y, ef.z);
+                c = make_float3(e.x/(1.f+e.x), e.y/(1.f+e.y), e.z/(1.f+e.z));
+            } break;
+            }
+        }
+    }
+    surf2Dwrite(make_float4(c.x, c.y, c.z, 1.f), surf, dx * (int)sizeof(float4), dy);
+}
+
+// mode: 0=normal, 1=albedo, 2=metallic, 3=roughness, 4=emission, 5=segmentation
+void pathtracer_visualize_material(
+    int src_w, int src_h, Camera cam,
+    BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+    BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+    GpuMaterial* d_materials, int num_materials,
+    cudaTextureObject_t* d_textures,
+    float3* d_obj_colors, int num_obj_colors,
+    int mode, cudaSurfaceObject_t surface, int dst_w, int dst_h)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    visualize_material_kernel<<<grid, block>>>(
+        src_w, src_h, cam,
+        d_bvh, d_prims, num_prims,
+        d_tri_bvh, d_triangles, num_triangles,
+        d_materials, num_materials, d_textures,
+        d_obj_colors, num_obj_colors,
+        mode, surface, dst_w, dst_h);
+}
+
+// ── Host readback API ───────────────────────────────────────────────────
+
+void pathtracer_readback_beauty(const float4* d_accum, int w, int h,
+                                int frame_count, float exposure,
+                                int tone_map_mode, uint8_t* h_rgba8)
+{
+    uint8_t* d_out = nullptr;
+    size_t sz = (size_t)w * h * 4;
+    cudaMalloc(&d_out, sz);
+    dim3 block(16, 16);
+    dim3 grid((w + 15) / 16, (h + 15) / 16);
+    readback_beauty_kernel<<<grid, block>>>(d_accum, w, h, frame_count,
+                                            exposure, tone_map_mode, d_out);
+    cudaMemcpy(h_rgba8, d_out, sz, cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
+}
+
+void pathtracer_readback_depth(const float* d_depth, int w, int h,
+                               float min_d, float max_d, uint8_t* h_rgba8)
+{
+    uint8_t* d_out = nullptr;
+    size_t sz = (size_t)w * h * 4;
+    cudaMalloc(&d_out, sz);
+    dim3 block(16, 16);
+    dim3 grid((w + 15) / 16, (h + 15) / 16);
+    readback_depth_kernel<<<grid, block>>>(d_depth, w, h, min_d, max_d, d_out);
+    cudaMemcpy(h_rgba8, d_out, sz, cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
+}
+
+void pathtracer_readback_seg(int w, int h, Camera cam,
+                             BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+                             BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+                             float3* d_obj_colors, int num_obj_colors,
+                             uint8_t* h_rgba8)
+{
+    uint8_t* d_out = nullptr;
+    size_t sz = (size_t)w * h * 4;
+    cudaMalloc(&d_out, sz);
+    dim3 block(16, 16);
+    dim3 grid((w + 15) / 16, (h + 15) / 16);
+    readback_seg_kernel<<<grid, block>>>(w, h, cam,
+        d_bvh, d_prims, num_prims,
+        d_tri_bvh, d_triangles, num_triangles,
+        d_obj_colors, num_obj_colors, d_out);
+    cudaMemcpy(h_rgba8, d_out, sz, cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
+}
+
+void pathtracer_readback_material(int w, int h, Camera cam,
+                                  BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+                                  BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+                                  GpuMaterial* d_materials, int num_materials,
+                                  cudaTextureObject_t* d_textures,
+                                  int mode, uint8_t* h_rgba8)
+{
+    uint8_t* d_out = nullptr;
+    size_t sz = (size_t)w * h * 4;
+    cudaMalloc(&d_out, sz);
+    dim3 block(16, 16);
+    dim3 grid((w + 15) / 16, (h + 15) / 16);
+    readback_material_kernel<<<grid, block>>>(w, h, cam,
+        d_bvh, d_prims, num_prims,
+        d_tri_bvh, d_triangles, num_triangles,
+        d_materials, num_materials, d_textures,
+        mode, d_out);
+    cudaMemcpy(h_rgba8, d_out, sz, cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
 }

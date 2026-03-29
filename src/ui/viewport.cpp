@@ -18,6 +18,33 @@ void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor, ControlPanelSt
 
     if (ImGui::BeginMenuBar()) {
         control_panel_draw_main_menu(controls);
+
+        // AOV pass selector in the menu bar
+        // Maps combo index → ViewportPassMode enum value
+        static const char* vp_aov_items[] = {
+            "Beauty", "Depth", "Normal", "Albedo",
+            "Metallic", "Roughness", "Emission", "SegId"
+        };
+        static const int vp_aov_map[] = {
+            (int)ViewportPassMode::Final,
+            (int)ViewportPassMode::DlssDepth,
+            (int)ViewportPassMode::Normal,
+            (int)ViewportPassMode::Albedo,
+            (int)ViewportPassMode::Metallic,
+            (int)ViewportPassMode::Roughness,
+            (int)ViewportPassMode::Emission,
+            (int)ViewportPassMode::Segmentation,
+        };
+        // Find current combo index from enum value
+        int combo_idx = 0;
+        for (int i = 0; i < IM_ARRAYSIZE(vp_aov_map); ++i)
+            if (vp_aov_map[i] == controls.viewport_pass) { combo_idx = i; break; }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100.f);
+        if (ImGui::Combo("##vp_aov", &combo_idx,
+                         vp_aov_items, IM_ARRAYSIZE(vp_aov_items)))
+            controls.viewport_pass = vp_aov_map[combo_idx];
+
         ImGui::EndMenuBar();
     }
 

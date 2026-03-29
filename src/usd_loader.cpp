@@ -371,6 +371,14 @@ static GpuMaterial read_preview_surface(
     read_float_tex("metallic",  gm.metallic,  metallic_tex_idx);
     read_float_tex("roughness", gm.roughness, roughness_tex_idx);
 
+    // When a texture is connected, treat the scalar as a multiplier.
+    // If the scalar is still at the default 0.0 (metallic) or wasn't
+    // explicitly authored, use 1.0 so the texture value isn't zeroed out.
+    if (metallic_tex_idx >= 0 && gm.metallic == 0.f)
+        gm.metallic = 1.f;
+    if (roughness_tex_idx >= 0 && gm.roughness == 0.f)
+        gm.roughness = 1.f;
+
     // The renderer reads roughness from G and metallic from B (glTF convention).
     // USD often stores them as separate single-channel textures with data in R.
     // Pack into a single combined texture with correct channel layout.

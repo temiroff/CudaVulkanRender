@@ -116,3 +116,34 @@ void pathtracer_visualize_depth(const float* d_depth, int src_w, int src_h,
 void pathtracer_visualize_motion(const float2* d_motion, int src_w, int src_h,
                                  float max_mag,
                                  cudaSurfaceObject_t surface, int dst_w, int dst_h);
+
+// ── AOV visualization (GPU → viewport surface) ─────────────────────────
+// mode: 0=normal, 1=albedo, 2=metallic, 3=roughness, 4=emission, 5=segmentation
+void pathtracer_visualize_material(
+    int src_w, int src_h, Camera cam,
+    BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+    BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+    GpuMaterial* d_materials, int num_materials,
+    cudaTextureObject_t* d_textures,
+    float3* d_obj_colors, int num_obj_colors,
+    int mode, cudaSurfaceObject_t surface, int dst_w, int dst_h);
+
+// ── AOV readback (GPU → CPU RGBA8 for Cosmos Transfer) ─────────────────
+// All output to caller-allocated h_rgba8 buffer (w * h * 4 bytes).
+void pathtracer_readback_beauty(const float4* d_accum, int w, int h,
+                                int frame_count, float exposure,
+                                int tone_map_mode, uint8_t* h_rgba8);
+void pathtracer_readback_depth(const float* d_depth, int w, int h,
+                               float min_d, float max_d, uint8_t* h_rgba8);
+void pathtracer_readback_seg(int w, int h, Camera cam,
+                             BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+                             BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+                             float3* d_obj_colors, int num_obj_colors,
+                             uint8_t* h_rgba8);
+// Material AOV readback: mode 0=normal, 1=albedo, 2=metallic, 3=roughness, 4=emission
+void pathtracer_readback_material(int w, int h, Camera cam,
+                                  BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+                                  BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+                                  GpuMaterial* d_materials, int num_materials,
+                                  cudaTextureObject_t* d_textures,
+                                  int mode, uint8_t* h_rgba8);

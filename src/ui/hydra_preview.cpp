@@ -477,6 +477,108 @@ static bool read_color_aov_rgba8(UsdImagingGLEngine& eng, std::vector<uint8_t>& 
     return true;
 }
 
+// Read any active AOV buffer and convert to RGBA8 for display.
+// Handles float1 (depth), float3/float4 (normal/color), and int (primId).
+// out_w/out_h: set to actual render buffer dimensions (may differ from window size).
+static bool read_active_aov_rgba8(UsdImagingGLEngine& eng, TfToken aov_token,
+                                   std::vector<uint8_t>& out_rgba,
+                                   int& out_w, int& out_h)
+{
+    HdRenderBuffer* rb = eng.GetAovRenderBuffer(aov_token);
+    if (!rb) return false;
+
+    rb->Resolve();
+    void* src = rb->Map();
+    if (!src) return false;
+
+    const unsigned w = rb->GetWidth();
+    const unsigned h = rb->GetHeight();
+    out_w = (int)w;
+    out_h = (int)h;
+    const HdFormat fmt = rb->GetFormat();
+    const size_t n = (size_t)w * (size_t)h;
+    out_rgba.resize(n * 4u);
+
+    // UNorm8Vec4 (same as color — Neye on HdStorm returns this)
+    if (fmt == HdFormatUNorm8Vec4) {
+        std::memcpy(out_rgba.data(), src, n * 4u);
+        rb->Unmap();
+        return true;
+    }
+
+    // UNorm8Vec3
+    if (fmt == HdFormatUNorm8Vec3) {
+        const uint8_t* p = static_cast<const uint8_t*>(src);
+        for (size_t i = 0; i < n; ++i) {
+            out_rgba[i*4+0] = p[i*3+0];
+            out_rgba[i*4+1] = p[i*3+1];
+            out_rgba[i*4+2] = p[i*3+2];
+            out_rgba[i*4+3] = 255;
+        }
+        rb->Unmap();
+        return true;
+    }
+
+    // Float32 single-channel (depth)
+    if (fmt == HdFormatFloat32) {
+        const float* p = static_cast<const float*>(src);
+        // Auto-range: find min/max of valid (non-background) pixels
+        float mn = 1e30f, mx = -1e30f;
+        for (size_t i = 0; i < n; ++i) {
+            if (p[i] < 1e10f && p[i] > -1e10f) { mn = std::min(mn, p[i]); mx = std::max(mx, p[i]); }
+        }
+        float range = std::max(1e-5f, mx - mn);
+        for (size_t i = 0; i < n; ++i) {
+            bool is_bg = (p[i] >= 1e10f || p[i] <= -1e10f);
+            if (is_bg) {
+                out_rgba[i*4+0] = 0; out_rgba[i*4+1] = 0;
+                out_rgba[i*4+2] = 0; out_rgba[i*4+3] = 0;  // transparent bg
+            } else {
+                float t = std::max(0.f, std::min(1.f, (p[i] - mn) / range));
+                // Log-scale: spreads near/mid range, compresses far
+                float log_t = log1pf(t * 99.f) / log1pf(99.f); // steeper curve
+                uint8_t v = (uint8_t)((1.f - log_t) * 255.f + 0.5f); // close=bright
+                out_rgba[i*4+0] = v; out_rgba[i*4+1] = v;
+                out_rgba[i*4+2] = v; out_rgba[i*4+3] = 255;
+            }
+        }
+    }
+    // Float32 vec3 (normals)
+    else if (fmt == HdFormatFloat32Vec3) {
+        const float* p = static_cast<const float*>(src);
+        for (size_t i = 0; i < n; ++i) {
+            out_rgba[i*4+0] = to_u8(p[i*3+0] * 0.5f + 0.5f);
+            out_rgba[i*4+1] = to_u8(p[i*3+1] * 0.5f + 0.5f);
+            out_rgba[i*4+2] = to_u8(p[i*3+2] * 0.5f + 0.5f);
+            out_rgba[i*4+3] = 255;
+        }
+    }
+    // Int32 single-channel (primId) — hash to colors
+    else if (fmt == HdFormatInt32) {
+        const int32_t* p = static_cast<const int32_t*>(src);
+        for (size_t i = 0; i < n; ++i) {
+            if (p[i] < 0) {
+                out_rgba[i*4+0]=0; out_rgba[i*4+1]=0; out_rgba[i*4+2]=0; out_rgba[i*4+3]=255;
+            } else {
+                unsigned h = (unsigned)p[i] * 2654435761u;
+                out_rgba[i*4+0] = (uint8_t)(((h>>0)&0xFF)*0.7f+76.5f);
+                out_rgba[i*4+1] = (uint8_t)(((h>>8)&0xFF)*0.7f+76.5f);
+                out_rgba[i*4+2] = (uint8_t)(((h>>16)&0xFF)*0.7f+76.5f);
+                out_rgba[i*4+3] = 255;
+            }
+        }
+    }
+    // Unknown format — fill black
+    else {
+        std::cerr << "[hydra_aov] unhandled format " << (int)fmt << "\n";
+        std::fill(out_rgba.begin(), out_rgba.end(), (uint8_t)0);
+        for (size_t i = 0; i < n; ++i) out_rgba[i*4+3] = 255;
+    }
+
+    rb->Unmap();
+    return true;
+}
+
 static bool upload_rgba8(HydraPreviewState& hp, const uint8_t* rgba, int width, int height)
 {
     const size_t bytes = (size_t)width * (size_t)height * 4u;
@@ -688,6 +790,14 @@ static bool recreate_engine(HydraPreviewState& hp)
     TfTokenVector plugins = UsdImagingGLEngine::GetRendererPlugins();
     for (const TfToken& t : plugins) {
         if (eng.SetRendererPlugin(t)) {
+            // Log all AOVs this renderer supports
+            TfTokenVector aovs = eng.GetRendererAovs();
+            std::cerr << "[hydra_preview] Renderer '" << t << "' supports "
+                      << aovs.size() << " AOVs:";
+            for (const TfToken& a : aovs)
+                std::cerr << " " << a;
+            std::cerr << "\n";
+
             eng.SetRendererAov(HdAovTokens->color);
             return true;
         }
@@ -817,6 +927,18 @@ bool hydra_preview_tick(HydraPreviewState& hp, const AnimPanelState& anim, int w
     params.cullStyle = UsdImagingGLCullStyle::CULL_STYLE_BACK_UNLESS_DOUBLE_SIDED;
     params.clearColor = GfVec4f(0.18f, 0.18f, 0.18f, 1.f);
 
+    // Select AOV before rendering
+    // HdStorm supports: color, depth, Neye, primId
+    TfToken active_aov = HdAovTokens->color;
+    switch (hp.aov_mode) {
+        default:
+        case 0: active_aov = HdAovTokens->color;  break;
+        case 1: active_aov = HdAovTokens->depth;  break;
+        case 2: active_aov = HdAovTokens->Neye;   break;
+        case 3: active_aov = HdAovTokens->primId;  break;
+    }
+
+    eng.SetRendererAov(active_aov);
     eng.Render(stage->GetPseudoRoot(), params);
 
     // Focus pick: cast a single ray at the requested pixel via a 1×1 pick frustum.
@@ -863,10 +985,29 @@ bool hydra_preview_tick(HydraPreviewState& hp, const AnimPanelState& anim, int w
     }
 
     std::vector<uint8_t> rgba;
-    if (!read_color_aov_rgba8(eng, rgba))
-        return false;
+    int buf_w = width, buf_h = height;
+    bool aov_ok = false;
+    if (hp.aov_mode == 0) {
+        aov_ok = read_color_aov_rgba8(eng, rgba);
+    } else {
+        aov_ok = read_active_aov_rgba8(eng, active_aov, rgba, buf_w, buf_h);
+    }
+    if (!aov_ok) {
+        // AOV failed — fall back to color and reset mode
+        eng.SetRendererAov(HdAovTokens->color);
+        hp.aov_mode = 0;
+        if (!read_color_aov_rgba8(eng, rgba))
+            return false;
+        buf_w = width; buf_h = height;
+    }
 
-    if (!upload_rgba8(hp, rgba.data(), width, height))
+    // Ensure upload resources match the actual buffer size
+    if (buf_w != hp.tex_w || buf_h != hp.tex_h) {
+        if (!ensure_upload_resources(hp, buf_w, buf_h))
+            return false;
+    }
+
+    if (!upload_rgba8(hp, rgba.data(), buf_w, buf_h))
         return false;
 
     hp.vk_image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -876,4 +1017,12 @@ bool hydra_preview_tick(HydraPreviewState& hp, const AnimPanelState& anim, int w
 VkDescriptorSet hydra_preview_descriptor(const HydraPreviewState& hp)
 {
     return hp.imgui_desc;
+}
+
+std::vector<uint8_t> hydra_preview_read_color(HydraPreviewState& hp)
+{
+    std::vector<uint8_t> result;
+    if (!hp.engine_ptr) return result;
+    read_color_aov_rgba8(get_engine(hp), result);
+    return result;
 }

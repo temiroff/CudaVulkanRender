@@ -255,10 +255,13 @@ __device__ static bool tri_hit(const Triangle& tri, const Ray& r,
     rec.v  = tri.uv0.y * w + tri.uv1.y * u + tri.uv2.y * v;
     rec.gpu_mat_idx = tri.mat_idx;
     rec.obj_id      = tri.obj_id;
-    rec.set_face_normal(r, shading_n);
-    // Store face-corrected geometric normal (same front/back convention as shading normal)
-    rec.geom_normal  = (dot(r.dir, geom_n) < 0.f) ? geom_n
-                     : make_float3(-geom_n.x, -geom_n.y, -geom_n.z);
+    // Use GEOMETRIC normal for front/back face test — the shading normal
+    // can legitimately face away from the ray at silhouette edges.
+    rec.front_face = (dot(r.dir, geom_n) < 0.f) ? 1 : 0;
+    rec.normal     = rec.front_face ? shading_n
+                   : make_float3(-shading_n.x, -shading_n.y, -shading_n.z);
+    rec.geom_normal = rec.front_face ? geom_n
+                    : make_float3(-geom_n.x, -geom_n.y, -geom_n.z);
     // Interpolate tangent (xyz = direction, w = sign)
     rec.tangent = make_float4(
         tri.t0.x * w + tri.t1.x * u + tri.t2.x * v,

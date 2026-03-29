@@ -52,13 +52,19 @@ static const char* mat_names[] = { "Lambertian", "Metal", "Dielectric", "Emissiv
 static const char* viewport_pass_name(int pass)
 {
     switch ((ViewportPassMode)pass) {
-        case ViewportPassMode::Final:      return "Final";
-        case ViewportPassMode::RawRender:  return "Raw Render";
-        case ViewportPassMode::Denoised:   return "Denoised";
-        case ViewportPassMode::DlssInput:  return "DLSS Input";
-        case ViewportPassMode::DlssDepth:  return "DLSS Depth";
-        case ViewportPassMode::DlssMotion: return "DLSS Motion";
-        default:                           return "Final";
+        case ViewportPassMode::Final:        return "Final";
+        case ViewportPassMode::RawRender:    return "Raw Render";
+        case ViewportPassMode::Denoised:     return "Denoised";
+        case ViewportPassMode::DlssInput:    return "DLSS Input";
+        case ViewportPassMode::DlssDepth:    return "Depth";
+        case ViewportPassMode::DlssMotion:   return "Motion";
+        case ViewportPassMode::Normal:       return "Normal";
+        case ViewportPassMode::Albedo:       return "Albedo";
+        case ViewportPassMode::Metallic:     return "Metallic";
+        case ViewportPassMode::Roughness:    return "Roughness";
+        case ViewportPassMode::Emission:     return "Emission";
+        case ViewportPassMode::Segmentation: return "Segmentation";
+        default:                             return "Final";
     }
 }
 
@@ -523,6 +529,72 @@ bool control_panel_draw(ControlPanelState& s) {
 
     ImGui::Separator();
 
+    // ── Cosmos Transfer (AI-augmented rendering) ─────────────────────
+    if (ImGui::CollapsingHeader("Cosmos Transfer (AI Render)")) {
+
+        // Inherit API key from NIM VLM if empty
+        if (s.cosmos_cfg.api_key[0] == '\0' && s.nim_cfg.api_key[0] != '\0')
+            strncpy_s(s.cosmos_cfg.api_key, sizeof(s.cosmos_cfg.api_key),
+                      s.nim_cfg.api_key, _TRUNCATE);
+
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputText("API Key##cosmos", s.cosmos_cfg.api_key,
+                         sizeof(s.cosmos_cfg.api_key), ImGuiInputTextFlags_Password);
+
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputText("Model##cosmos", s.cosmos_cfg.model, sizeof(s.cosmos_cfg.model));
+
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputText("Endpoint##cosmos", s.cosmos_cfg.endpoint, sizeof(s.cosmos_cfg.endpoint));
+        ImGui::TextDisabled("Host: %s:%d", s.cosmos_cfg.host, s.cosmos_cfg.port);
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Prompt");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputTextMultiline("##cosmos_prompt", s.cosmos_cfg.prompt,
+                                  sizeof(s.cosmos_cfg.prompt), ImVec2(-1.f, 60.f));
+
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::SliderFloat("Depth Weight", &s.cosmos_cfg.depth_weight, 0.f, 1.f, "%.2f");
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::SliderFloat("Seg Weight", &s.cosmos_cfg.seg_weight, 0.f, 1.f, "%.2f");
+        ImGui::SetNextItemWidth(80.f);
+        ImGui::InputInt("Seed##cosmos", &s.cosmos_cfg.seed);
+
+        ImGui::Separator();
+
+        // Send button
+        if (s.cosmos_busy) {
+            static float cosmos_anim = 0.f;
+            cosmos_anim += ImGui::GetIO().DeltaTime * 2.f;
+            int dots = (int)(cosmos_anim) % 4;
+            char label[64];
+            snprintf(label, sizeof(label), "Generating%.*s", dots, "...");
+            ImGui::BeginDisabled();
+            ImGui::Button(label, ImVec2(-1.f, 0.f));
+            ImGui::EndDisabled();
+            if (s.cosmos_cfg.status[0] != '\0')
+                ImGui::TextDisabled("%s", s.cosmos_cfg.status);
+        } else {
+            if (ImGui::Button("Send AOVs to Cosmos", ImVec2(-1.f, 0.f)))
+                s.cosmos_request = true;
+        }
+
+        // Result display
+        if (s.cosmos_has_result) {
+            ImGui::TextColored(ImVec4(0.3f, 1.f, 0.4f, 1.f),
+                               "Result ready (%dx%d)", s.cosmos_result_w, s.cosmos_result_h);
+            ImGui::Checkbox("Show Result Overlay", &s.cosmos_show_result);
+        }
+        if (s.cosmos_error[0] != '\0') {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
+            ImGui::TextWrapped("Error: %s", s.cosmos_error);
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::Separator();
+
     // ?????? GPU Features ???????????????????????????????????????????????????????????????????????????
     if (ImGui::CollapsingHeader("GPU Features", ImGuiTreeNodeFlags_DefaultOpen)) {
 
@@ -690,16 +762,6 @@ if (s.dlss_enabled) {
                                  overlay_items, IM_ARRAYSIZE(overlay_items)))
                     s.dlss_overlay_pass = overlay_idx + 1;
             }
-            const char* viewport_items[] = {
-                "Final",
-                "Raw Render",
-                "Denoised",
-                "DLSS Input",
-                "DLSS Depth",
-                "DLSS Motion",
-            };
-            ImGui::Combo("Viewport pass##viewport_pass", &s.viewport_pass,
-                         viewport_items, IM_ARRAYSIZE(viewport_items));
 #ifdef DLSS_ENABLED
             if (ImGui::TreeNodeEx("DLSS Debug Panel", ImGuiTreeNodeFlags_DefaultOpen)) {
                 const float requested_pct = s.dlss_scale * 100.f;

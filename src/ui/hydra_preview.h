@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <vector>
+#include <cstdint>
 #include <vulkan/vulkan.h>
 
 struct AnimPanelState;
@@ -45,6 +47,9 @@ struct HydraPreviewState {
     int              tex_w             = 0;
     int              tex_h             = 0;
     VkDescriptorSet  imgui_desc        = VK_NULL_HANDLE;
+
+    // AOV display mode: 0=Color, 1=Depth, 2=Normal, 3=PrimId
+    int              aov_mode          = 0;
 };
 
 // Initialize Hydra engine and upload resources.
@@ -67,3 +72,7 @@ bool hydra_preview_tick(HydraPreviewState& hp, const AnimPanelState& anim, int w
 
 // Descriptor for ImGui::Image().
 VkDescriptorSet hydra_preview_descriptor(const HydraPreviewState& hp);
+
+// Read the current Hydra color AOV as RGBA8 (for Cosmos Transfer).
+// Returns empty vector if unavailable.
+std::vector<uint8_t> hydra_preview_read_color(HydraPreviewState& hp);

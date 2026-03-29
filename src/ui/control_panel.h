@@ -3,6 +3,7 @@
 #include "../scene.h"
 #include "../post_process.h"
 #include "../nim_vlm.h"
+#include "../nim_cosmos.h"
 #include "../restir.h"
 
 enum class InteractMode { Select, Move, Orbit };
@@ -13,6 +14,14 @@ enum class ViewportPassMode {
     DlssInput,
     DlssDepth,
     DlssMotion,
+    // AOV / material channels
+    Normal,
+    Albedo,
+    Metallic,
+    Roughness,
+    Emission,
+    Segmentation,
+    COUNT
 };
 
 struct ControlPanelState {
@@ -89,6 +98,17 @@ struct ControlPanelState {
     bool nim_ping_request      = false;  // request a connection test from main
     bool nim_docker_launch_req = false;  // request docker run from main
     char nim_docker_error[256] = {};     // non-empty if last docker launch failed
+
+    // ── Cosmos Transfer (AI-augmented rendering) ──────────────────────
+    CosmosConfig cosmos_cfg;
+    bool cosmos_request       = false;  // set true by UI button → handled in main.cpp
+    bool cosmos_busy          = false;  // transfer in flight
+    bool cosmos_has_result    = false;  // a result frame is ready to display
+    int  cosmos_result_w      = 0;
+    int  cosmos_result_h      = 0;
+    uint8_t* cosmos_result_pixels = nullptr;  // RGBA8, caller frees with delete[]
+    char cosmos_error[256]    = {};
+    bool cosmos_show_result   = false;  // overlay result in viewport
 
     // ?????? Save render ?????????????????????????????????????????????????????????????????????????????????
     bool save_exr_requested  = false;
