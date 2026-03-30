@@ -403,6 +403,78 @@ static std::string http_post(const char* host, int port,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  WinHTTP GET
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string http_get(const char* host, int port, const char* path,
+                             bool use_https, int timeout_ms = 300000)
+{
+    auto to_wide = [](const char* s) -> std::wstring {
+        if (!s || !*s) return {};
+        int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+        std::wstring w(n, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+        return w;
+    };
+    std::string result;
+    HINTERNET hSession = WinHttpOpen(L"Cosmos/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+    WinHttpSetTimeouts(hSession, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+    HINTERNET hConnect = WinHttpConnect(hSession, to_wide(host).c_str(), (INTERNET_PORT)port, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", to_wide(path).c_str(),
+                                         nullptr, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         use_https ? WINHTTP_FLAG_SECURE : 0);
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return ""; }
+    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+        !WinHttpReceiveResponse(hReq, nullptr)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return "";
+    }
+    DWORD avail = 0;
+    do {
+        WinHttpQueryDataAvailable(hReq, &avail);
+        if (!avail) break;
+        std::vector<char> buf(avail + 1, 0);
+        DWORD rd = 0;
+        if (WinHttpReadData(hReq, buf.data(), avail, &rd)) result.append(buf.data(), rd);
+    } while (avail > 0);
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Multipart file upload via WinHTTP
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string http_upload_file(const char* host, int port, const char* path,
+                                     const char* filename,
+                                     const uint8_t* data, size_t data_size,
+                                     bool use_https)
+{
+    auto to_wide = [](const char* s) -> std::wstring {
+        if (!s || !*s) return {};
+        int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+        std::wstring w(n, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+        return w;
+    };
+
+    std::string boundary = "----CosmosUpload9f8e7d6c";
+    std::string body;
+    body += "--" + boundary + "\r\n";
+    body += "Content-Disposition: form-data; name=\"files\"; filename=\"" + std::string(filename) + "\"\r\n";
+    body += "Content-Type: application/octet-stream\r\n\r\n";
+    body.append(reinterpret_cast<const char*>(data), data_size);
+    body += "\r\n--" + boundary + "--\r\n";
+
+    std::string ct = "multipart/form-data; boundary=" + boundary;
+    return http_post(host, port, path, body, ct.c_str(), use_https, nullptr, 60000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Simple JSON string value extractor
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -444,122 +516,199 @@ CosmosResult cosmos_transfer(
     int                 height)
 {
     CosmosResult res;
+    const char* host = cfg.host;
+    int port = cfg.port;
+    bool https = cfg.use_https;
 
-    // ── Encode each AOV as JPEG → MP4 → base64 ──────────────────────────────
-    std::cout << "[cosmos] Encoding AOV buffers (" << width << "x" << height << ")...\n";
-
-    auto encode_aov = [&](const uint8_t* rgba, const char* name) -> std::string {
-        auto jpeg = rgba8_to_jpeg(rgba, width, height, 90);
-        auto mp4  = wrap_jpeg_as_mp4(jpeg, width, height);
-        std::cout << "[cosmos] " << name << ": JPEG=" << jpeg.size()
-                  << " MP4=" << mp4.size() << " bytes\n";
-        return b64_encode(mp4.data(), mp4.size());
+    // Helper: encode RGBA8 → JPEG → MP4, save to debug/, return MP4 bytes
+    auto encode_and_save = [&](const uint8_t* rgba, const char* name) -> std::vector<uint8_t> {
+        auto j = rgba8_to_jpeg(rgba, width, height, 90);
+        auto m = wrap_jpeg_as_mp4(j, width, height);
+        // Save to debug/ for inspection and easy resend
+        std::string path = std::string("debug/cosmos_") + name + ".mp4";
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) { fwrite(m.data(), 1, m.size(), f); fclose(f); }
+        std::cout << "[cosmos] " << name << " MP4: " << m.size() << " bytes → " << path << "\n";
+        return m;
     };
 
-    std::string beauty_b64 = encode_aov(beauty_rgba8, "beauty");
-    std::string depth_b64  = depth_rgba8 ? encode_aov(depth_rgba8, "depth") : "";
-    std::string seg_b64    = seg_rgba8   ? encode_aov(seg_rgba8,   "seg")   : "";
+    // ── 1. Encode AOVs as MP4 and save to debug/ ────────────────────────────
+    std::cout << "[cosmos] Encoding AOVs (" << width << "x" << height << ")...\n";
+    auto mp4 = encode_and_save(beauty_rgba8, "beauty");
+    std::vector<uint8_t> depth_mp4, seg_mp4;
+    if (depth_rgba8) depth_mp4 = encode_and_save(depth_rgba8, "depth");
+    if (seg_rgba8)   seg_mp4   = encode_and_save(seg_rgba8,   "seg");
 
-    // ── Build JSON request ───────────────────────────────────────────────────
-    // Escape prompt for JSON
-    std::string prompt_escaped;
-    for (char c : std::string(cfg.prompt)) {
-        if (c == '"') prompt_escaped += "\\\"";
-        else if (c == '\\') prompt_escaped += "\\\\";
-        else if (c == '\n') prompt_escaped += "\\n";
-        else prompt_escaped += c;
-    }
+    // ── 2. Upload beauty MP4 to Gradio ──────────────────────────────────────
+    std::cout << "[cosmos] Uploading to " << host << ":" << port << "...\n";
+    std::string upload_resp = http_upload_file(
+        host, port, "/gradio_api/upload",
+        "beauty.mp4", mp4.data(), mp4.size(), https);
+    std::cout << "[cosmos] Upload response: " << upload_resp << "\n";
 
-    std::string json = "{\n";
-    json += "  \"model\": \"" + std::string(cfg.model) + "\",\n";
-    json += "  \"prompt\": \"" + prompt_escaped + "\",\n";
-    json += "  \"video\": \"data:video/mp4;base64," + beauty_b64 + "\",\n";
-
-    if (!depth_b64.empty()) {
-        char w[32]; snprintf(w, sizeof(w), "%.2f", cfg.depth_weight);
-        json += "  \"depth\": {\n";
-        json += "    \"control_weight\": " + std::string(w) + ",\n";
-        json += "    \"control\": \"data:video/mp4;base64," + depth_b64 + "\"\n";
-        json += "  },\n";
-    }
-
-    if (!seg_b64.empty()) {
-        char w[32]; snprintf(w, sizeof(w), "%.2f", cfg.seg_weight);
-        json += "  \"seg\": {\n";
-        json += "    \"control_weight\": " + std::string(w) + ",\n";
-        json += "    \"control\": \"data:video/mp4;base64," + seg_b64 + "\"\n";
-        json += "  },\n";
-    }
-
-    json += "  \"seed\": " + std::to_string(cfg.seed) + "\n";
-    json += "}";
-
-    std::cout << "[cosmos] Request JSON: " << json.size() << " bytes\n";
-    std::cout << "[cosmos] Sending to " << cfg.host << ":" << cfg.port << "...\n";
-
-    // ── POST to Cosmos API ───────────────────────────────────────────────────
-    std::string endpoint = cfg.endpoint;
-    if (endpoint.empty()) endpoint = "/v1/cv/nvidia/cosmos-transfer2p5-2b";
-
-    std::string response = http_post(
-        cfg.host, cfg.port, endpoint.c_str(),
-        json, "application/json",
-        cfg.use_https, cfg.api_key);
-
-    if (response.empty()) {
-        snprintf(res.error, sizeof(res.error), "Empty response from Cosmos");
+    if (upload_resp.empty() || upload_resp[0] != '[') {
+        snprintf(res.error, sizeof(res.error), "Upload failed: %.400s", upload_resp.c_str());
         return res;
     }
-
-    if (response.rfind("ERROR:", 0) == 0) {
-        snprintf(res.error, sizeof(res.error), "%s", response.c_str());
-        return res;
-    }
-
-    std::cout << "[cosmos] Response: " << response.size() << " bytes\n";
-
-    // Log first 500 chars for debugging
-    std::cout << "[cosmos] Response preview: "
-              << response.substr(0, std::min((size_t)500, response.size())) << "\n";
-
-    // ── Parse response ───────────────────────────────────────────────────────
-    // Expected: { "b64_video": "<base64>" } or similar
-    std::string video_b64 = json_string_value(response, "b64_video");
-    if (video_b64.empty())
-        video_b64 = json_string_value(response, "video");
-    if (video_b64.empty())
-        video_b64 = json_string_value(response, "output");
-
-    if (video_b64.empty()) {
-        // Check for error message
-        std::string err = json_string_value(response, "error");
-        if (err.empty()) err = json_string_value(response, "message");
-        if (err.empty()) err = json_string_value(response, "detail");
-        snprintf(res.error, sizeof(res.error), "No output in response: %.400s",
-                 err.empty() ? response.c_str() : err.c_str());
-        return res;
-    }
-
-    // Strip data URI prefix if present
+    // Parse server path from ["<path>"]
+    std::string beauty_path;
     {
-        size_t comma = video_b64.find(',');
-        if (comma != std::string::npos && comma < 100)
-            video_b64 = video_b64.substr(comma + 1);
+        size_t q1 = upload_resp.find('"');
+        size_t q2 = upload_resp.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+            beauty_path = upload_resp.substr(q1 + 1, q2 - q1 - 1);
+    }
+    if (beauty_path.empty()) {
+        snprintf(res.error, sizeof(res.error), "Failed to parse upload path");
+        return res;
+    }
+    std::cout << "[cosmos] Uploaded to: " << beauty_path << "\n";
+
+    // ── 3. Upload depth + seg control videos if provided ────────────────────
+    std::string depth_path, seg_path;
+    if (!depth_mp4.empty()) {
+        std::string dr = http_upload_file(host, port, "/gradio_api/upload",
+                                           "depth.mp4", depth_mp4.data(), depth_mp4.size(), https);
+        size_t q1 = dr.find('"'), q2 = dr.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+            depth_path = dr.substr(q1 + 1, q2 - q1 - 1);
+        std::cout << "[cosmos] Depth uploaded: " << depth_path << "\n";
+    }
+    if (!seg_mp4.empty()) {
+        std::string sr = http_upload_file(host, port, "/gradio_api/upload",
+                                           "seg.mp4", seg_mp4.data(), seg_mp4.size(), https);
+        size_t q1 = sr.find('"'), q2 = sr.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+            seg_path = sr.substr(q1 + 1, q2 - q1 - 1);
+        std::cout << "[cosmos] Seg uploaded: " << seg_path << "\n";
     }
 
-    // ── Decode the response video/image ──────────────────────────────────────
-    std::vector<uint8_t> decoded = b64_decode(video_b64);
-    std::cout << "[cosmos] Decoded output: " << decoded.size() << " bytes\n";
+    // ── 4. Build generate_video request ─────────────────────────────────────
+    // Escape prompt
+    std::string prompt_esc;
+    for (char c : std::string(cfg.prompt)) {
+        if (c == '"') prompt_esc += "\\\"";
+        else if (c == '\\') prompt_esc += "\\\\";
+        else if (c == '\n') prompt_esc += "\\n";
+        else prompt_esc += c;
+    }
 
-    if (decoded.empty()) {
-        snprintf(res.error, sizeof(res.error), "Failed to decode base64 output");
+    // Inner JSON (the request passed as a string to generate_video)
+    std::string inner = "{";
+    inner += "\"name\":\"cosmos_render\",";
+    inner += "\"prompt\":\"" + prompt_esc + "\",";
+    inner += "\"video_path\":\"" + beauty_path + "\",";
+    inner += "\"resolution\":\"480\",";
+    inner += "\"num_steps\":20,";
+    inner += "\"seed\":" + std::to_string(cfg.seed);
+    if (!depth_path.empty()) {
+        char w[32]; snprintf(w, sizeof(w), "%.2f", cfg.depth_weight);
+        inner += ",\"depth\":{\"control_path\":\"" + depth_path + "\",\"control_weight\":" + w + "}";
+    }
+    if (!seg_path.empty()) {
+        char w[32]; snprintf(w, sizeof(w), "%.2f", cfg.seg_weight);
+        inner += ",\"seg\":{\"control_path\":\"" + seg_path + "\",\"control_weight\":" + w + "}";
+    }
+    inner += "}";
+
+    // Outer JSON wrapping for Gradio API: {"data":["<inner_json_string>"]}
+    // The inner JSON must be escaped as a string inside the outer JSON
+    std::string inner_escaped;
+    for (char c : inner) {
+        if (c == '"') inner_escaped += "\\\"";
+        else if (c == '\\') inner_escaped += "\\\\";
+        else inner_escaped += c;
+    }
+    std::string outer = "{\"data\":[\"" + inner_escaped + "\"]}";
+
+    std::cout << "[cosmos] Calling generate_video (" << outer.size() << " bytes)...\n";
+
+    // ── 5. POST to /gradio_api/call/generate_video ──────────────────────────
+    std::string call_resp = http_post(host, port,
+        "/gradio_api/call/generate_video",
+        outer, "application/json", https, nullptr, 10000);
+    std::cout << "[cosmos] Call response: " << call_resp << "\n";
+
+    // Parse event_id from {"event_id":"<id>"}
+    std::string event_id = json_string_value(call_resp, "event_id");
+    if (event_id.empty()) {
+        snprintf(res.error, sizeof(res.error), "No event_id: %.400s", call_resp.c_str());
         return res;
     }
 
-    // Try to decode as image directly (JPEG/PNG)
+    // ── 6. Poll for result via SSE GET ──────────────────────────────────────
+    std::string poll_path = "/gradio_api/call/generate_video/" + event_id;
+    std::cout << "[cosmos] Polling " << poll_path << "...\n";
+
+    // Gradio returns SSE: "event: complete\ndata: [...]"
+    // The GET blocks until complete (up to timeout)
+    std::string sse = http_get(host, port, poll_path.c_str(), https, 600000); // 10min timeout
+    std::cout << "[cosmos] SSE response: " << sse.size() << " bytes\n";
+    std::cout << "[cosmos] SSE preview: "
+              << sse.substr(0, std::min((size_t)500, sse.size())) << "\n";
+
+    if (sse.empty()) {
+        snprintf(res.error, sizeof(res.error), "Empty SSE response (timeout?)");
+        return res;
+    }
+
+    // Parse the "data:" line — contains JSON array
+    // Look for video file path in the response
+    // Format: event: complete\ndata: [{"video":{"path":"/tmp/...mp4",...}}, "result_json"]
+    std::string video_url;
+    {
+        // Find "path" in the response
+        size_t pos = sse.find("\"path\"");
+        if (pos != std::string::npos) {
+            pos = sse.find('"', pos + 6);  // skip "path"
+            if (pos != std::string::npos) {
+                pos = sse.find('"', pos + 1); // skip :
+                // skip any whitespace/colon
+                while (pos < sse.size() && (sse[pos] == ':' || sse[pos] == ' ' || sse[pos] == '"')) pos++;
+                if (pos > 0) pos--; // back to opening quote
+                size_t q1 = sse.find('"', pos);
+                size_t q2 = sse.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos)
+                    video_url = sse.substr(q1 + 1, q2 - q1 - 1);
+            }
+        }
+    }
+
+    // Check for error in response
+    if (video_url.empty()) {
+        std::string status = json_string_value(sse, "status");
+        if (!status.empty()) {
+            snprintf(res.error, sizeof(res.error), "Cosmos error: %.400s", status.c_str());
+        } else {
+            snprintf(res.error, sizeof(res.error), "No video path in response: %.400s", sse.c_str());
+        }
+        return res;
+    }
+
+    std::cout << "[cosmos] Result video: " << video_url << "\n";
+
+    // ── 7. Download result video ────────────────────────────────────────────
+    // The path may be a Gradio file URL like /gradio_api/file=<path>
+    std::string dl_path = "/gradio_api/file=" + video_url;
+    std::string video_data = http_get(host, port, dl_path.c_str(), https, 60000);
+    if (video_data.empty()) {
+        // Try direct path
+        video_data = http_get(host, port, video_url.c_str(), https, 60000);
+    }
+
+    std::cout << "[cosmos] Downloaded: " << video_data.size() << " bytes\n";
+
+    if (video_data.empty()) {
+        snprintf(res.error, sizeof(res.error), "Failed to download result video");
+        return res;
+    }
+
+    // ── 8. Extract first frame from result video ────────────────────────────
+    // Try as image first
     int img_w = 0, img_h = 0, img_ch = 0;
-    uint8_t* img = stbi_load_from_memory(decoded.data(), (int)decoded.size(),
-                                          &img_w, &img_h, &img_ch, 4);
+    uint8_t* img = stbi_load_from_memory(
+        reinterpret_cast<const uint8_t*>(video_data.data()),
+        (int)video_data.size(), &img_w, &img_h, &img_ch, 4);
     if (img) {
         res.success = true;
         res.pixels  = new uint8_t[img_w * img_h * 4];
@@ -567,17 +716,15 @@ CosmosResult cosmos_transfer(
         res.width   = img_w;
         res.height  = img_h;
         stbi_image_free(img);
-        std::cout << "[cosmos] Decoded image: " << img_w << "x" << img_h << "\n";
+        std::cout << "[cosmos] Result image: " << img_w << "x" << img_h << "\n";
         return res;
     }
 
-    // If it's an MP4, try to find the JPEG frame inside the mdat atom
-    for (size_t i = 0; i + 4 < decoded.size(); ++i) {
-        if (decoded[i] == 0xFF && decoded[i+1] == 0xD8 &&
-            decoded[i+2] == 0xFF) {
-            // Found JPEG SOI marker
-            img = stbi_load_from_memory(decoded.data() + i,
-                                         (int)(decoded.size() - i),
+    // Try to find JPEG frame inside MP4 mdat
+    const uint8_t* vd = reinterpret_cast<const uint8_t*>(video_data.data());
+    for (size_t i = 0; i + 4 < video_data.size(); ++i) {
+        if (vd[i] == 0xFF && vd[i+1] == 0xD8 && vd[i+2] == 0xFF) {
+            img = stbi_load_from_memory(vd + i, (int)(video_data.size() - i),
                                          &img_w, &img_h, &img_ch, 4);
             if (img) {
                 res.success = true;
@@ -586,14 +733,13 @@ CosmosResult cosmos_transfer(
                 res.width   = img_w;
                 res.height  = img_h;
                 stbi_image_free(img);
-                std::cout << "[cosmos] Extracted JPEG from MP4: "
-                          << img_w << "x" << img_h << "\n";
+                std::cout << "[cosmos] Extracted frame: " << img_w << "x" << img_h << "\n";
                 return res;
             }
         }
     }
 
     snprintf(res.error, sizeof(res.error),
-             "Could not decode output frame (%zu bytes)", decoded.size());
+             "Could not decode result video (%zu bytes)", video_data.size());
     return res;
 }

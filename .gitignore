@@ -13,3 +13,17 @@ hdri/
 external/streamline/
 external/streamline-sdk.zip
 external/usd_devkit/
+external/openusd_src/
+external/usd_downloads/
+external/usd_vulkan/
+
+# Build/debug artifacts
+debug/
+profile_output.ncu-rep
+*.ncu-rep
+
+# Claude Code
+.claude/
+
+# Docs (generated separately)
+CudaVulkan_Pipeline.docx

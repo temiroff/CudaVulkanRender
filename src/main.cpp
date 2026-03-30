@@ -2552,61 +2552,76 @@ int main() {
 
         ++frame_count;
 
-        // ── Save Render (EXR / tonemapped PNG) ──────────────────────
+        // ── Save Render (EXR — with or without tonemapping) ─────────
         if (ctrl.save_exr_requested) {
             ctrl.save_exr_requested = false;
             if (ctrl.save_exr_path[0] != '\0' && frame_count > 0) {
-                if (ctrl.save_exr_tonemapped) {
-                    // Save tonemapped PNG — read from surface (what you see)
-                    std::vector<uint8_t> png_buf(rt_w * rt_h * 4);
-                    pathtracer_readback_surface(interop.surface, rt_w, rt_h, png_buf.data());
-                    // Change extension to .png
-                    std::string png_path = ctrl.save_exr_path;
-                    auto dot = png_path.rfind('.');
-                    if (dot != std::string::npos) png_path = png_path.substr(0, dot);
-                    png_path += ".png";
-                    stbi_write_png(png_path.c_str(), rt_w, rt_h, 4, png_buf.data(), rt_w * 4);
-                    std::cout << "[save] Wrote tonemapped PNG: " << png_path << "\n";
+                int sw = rt_w, sh = rt_h;
+                std::vector<float> r(sw * sh), g(sw * sh), b(sw * sh);
+
+                if (ctrl.save_exr_tonemapped && ctrl.post_enabled && post.pipeline) {
+                    // Read the post-processed image — exact viewport content
+                    // (AgX/ACES tonemap, bloom, exposure, all baked in)
+                    auto h2f = [](uint16_t h) -> float {
+                        uint32_t sign = (h & 0x8000u) << 16;
+                        uint32_t exp = (h >> 10) & 0x1Fu;
+                        uint32_t mant = h & 0x3FFu;
+                        if (exp == 0) { if (mant == 0) { float f; uint32_t u = sign; memcpy(&f,&u,4); return f; }
+                            exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF;
+                            uint32_t u = sign | ((exp + 112) << 23) | (mant << 13); float f; memcpy(&f,&u,4); return f;
+                        } else if (exp == 31) { uint32_t u = sign | 0x7F800000u | (mant << 13); float f; memcpy(&f,&u,4); return f; }
+                        uint32_t u = sign | ((exp + 112) << 23) | (mant << 13); float f; memcpy(&f,&u,4); return f;
+                    };
+                    std::vector<uint16_t> hf = post_process_readback(
+                        post, vk.physicalDevice, vk.commandPool, vk.graphicsQueue);
+                    sw = post.width; sh = post.height;
+                    r.resize(sw * sh); g.resize(sw * sh); b.resize(sw * sh);
+                    for (int i = 0; i < sw * sh; ++i) {
+                        r[i] = h2f(hf[i * 4 + 0]);
+                        g[i] = h2f(hf[i * 4 + 1]);
+                        b[i] = h2f(hf[i * 4 + 2]);
+                    }
+                    std::cout << "[save] Saving tonemapped EXR from post-process ("
+                              << sw << "x" << sh << ")\n";
                 } else {
-                    // Save HDR EXR — read d_accum with rt_w stride
+                    // Raw linear HDR from accum buffer (already a running average)
                     std::vector<float> px((size_t)rt_w * rt_h * 4);
                     cudaMemcpy(px.data(), d_accum, px.size() * sizeof(float),
                                cudaMemcpyDeviceToHost);
-                    float inv = 1.f / (float)frame_count;
-                    std::vector<float> r(rt_w * rt_h), g(rt_w * rt_h), b(rt_w * rt_h);
-                    for (int i = 0; i < rt_w * rt_h; ++i) {
-                        r[i] = px[i * 4 + 0] * inv;
-                        g[i] = px[i * 4 + 1] * inv;
-                        b[i] = px[i * 4 + 2] * inv;
+                    for (int i = 0; i < sw * sh; ++i) {
+                        r[i] = px[i * 4 + 0];
+                        g[i] = px[i * 4 + 1];
+                        b[i] = px[i * 4 + 2];
                     }
-                    EXRHeader header; InitEXRHeader(&header);
-                    EXRImage  image;  InitEXRImage(&image);
-                    image.num_channels = 3;
-                    float* channels[3] = { b.data(), g.data(), r.data() };
-                    image.images = reinterpret_cast<unsigned char**>(channels);
-                    image.width  = rt_w;
-                    image.height = rt_h;
-                    header.num_channels = 3;
-                    header.channels = static_cast<EXRChannelInfo*>(malloc(sizeof(EXRChannelInfo)*3));
-                    strncpy_s(header.channels[0].name, sizeof(header.channels[0].name), "B", _TRUNCATE);
-                    strncpy_s(header.channels[1].name, sizeof(header.channels[1].name), "G", _TRUNCATE);
-                    strncpy_s(header.channels[2].name, sizeof(header.channels[2].name), "R", _TRUNCATE);
-                    header.pixel_types           = static_cast<int*>(malloc(sizeof(int)*3));
-                    header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int)*3));
-                    int exr_type = ctrl.save_exr_half ? TINYEXR_PIXELTYPE_HALF : TINYEXR_PIXELTYPE_FLOAT;
-                    for (int i = 0; i < 3; ++i) {
-                        header.pixel_types[i]           = TINYEXR_PIXELTYPE_FLOAT;
-                        header.requested_pixel_types[i] = exr_type;
-                    }
-                    const char* err = nullptr;
-                    int ret = SaveEXRImageToFile(&image, &header, ctrl.save_exr_path, &err);
-                    if (ret == TINYEXR_SUCCESS)
-                        std::cout << "[save] Wrote EXR: " << ctrl.save_exr_path << "\n";
-                    else if (err) { std::cerr << "[save] EXR error: " << err << "\n"; FreeEXRErrorMessage(err); }
-                    free(header.channels);
-                    free(header.pixel_types);
-                    free(header.requested_pixel_types);
                 }
+
+                EXRHeader header; InitEXRHeader(&header);
+                EXRImage  image;  InitEXRImage(&image);
+                image.num_channels = 3;
+                float* channels[3] = { b.data(), g.data(), r.data() };
+                image.images = reinterpret_cast<unsigned char**>(channels);
+                image.width  = sw;
+                image.height = sh;
+                header.num_channels = 3;
+                header.channels = static_cast<EXRChannelInfo*>(malloc(sizeof(EXRChannelInfo)*3));
+                strncpy_s(header.channels[0].name, sizeof(header.channels[0].name), "B", _TRUNCATE);
+                strncpy_s(header.channels[1].name, sizeof(header.channels[1].name), "G", _TRUNCATE);
+                strncpy_s(header.channels[2].name, sizeof(header.channels[2].name), "R", _TRUNCATE);
+                header.pixel_types           = static_cast<int*>(malloc(sizeof(int)*3));
+                header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int)*3));
+                int exr_type = ctrl.save_exr_half ? TINYEXR_PIXELTYPE_HALF : TINYEXR_PIXELTYPE_FLOAT;
+                for (int i = 0; i < 3; ++i) {
+                    header.pixel_types[i]           = TINYEXR_PIXELTYPE_FLOAT;
+                    header.requested_pixel_types[i] = exr_type;
+                }
+                const char* err = nullptr;
+                int ret = SaveEXRImageToFile(&image, &header, ctrl.save_exr_path, &err);
+                if (ret == TINYEXR_SUCCESS)
+                    std::cout << "[save] Wrote EXR: " << ctrl.save_exr_path << "\n";
+                else if (err) { std::cerr << "[save] EXR error: " << err << "\n"; FreeEXRErrorMessage(err); }
+                free(header.channels);
+                free(header.pixel_types);
+                free(header.requested_pixel_types);
             }
         }
 

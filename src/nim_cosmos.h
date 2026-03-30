@@ -9,11 +9,11 @@
 
 struct CosmosConfig {
     // ── Endpoint ─────────────────────────────────────────────────────────────
-    char  host[256]    = "integrate.api.nvidia.com";
-    int   port         = 443;
-    bool  use_https    = true;
-    char  api_key[512] = "";   // NGC API key — copied from NimVlmConfig at init
-    char  endpoint[256] = "/v1/infer";  // /v1/infer for both cloud and local NIM
+    char  host[256]    = "localhost";
+    int   port         = 8080;
+    bool  use_https    = false;
+    char  api_key[512] = "";   // NGC API key (not needed for local NIM)
+    char  endpoint[256] = "/v1/infer";
 
     // ── Model ────────────────────────────────────────────────────────────────
     char  model[256]   = "nvidia/cosmos-transfer2p5-2b";
