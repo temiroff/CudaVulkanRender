@@ -101,6 +101,7 @@ struct ControlPanelState {
 
     // ── Cosmos Transfer (AI-augmented rendering) ──────────────────────
     CosmosConfig cosmos_cfg;
+    int  cosmos_source        = 0;      // 0=Path Tracer, 1=Hydra Preview
     bool cosmos_request       = false;  // set true by UI button → handled in main.cpp
     bool cosmos_busy          = false;  // transfer in flight
     bool cosmos_has_result    = false;  // a result frame is ready to display

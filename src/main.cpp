@@ -1598,46 +1598,7 @@ int main() {
         }
 
         // ── Save Render as EXR ───────────────────────────────────────
-        if (ctrl.save_exr_requested) {
-            ctrl.save_exr_requested = false;
-            if (ctrl.save_exr_path[0] != '\0' && frame_count > 0) {
-                std::vector<float> px((size_t)rt_w * rt_h * 4);
-                cudaMemcpy(px.data(), d_accum, px.size() * sizeof(float), cudaMemcpyDeviceToHost);
-                // Divide accumulated sum by frame count to get average HDR values
-                float inv = 1.f / (float)frame_count;
-                std::vector<float> r(rt_w * rt_h), g(rt_w * rt_h), b(rt_w * rt_h);
-                for (int i = 0; i < rt_w * rt_h; ++i) {
-                    r[i] = px[i * 4 + 0] * inv;
-                    g[i] = px[i * 4 + 1] * inv;
-                    b[i] = px[i * 4 + 2] * inv;
-                }
-                EXRHeader header; InitEXRHeader(&header);
-                EXRImage  image;  InitEXRImage(&image);
-                image.num_channels = 3;
-                float* channels[3] = { b.data(), g.data(), r.data() }; // EXR: BGR order
-                image.images = reinterpret_cast<unsigned char**>(channels);
-                image.width  = rt_w;
-                image.height = rt_h;
-                header.num_channels = 3;
-                header.channels     = static_cast<EXRChannelInfo*>(
-                    malloc(sizeof(EXRChannelInfo) * 3));
-                strncpy_s(header.channels[0].name, sizeof(header.channels[0].name), "B", _TRUNCATE);
-                strncpy_s(header.channels[1].name, sizeof(header.channels[1].name), "G", _TRUNCATE);
-                strncpy_s(header.channels[2].name, sizeof(header.channels[2].name), "R", _TRUNCATE);
-                header.pixel_types           = static_cast<int*>(malloc(sizeof(int) * 3));
-                header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * 3));
-                for (int i = 0; i < 3; ++i) {
-                    header.pixel_types[i]           = TINYEXR_PIXELTYPE_FLOAT;
-                    header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
-                }
-                const char* err = nullptr;
-                int ret = SaveEXRImageToFile(&image, &header, ctrl.save_exr_path, &err);
-                if (ret != TINYEXR_SUCCESS && err) FreeEXRErrorMessage(err);
-                free(header.channels);
-                free(header.pixel_types);
-                free(header.requested_pixel_types);
-            }
-        }
+        // EXR save is deferred to after the render — see below ++frame_count
 
         if (ctrl.nim_request && !ctrl.nim_busy) {
             ctrl.nim_request = false;
@@ -2591,6 +2552,64 @@ int main() {
 
         ++frame_count;
 
+        // ── Save Render (EXR / tonemapped PNG) ──────────────────────
+        if (ctrl.save_exr_requested) {
+            ctrl.save_exr_requested = false;
+            if (ctrl.save_exr_path[0] != '\0' && frame_count > 0) {
+                if (ctrl.save_exr_tonemapped) {
+                    // Save tonemapped PNG — read from surface (what you see)
+                    std::vector<uint8_t> png_buf(rt_w * rt_h * 4);
+                    pathtracer_readback_surface(interop.surface, rt_w, rt_h, png_buf.data());
+                    // Change extension to .png
+                    std::string png_path = ctrl.save_exr_path;
+                    auto dot = png_path.rfind('.');
+                    if (dot != std::string::npos) png_path = png_path.substr(0, dot);
+                    png_path += ".png";
+                    stbi_write_png(png_path.c_str(), rt_w, rt_h, 4, png_buf.data(), rt_w * 4);
+                    std::cout << "[save] Wrote tonemapped PNG: " << png_path << "\n";
+                } else {
+                    // Save HDR EXR — read d_accum with rt_w stride
+                    std::vector<float> px((size_t)rt_w * rt_h * 4);
+                    cudaMemcpy(px.data(), d_accum, px.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    float inv = 1.f / (float)frame_count;
+                    std::vector<float> r(rt_w * rt_h), g(rt_w * rt_h), b(rt_w * rt_h);
+                    for (int i = 0; i < rt_w * rt_h; ++i) {
+                        r[i] = px[i * 4 + 0] * inv;
+                        g[i] = px[i * 4 + 1] * inv;
+                        b[i] = px[i * 4 + 2] * inv;
+                    }
+                    EXRHeader header; InitEXRHeader(&header);
+                    EXRImage  image;  InitEXRImage(&image);
+                    image.num_channels = 3;
+                    float* channels[3] = { b.data(), g.data(), r.data() };
+                    image.images = reinterpret_cast<unsigned char**>(channels);
+                    image.width  = rt_w;
+                    image.height = rt_h;
+                    header.num_channels = 3;
+                    header.channels = static_cast<EXRChannelInfo*>(malloc(sizeof(EXRChannelInfo)*3));
+                    strncpy_s(header.channels[0].name, sizeof(header.channels[0].name), "B", _TRUNCATE);
+                    strncpy_s(header.channels[1].name, sizeof(header.channels[1].name), "G", _TRUNCATE);
+                    strncpy_s(header.channels[2].name, sizeof(header.channels[2].name), "R", _TRUNCATE);
+                    header.pixel_types           = static_cast<int*>(malloc(sizeof(int)*3));
+                    header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int)*3));
+                    int exr_type = ctrl.save_exr_half ? TINYEXR_PIXELTYPE_HALF : TINYEXR_PIXELTYPE_FLOAT;
+                    for (int i = 0; i < 3; ++i) {
+                        header.pixel_types[i]           = TINYEXR_PIXELTYPE_FLOAT;
+                        header.requested_pixel_types[i] = exr_type;
+                    }
+                    const char* err = nullptr;
+                    int ret = SaveEXRImageToFile(&image, &header, ctrl.save_exr_path, &err);
+                    if (ret == TINYEXR_SUCCESS)
+                        std::cout << "[save] Wrote EXR: " << ctrl.save_exr_path << "\n";
+                    else if (err) { std::cerr << "[save] EXR error: " << err << "\n"; FreeEXRErrorMessage(err); }
+                    free(header.channels);
+                    free(header.pixel_types);
+                    free(header.requested_pixel_types);
+                }
+            }
+        }
+
         // ── Cosmos Transfer: readback AOVs and send to Cosmos ────────
         if (ctrl.cosmos_request && !ctrl.cosmos_busy) {
             ctrl.cosmos_request = false;
@@ -2600,55 +2619,66 @@ int main() {
 
             int cw = render_w, ch = render_h;
 
-            // Readback beauty — read d_accum at rt_w stride, apply same ACES
-            // tonemap as the viewport so the PNG matches what you see on screen.
-            std::vector<uint8_t> beauty(cw * ch * 4);
-            {
-                std::vector<float> cpu_accum((size_t)rt_w * rt_h * 4);
-                cudaMemcpy(cpu_accum.data(), d_accum,
-                           cpu_accum.size() * sizeof(float),
-                           cudaMemcpyDeviceToHost);
-                float inv = (frame_count > 0) ? 1.f / (float)frame_count : 1.f;
-                float exp_scale = exp2f(ctrl.post.exposure);
-                // ACES filmic tonemap — same curve as tonemap_for_viewport modes 2-5
-                auto aces = [](float x) -> float {
-                    x = std::max(0.f, x);
-                    return std::min(1.f, (x * (2.51f * x + 0.03f)) /
-                                         (x * (2.43f * x + 0.59f) + 0.14f));
+            // ── Beauty readback ──────────────────────────────────────────
+            std::vector<uint8_t> beauty;
+            if (ctrl.cosmos_source == 1 && hydra_preview_ready) {
+                // Hydra source — read whatever AOV is currently displayed
+                beauty = hydra_preview_read_color(hp_preview);
+                if (beauty.empty()) {
+                    // Fallback to pathtracer if Hydra read failed
+                    beauty.resize(cw * ch * 4);
+                    pathtracer_readback_surface(interop.surface, rt_w, rt_h, beauty.data());
+                } else {
+                    // Hydra buffer may be a different size — update cw/ch
+                    // (read_color returns w*h*4 bytes, dimensions from the render buffer)
+                    // For now assume it matches the Hydra panel size
+                    cw = hp_preview.tex_w;
+                    ch = hp_preview.tex_h;
+                }
+            } else if (ctrl.post_enabled && post.pipeline) {
+                // Path Tracer + post-process: read tonemapped display image
+                beauty.resize(cw * ch * 4);
+                std::vector<uint16_t> hf = post_process_readback(
+                    post, vk.physicalDevice, vk.commandPool, vk.graphicsQueue);
+                int pw = post.width, ph = post.height;
+                auto h2f = [](uint16_t h) -> float {
+                    uint32_t sign = (h & 0x8000u) << 16;
+                    uint32_t exp  = (h >> 10) & 0x1Fu;
+                    uint32_t mant = h & 0x3FFu;
+                    if (exp == 0) { if (mant == 0) { float f; uint32_t u = sign; memcpy(&f,&u,4); return f; }
+                        exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF;
+                        uint32_t u = sign | ((exp + 112) << 23) | (mant << 13); float f; memcpy(&f,&u,4); return f;
+                    } else if (exp == 31) { uint32_t u = sign | 0x7F800000u | (mant << 13); float f; memcpy(&f,&u,4); return f; }
+                    uint32_t u = sign | ((exp + 112) << 23) | (mant << 13); float f; memcpy(&f,&u,4); return f;
                 };
-                // Linear → sRGB gamma
-                auto to_srgb = [](float c) -> uint8_t {
-                    c = std::max(0.f, std::min(1.f, c));
-                    // sRGB transfer function
-                    float s = (c <= 0.0031308f)
-                        ? c * 12.92f
-                        : 1.055f * powf(c, 1.f / 2.4f) - 0.055f;
-                    return (uint8_t)(s * 255.f + 0.5f);
-                };
-                for (int y = 0; y < ch; ++y) {
-                    for (int x = 0; x < cw; ++x) {
-                        int ai = y * rt_w + x;  // accum stride = rt_w
-                        int oi = y * cw + x;
-                        float r = cpu_accum[ai*4+0] * inv * exp_scale;
-                        float g = cpu_accum[ai*4+1] * inv * exp_scale;
-                        float b = cpu_accum[ai*4+2] * inv * exp_scale;
-                        beauty[oi*4+0] = to_srgb(aces(r));
-                        beauty[oi*4+1] = to_srgb(aces(g));
-                        beauty[oi*4+2] = to_srgb(aces(b));
-                        beauty[oi*4+3] = 255;
+                for (int y = 0; y < std::min(ch, ph); ++y) {
+                    for (int x = 0; x < std::min(cw, pw); ++x) {
+                        int si = y * pw + x;
+                        int di = y * cw + x;
+                        float r = h2f(hf[si*4+0]);
+                        float g = h2f(hf[si*4+1]);
+                        float b = h2f(hf[si*4+2]);
+                        beauty[di*4+0] = (uint8_t)std::min(255.f, powf(std::max(0.f,std::min(1.f,r)), 1.f/2.2f) * 255.f + 0.5f);
+                        beauty[di*4+1] = (uint8_t)std::min(255.f, powf(std::max(0.f,std::min(1.f,g)), 1.f/2.2f) * 255.f + 0.5f);
+                        beauty[di*4+2] = (uint8_t)std::min(255.f, powf(std::max(0.f,std::min(1.f,b)), 1.f/2.2f) * 255.f + 0.5f);
+                        beauty[di*4+3] = 255;
                     }
                 }
+            } else {
+                // Path Tracer, no post-process — read CUDA surface directly
+                beauty.resize(cw * ch * 4);
+                pathtracer_readback_surface(interop.surface, rt_w, rt_h, beauty.data());
             }
 
-            // Readback depth
+            // Readback depth + seg from pathtracer (always, regardless of source)
+            int dw = render_w, dh = render_h;  // pathtracer dimensions
             float dmin = 0.f, dmax = 1.f;
-            pathtracer_depth_range(d_depth, cw * ch, &dmin, &dmax);
-            std::vector<uint8_t> depth_aov(cw * ch * 4);
-            pathtracer_readback_depth(d_depth, cw, ch, dmin, dmax, depth_aov.data());
+            pathtracer_depth_range(d_depth, dw * dh, &dmin, &dmax);
+            std::vector<uint8_t> depth_aov(dw * dh * 4);
+            pathtracer_readback_depth(d_depth, dw, dh, dmin, dmax, depth_aov.data());
 
-            // Readback segmentation
-            std::vector<uint8_t> seg_aov(cw * ch * 4);
-            pathtracer_readback_seg(cw, ch, cam,
+            std::vector<uint8_t> seg_aov(dw * dh * 4);
+            pathtracer_readback_seg(dw, dh, cam,
                 d_bvh, d_prims, (int)prims_sorted.size(),
                 mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
                 mesh.d_obj_colors, mesh.num_obj_colors, seg_aov.data());
@@ -2659,8 +2689,8 @@ int main() {
             // Save AOVs to disk for debugging
             std::filesystem::create_directories("debug");
             stbi_write_png("debug/cosmos_beauty.png", cw, ch, 4, beauty.data(), cw * 4);
-            stbi_write_png("debug/cosmos_depth.png",  cw, ch, 4, depth_aov.data(), cw * 4);
-            stbi_write_png("debug/cosmos_seg.png",    cw, ch, 4, seg_aov.data(), cw * 4);
+            stbi_write_png("debug/cosmos_depth.png",  dw, dh, 4, depth_aov.data(), dw * 4);
+            stbi_write_png("debug/cosmos_seg.png",    dw, dh, 4, seg_aov.data(), dw * 4);
             std::cout << "[cosmos] Saved AOV PNGs to debug/\n";
 
             if (cosmos_thread.joinable()) cosmos_thread.join();

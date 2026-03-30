@@ -117,6 +117,10 @@ void pathtracer_visualize_motion(const float2* d_motion, int src_w, int src_h,
                                  float max_mag,
                                  cudaSurfaceObject_t surface, int dst_w, int dst_h);
 
+// ── Surface readback (viewport content → CPU RGBA8 for Cosmos/PNG) ──────
+void pathtracer_readback_surface(cudaSurfaceObject_t surface, int w, int h,
+                                  uint8_t* h_rgba8);
+
 // ── AOV visualization (GPU → viewport surface) ─────────────────────────
 // mode: 0=normal, 1=albedo, 2=metallic, 3=roughness, 4=emission, 5=segmentation
 void pathtracer_visualize_material(

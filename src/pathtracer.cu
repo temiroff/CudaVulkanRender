@@ -1283,6 +1283,37 @@ void pathtracer_visualize_material(
         mode, surface, dst_w, dst_h);
 }
 
+// ── Surface readback (viewport content → CPU RGBA8) ─────────────────────
+__global__ void readback_surface_kernel(cudaSurfaceObject_t surf, int w, int h,
+                                        uint8_t* out_rgba8)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float4 v;
+    surf2Dread(&v, surf, x * (int)sizeof(float4), y);
+    // Surface stores linear [0,1] tonemapped values — apply gamma for sRGB PNG
+    int idx = y * w + x;
+    int oi = idx * 4;
+    out_rgba8[oi + 0] = (uint8_t)fminf(255.f, powf(fmaxf(0.f, fminf(1.f, v.x)), 1.f/2.2f) * 255.f + 0.5f);
+    out_rgba8[oi + 1] = (uint8_t)fminf(255.f, powf(fmaxf(0.f, fminf(1.f, v.y)), 1.f/2.2f) * 255.f + 0.5f);
+    out_rgba8[oi + 2] = (uint8_t)fminf(255.f, powf(fmaxf(0.f, fminf(1.f, v.z)), 1.f/2.2f) * 255.f + 0.5f);
+    out_rgba8[oi + 3] = 255;
+}
+
+void pathtracer_readback_surface(cudaSurfaceObject_t surface, int w, int h,
+                                  uint8_t* h_rgba8)
+{
+    uint8_t* d_out = nullptr;
+    size_t sz = (size_t)w * h * 4;
+    cudaMalloc(&d_out, sz);
+    dim3 block(16, 16);
+    dim3 grid((w + 15) / 16, (h + 15) / 16);
+    readback_surface_kernel<<<grid, block>>>(surface, w, h, d_out);
+    cudaMemcpy(h_rgba8, d_out, sz, cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
+}
+
 // ── Host readback API ───────────────────────────────────────────────────
 
 void pathtracer_readback_beauty(const float4* d_accum, int w, int h,

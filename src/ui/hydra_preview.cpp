@@ -1021,8 +1021,33 @@ VkDescriptorSet hydra_preview_descriptor(const HydraPreviewState& hp)
 
 std::vector<uint8_t> hydra_preview_read_color(HydraPreviewState& hp)
 {
-    std::vector<uint8_t> result;
-    if (!hp.engine_ptr) return result;
-    read_color_aov_rgba8(get_engine(hp), result);
+    std::vector<uint8_t> raw;
+    if (!hp.engine_ptr) return raw;
+    if (!read_color_aov_rgba8(get_engine(hp), raw)) return {};
+
+    int w = hp.tex_w, h = hp.tex_h;
+    if (w <= 0 || h <= 0 || (int)raw.size() != w * h * 4) return raw;
+
+    // Flip Y (OpenGL bottom-up → top-down) and apply sRGB gamma
+    std::vector<uint8_t> result(raw.size());
+    auto to_srgb = [](uint8_t v) -> uint8_t {
+        float c = v / 255.f;
+        float s = (c <= 0.0031308f)
+            ? c * 12.92f
+            : 1.055f * powf(c, 1.f / 2.4f) - 0.055f;
+        return (uint8_t)(std::min(1.f, std::max(0.f, s)) * 255.f + 0.5f);
+    };
+    for (int y = 0; y < h; ++y) {
+        int src_row = (h - 1 - y) * w * 4;
+        int dst_row = y * w * 4;
+        for (int x = 0; x < w; ++x) {
+            int si = src_row + x * 4;
+            int di = dst_row + x * 4;
+            result[di + 0] = to_srgb(raw[si + 0]);
+            result[di + 1] = to_srgb(raw[si + 1]);
+            result[di + 2] = to_srgb(raw[si + 2]);
+            result[di + 3] = raw[si + 3];
+        }
+    }
     return result;
 }

@@ -554,6 +554,10 @@ bool control_panel_draw(ControlPanelState& s) {
         ImGui::InputTextMultiline("##cosmos_prompt", s.cosmos_cfg.prompt,
                                   sizeof(s.cosmos_cfg.prompt), ImVec2(-1.f, 60.f));
 
+        ImGui::SetNextItemWidth(140.f);
+        static const char* cosmos_src[] = { "Path Tracer", "Hydra Preview" };
+        ImGui::Combo("Source##cosmos", &s.cosmos_source, cosmos_src, 2);
+
         ImGui::SetNextItemWidth(120.f);
         ImGui::SliderFloat("Depth Weight", &s.cosmos_cfg.depth_weight, 0.f, 1.f, "%.2f");
         ImGui::SetNextItemWidth(120.f);
