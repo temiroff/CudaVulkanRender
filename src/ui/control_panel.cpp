@@ -18,12 +18,13 @@ static std::string open_gltf_picker() {
                                        IID_IFileOpenDialog, reinterpret_cast<void**>(&pfd))))
         {
             COMDLG_FILTERSPEC types[] = {
-                { L"3D Scenes (glTF / USD)", L"*.gltf;*.glb;*.usd;*.usda;*.usdc;*.usdz" },
-                { L"glTF / GLB",             L"*.gltf;*.glb"                             },
-                { L"USD / USDA / USDC",      L"*.usd;*.usda;*.usdc;*.usdz"               },
-                { L"All Files",              L"*.*"                                       }
+                { L"3D Scenes (glTF / USD / URDF)", L"*.gltf;*.glb;*.usd;*.usda;*.usdc;*.usdz;*.urdf" },
+                { L"glTF / GLB",                    L"*.gltf;*.glb"                                    },
+                { L"USD / USDA / USDC",             L"*.usd;*.usda;*.usdc;*.usdz"                      },
+                { L"URDF (Robot Description)",      L"*.urdf"                                           },
+                { L"All Files",                     L"*.*"                                              }
             };
-            pfd->SetFileTypes(4, types);
+            pfd->SetFileTypes(5, types);
             pfd->SetFileTypeIndex(1);
             pfd->SetTitle(L"Open 3D Scene");
 
@@ -331,6 +332,11 @@ bool control_panel_draw(ControlPanelState& s) {
             cam_changed |= ImGui::SliderFloat("Intensity##hdri", &s.hdri_intensity, 0.f, 10.f);
             cam_changed |= ImGui::SliderFloat("Rotation##hdri",  &s.hdri_yaw_deg,  -180.f, 180.f);
         }
+        ImGui::Separator();
+        ImGui::TextDisabled("Background");
+        cam_changed |= ImGui::SliderFloat("BG Blur##hdri",    &s.hdri_bg_blur,    0.f, 1.f, "%.2f");
+        cam_changed |= ImGui::SliderFloat("BG Opacity##hdri", &s.hdri_bg_opacity, 0.f, 1.f, "%.2f");
+        cam_changed |= ImGui::ColorEdit3("BG Color##hdri", s.bg_color, ImGuiColorEditFlags_Float);
     }
 
     ImGui::Separator();
@@ -444,8 +450,34 @@ bool control_panel_draw(ControlPanelState& s) {
                 ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", s.nim_docker_error);
         }
 
-        ImGui::SetNextItemWidth(-1.f);
-        ImGui::InputText("Model", s.nim_cfg.model, sizeof(s.nim_cfg.model));
+        // ── Model dropdown ───────────────────────────────────────────────
+        {
+            static const char* nim_model_names[] = {
+                "Phi-3.5 Vision (Microsoft)",
+                "Llama 3.2 90B Vision (Meta)",
+                "Nemotron Nano 12B VL (NVIDIA)",
+                "Nemotron Nano VL 8B (NVIDIA)",
+            };
+            static const char* nim_model_ids[] = {
+                "microsoft/phi-3.5-vision-instruct",
+                "meta/llama-3.2-90b-vision-instruct",
+                "nvidia/nemotron-nano-12b-v2-vl",
+                "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+            };
+            static const int nim_model_count = sizeof(nim_model_ids) / sizeof(nim_model_ids[0]);
+
+            // Find current selection (default to 0 if model string doesn't match any)
+            int current = 0;
+            for (int i = 0; i < nim_model_count; ++i) {
+                if (strcmp(s.nim_cfg.model, nim_model_ids[i]) == 0) { current = i; break; }
+            }
+
+            ImGui::SetNextItemWidth(-1.f);
+            if (ImGui::Combo("Model", &current, nim_model_names, nim_model_count)) {
+                strncpy_s(s.nim_cfg.model, sizeof(s.nim_cfg.model),
+                          nim_model_ids[current], _TRUNCATE);
+            }
+        }
 
         ImGui::Separator();
 

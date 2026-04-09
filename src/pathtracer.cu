@@ -360,23 +360,80 @@ __device__ bool scatter_gpu_material(
 //  Sky / HDRI sampling
 // ─────────────────────────────────────────────
 
+// Sample HDRI at a direction (used for lighting — always sharp, full intensity).
+__device__ float3 sample_hdri(const PathTracerParams& p, float3 dir)
+{
+    float phi   = atan2f(dir.x, -dir.z) + p.hdri_yaw;
+    float theta = acosf(fmaxf(-1.f, fminf(1.f, dir.y)));
+    float u     = phi / (2.f * 3.14159265f);
+    if (u < 0.f) u += 1.f; if (u > 1.f) u -= 1.f;
+    float v     = theta / 3.14159265f;
+    float4 c    = tex2D<float4>(p.hdri_tex, u, v);
+    return make_float3(c.x * p.hdri_intensity,
+                       c.y * p.hdri_intensity,
+                       c.z * p.hdri_intensity);
+}
+
+// Sample sky for lighting (indirect bounces) — always uses full sharp HDRI.
 __device__ float3 sample_sky(const PathTracerParams& p, float3 dir)
 {
-    if (p.hdri_tex != 0) {
-        // Equirectangular mapping
-        float phi   = atan2f(dir.x, -dir.z) + p.hdri_yaw;
-        float theta = acosf(fmaxf(-1.f, fminf(1.f, dir.y)));
-        float u     = phi / (2.f * 3.14159265f);
-        if (u < 0.f) u += 1.f; if (u > 1.f) u -= 1.f;
-        float v     = theta / 3.14159265f;
-        float4 c    = tex2D<float4>(p.hdri_tex, u, v);
-        return make_float3(c.x * p.hdri_intensity,
-                           c.y * p.hdri_intensity,
-                           c.z * p.hdri_intensity);
-    }
+    if (p.hdri_tex != 0)
+        return sample_hdri(p, dir);
     // Default gradient sky
     float  t   = 0.5f * (normalize(dir).y + 1.f);
     return lerp(make_float3(1.f, 1.f, 1.f), make_float3(0.5f, 0.7f, 1.f), t);
+}
+
+// Build an orthonormal basis from a direction vector.
+__device__ void make_basis(float3 n, float3& t, float3& b)
+{
+    float3 a = (fabsf(n.y) < 0.999f)
+        ? make_float3(0.f, 1.f, 0.f)
+        : make_float3(1.f, 0.f, 0.f);
+    t = normalize(cross(a, n));
+    b = cross(n, t);
+}
+
+// Sample the environment (HDRI or gradient sky) at a single direction.
+__device__ float3 sample_env(const PathTracerParams& p, float3 dir)
+{
+    if (p.hdri_tex != 0)
+        return sample_hdri(p, dir);
+    // Default gradient sky
+    float t = 0.5f * (normalize(dir).y + 1.f);
+    return lerp(make_float3(1.f, 1.f, 1.f), make_float3(0.5f, 0.7f, 1.f), t);
+}
+
+// Sample sky for direct-view background (primary rays) — supports blur, opacity, bg color.
+// Applies to both HDRI and default gradient sky. Lighting is not affected.
+__device__ float3 sample_sky_background(const PathTracerParams& p, float3 dir, unsigned int& rng)
+{
+    float3 env_color;
+
+    if (p.hdri_bg_blur > 0.001f) {
+        // Blur: average multiple jittered samples in a cone around dir
+        float cone_angle = p.hdri_bg_blur * 0.5f; // max ~28 degrees at blur=1
+        float3 t, b;
+        make_basis(normalize(dir), t, b);
+
+        float3 sum = make_float3(0.f, 0.f, 0.f);
+        const int N = 8;
+        for (int i = 0; i < N; ++i) {
+            float r1 = rand_f(rng);
+            float r2 = rand_f(rng);
+            float angle = r1 * 2.f * 3.14159265f;
+            float radius = sqrtf(r2) * cone_angle;
+            float3 jdir = normalize(dir + radius * (cosf(angle) * t + sinf(angle) * b));
+            sum += sample_env(p, jdir);
+        }
+        env_color = sum * (1.f / (float)N);
+    } else {
+        env_color = sample_env(p, dir);
+    }
+
+    // Blend environment with solid background color based on opacity
+    float3 bg = p.bg_color;
+    return lerp(bg, env_color, p.hdri_bg_opacity);
 }
 
 // ─────────────────────────────────────────────
@@ -406,7 +463,12 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
         }
 
         if (!any_hit) {
-            radiance += throughput * sample_sky(p, ray.dir);
+            // Primary rays (depth 0): use background settings (blur, opacity, bg color).
+            // Bounced rays: use full sharp HDRI for correct lighting.
+            float3 sky = (depth == 0)
+                ? sample_sky_background(p, ray.dir, rng)
+                : sample_sky(p, ray.dir);
+            radiance += throughput * sky;
             break;
         }
 

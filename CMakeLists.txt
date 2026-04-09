@@ -192,6 +192,7 @@ add_executable(pathtracer
     src/denoiser.cpp
     src/gltf_loader.cpp
     src/usd_loader.cpp
+    src/urdf_loader.cpp
     src/post_process.cpp
     src/nim_vlm.cpp
     src/nim_cosmos.cpp
@@ -211,6 +212,7 @@ add_executable(pathtracer
     src/ui/stats_panel.cpp
     src/ui/material_panel.cpp
     src/ui/anim_panel.cpp
+    src/ui/articulation_panel.cpp
     src/ui/hydra_preview.cpp
     ${IMGUI_SOURCES}
     ${IMGUI_SOURCES_OPENGL3}

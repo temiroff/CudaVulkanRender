@@ -40,6 +40,9 @@ struct PathTracerParams {
     cudaTextureObject_t hdri_tex;       // equirectangular float4 texture, 0 = use gradient
     float               hdri_intensity; // exposure multiplier (default 1.0)
     float               hdri_yaw;       // rotation offset in radians
+    float               hdri_bg_blur;   // background blur cone angle (0 = sharp, 1 = max blur)
+    float               hdri_bg_opacity;// background HDRI visibility (0 = solid color only)
+    float3              bg_color;       // solid background color (linear RGB)
 
     // Firefly suppression: clamp per-sample luminance to this value (0 = disabled)
     float               firefly_clamp;  // e.g. 10.0f

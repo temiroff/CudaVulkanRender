@@ -17,6 +17,7 @@
 #include "gpu_textures.h"
 #include "gltf_loader.h"
 #include "usd_loader.h"
+#include "urdf_loader.h"
 #include "restir.h"
 #include "hdri.h"
 #include "denoiser.h"
@@ -36,6 +37,7 @@
 #include "ui/stats_panel.h"
 #include "ui/material_panel.h"
 #include "ui/anim_panel.h"
+#include "ui/articulation_panel.h"
 #include "ui/hydra_preview.h"
 
 #include <windows.h>
@@ -736,6 +738,13 @@ static bool is_usd_scene_path(const std::string& path)
     return (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz");
 }
 
+static bool is_urdf_path(const std::string& path)
+{
+    auto ext = std::filesystem::path(path).extension().string();
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    return (ext == ".urdf");
+}
+
 static bool load_gltf_into(const std::string& path, MeshState& ms,
                             ControlPanelState& ctrl)
 {
@@ -746,11 +755,14 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
     std::vector<TextureImage> tex_images;
 
     // Route by extension
-    const bool is_usd = is_usd_scene_path(path);
+    const bool is_usd  = is_usd_scene_path(path);
+    const bool is_urdf = is_urdf_path(path);
 
-    bool load_ok = is_usd
-        ? usd_load (path, tris, mats, tex_images, ms.objects)
-        : gltf_load(path, tris, mats, tex_images, ms.objects);
+    bool load_ok = is_urdf
+        ? urdf_load(path, tris, mats, tex_images, ms.objects)
+        : is_usd
+            ? usd_load (path, tris, mats, tex_images, ms.objects)
+            : gltf_load(path, tris, mats, tex_images, ms.objects);
     if (!load_ok) return false;
 
     // Upload textures
@@ -1082,6 +1094,9 @@ int main() {
     UsdAnimHandle*           usd_anim_handle = nullptr;
     float                    usd_last_frame_time = -1e30f;
 
+    // URDF articulation — persistent handle for interactive joint control
+    UrdfArticulation*        urdf_artic_handle = nullptr;
+
     HdriMap        hdri;
     DenoiserState  denoiser;
     denoiser_init(denoiser, rt_w, rt_h);
@@ -1272,6 +1287,15 @@ int main() {
                 cam_changed = true;    // reset accumulation
             }
         }
+        // URDF articulation: re-pose geometry when joint sliders change
+        if (articulation_panel_draw(urdf_artic_handle)) {
+            if (urdf_repose(urdf_artic_handle, mesh.all_prims)) {
+                rebuild_visible_bvh(mesh);
+                ++mesh.scene_version;
+                cam_changed = true;
+            }
+        }
+
         anim_panel_draw(anim, ctrl.gltf_path, active_scene_is_usd);
         viewport_draw(vp, (ctrl.post_enabled && post.imgui_desc) ? post.imgui_desc : interop.descriptor, ctrl);
         if (anim.preview_open && active_scene_is_usd) {
@@ -1554,6 +1578,12 @@ int main() {
                 usd_last_frame_time = -1e30f;
                 if (is_usd_scene_path(ctrl.gltf_path)) {
                     usd_anim_handle = usd_anim_open(ctrl.gltf_path, mesh.all_prims);
+                }
+
+                // Open URDF articulation handle for interactive joint control
+                if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
+                if (is_urdf_path(ctrl.gltf_path)) {
+                    urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                 }
             }
         }
@@ -2367,6 +2397,9 @@ int main() {
         pt.hdri_tex         = hdri.loaded ? hdri.tex : 0;
         pt.hdri_intensity   = ctrl.hdri_intensity;
         pt.hdri_yaw         = ctrl.hdri_yaw_deg * (3.14159265f / 180.f);
+        pt.hdri_bg_blur     = ctrl.hdri_bg_blur;
+        pt.hdri_bg_opacity  = ctrl.hdri_bg_opacity;
+        pt.bg_color         = make_float3(ctrl.bg_color[0], ctrl.bg_color[1], ctrl.bg_color[2]);
         pt.firefly_clamp        = ctrl.firefly_clamp;
         pt.sm_tracker_bitmask   = sm_tracker.d_bitmask;
 
