@@ -1010,6 +1010,10 @@ struct UrdfArticulation {
     // Axis correction
     Mat4 z_to_y;
 
+    // End-effector: deepest leaf link (cached on open)
+    std::string ee_link_name;
+    float3 ee_world_pos = {0, 0, 0};  // updated by urdf_repose
+
     int total_tris = 0;
 };
 
@@ -1123,9 +1127,57 @@ UrdfArticulation* urdf_articulation_open(const std::string& path,
     cache_link(h->root_link);
     h->total_tris = tri_cursor;
 
+    // Find end-effector: deepest leaf link, preferring names without "finger"/"tip"
+    {
+        std::string best_leaf;
+        int best_depth = -1;
+        std::function<void(const std::string&, int)> find_ee;
+        find_ee = [&](const std::string& link_name, int depth) {
+            auto jit = h->children_map.find(link_name);
+            bool has_children = (jit != h->children_map.end() && !jit->second.empty());
+            if (!has_children) {
+                // Leaf link — prefer non-finger/tip links, or deepest overall
+                bool is_finger = (link_name.find("finger") != std::string::npos ||
+                                  link_name.find("tip") != std::string::npos);
+                if (depth > best_depth || (!is_finger && depth >= best_depth)) {
+                    best_leaf = link_name;
+                    best_depth = depth;
+                }
+            }
+            if (has_children) {
+                for (auto* joint : jit->second)
+                    find_ee(joint->child, depth + 1);
+            }
+        };
+        find_ee(h->root_link, 0);
+        h->ee_link_name = best_leaf;
+    }
+
+    // Compute initial ee position from the last mesh cache's triangle centroid
+    if (!h->mesh_caches.empty()) {
+        auto& last_mc = h->mesh_caches.back();
+        float3 sum = make_float3(0, 0, 0);
+        int count = 0;
+        for (int ti = 0; ti < last_mc.tri_count; ++ti) {
+            int idx = last_mc.tri_start + ti;
+            if (idx >= (int)initial_tris.size()) break;
+            const Triangle& t = initial_tris[idx];
+            sum.x += t.v0.x + t.v1.x + t.v2.x;
+            sum.y += t.v0.y + t.v1.y + t.v2.y;
+            sum.z += t.v0.z + t.v1.z + t.v2.z;
+            count += 3;
+        }
+        if (count > 0) {
+            float inv = 1.f / (float)count;
+            h->ee_world_pos = make_float3(sum.x * inv, sum.y * inv, sum.z * inv);
+        }
+    }
+
     std::cerr << "[urdf_articulation] opened: " << h->joint_infos.size()
               << " joints, " << h->mesh_caches.size() << " mesh caches, "
-              << h->total_tris << " triangles\n";
+              << h->total_tris << " triangles, ee=" << h->ee_link_name
+              << " pos=(" << h->ee_world_pos.x << "," << h->ee_world_pos.y
+              << "," << h->ee_world_pos.z << ")\n";
 
     return h;
 }
@@ -1136,6 +1188,180 @@ int urdf_joint_count(const UrdfArticulation* h) {
 
 UrdfJointInfo* urdf_joint_info(UrdfArticulation* h) {
     return h && !h->joint_infos.empty() ? h->joint_infos.data() : nullptr;
+}
+
+float3 urdf_end_effector_pos(UrdfArticulation* h)
+{
+    // Returns the cached ee position computed during the last urdf_repose() call.
+    // This is the centroid of the last (deepest) link's mesh vertices,
+    // guaranteed to use the exact same transform chain as the visible geometry.
+    return h ? h->ee_world_pos : make_float3(0, 0, 0);
+}
+
+// ── CCD Inverse Kinematics ──────────────────────────────────────────────────
+
+// Internal FK: compute the world-space position of every joint origin and the
+// end-effector from current joint_infos angles. No dependency on cached data.
+// Returns: joint_positions[i] and joint_axes[i] for each entry in chain,
+//          plus ee_pos for the end-effector.
+struct IKChainEntry {
+    int              ji;   // index into joint_infos (-1 for fixed)
+    const URDFJoint* jnt;
+};
+
+static bool ik_collect_chain(UrdfArticulation* h,
+                             std::vector<IKChainEntry>& chain)
+{
+    chain.clear();
+    std::function<bool(const std::string&)> walk;
+    walk = [&](const std::string& link_name) -> bool {
+        if (link_name == h->ee_link_name) return true;
+        auto jit = h->children_map.find(link_name);
+        if (jit == h->children_map.end()) return false;
+        for (auto* joint : jit->second) {
+            auto idx_it = h->joint_name_to_idx.find(joint->name);
+            int ji = (idx_it != h->joint_name_to_idx.end()) ? idx_it->second : -1;
+            chain.push_back({ ji, joint });
+            if (walk(joint->child)) return true;
+            chain.pop_back();
+        }
+        return false;
+    };
+    return walk(h->root_link);
+}
+
+// Run forward kinematics on the chain, computing world-space joint positions,
+// axes, and the final ee position. Uses current joint_infos angles directly.
+static float3 ik_forward(UrdfArticulation* h,
+                         const std::vector<IKChainEntry>& chain,
+                         std::vector<float3>& joint_pos,
+                         std::vector<float3>& joint_axis)
+{
+    joint_pos.resize(chain.size());
+    joint_axis.resize(chain.size());
+
+    Mat4 xform = h->z_to_y;
+    UrdfJointInfo* joints = h->joint_infos.data();
+
+    for (int i = 0; i < (int)chain.size(); i++) {
+        const URDFJoint* jnt = chain[i].jnt;
+        xform = xform * jnt->origin;
+
+        // Record joint world position and axis BEFORE applying joint rotation
+        joint_pos[i]  = xform.transform_point(make_float3(0, 0, 0));
+        float3 wa = xform.transform_normal(jnt->axis);
+        float al = sqrtf(wa.x*wa.x + wa.y*wa.y + wa.z*wa.z);
+        if (al > 1e-7f) { wa.x /= al; wa.y /= al; wa.z /= al; }
+        joint_axis[i] = wa;
+
+        // Apply joint angle
+        int ji = chain[i].ji;
+        if (ji >= 0) {
+            float angle = joints[ji].angle;
+            int type = joints[ji].type;
+            if ((type == 0 || type == 2) && angle != 0.0f)
+                xform = xform * axis_angle_rotation(jnt->axis, angle);
+            else if (type == 1 && angle != 0.0f) {
+                Mat4 T = Mat4::identity();
+                T.m[0][3] = jnt->axis.x * angle;
+                T.m[1][3] = jnt->axis.y * angle;
+                T.m[2][3] = jnt->axis.z * angle;
+                xform = xform * T;
+            }
+        }
+    }
+
+    return xform.transform_point(make_float3(0, 0, 0));
+}
+
+float3 urdf_fk_ee_pos(UrdfArticulation* h)
+{
+    if (!h) return make_float3(0, 0, 0);
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty())
+        return h ? h->ee_world_pos : make_float3(0, 0, 0);
+    std::vector<float3> jp, ja;
+    return ik_forward(h, chain, jp, ja);
+}
+
+
+// CCD helper: compute the rotation angle for one joint to bring 'current' toward 'target'
+// around the joint's axis. Returns the signed angle (already damped).
+static float ccd_angle_for_joint(float3 j_pos, float3 j_axis,
+                                 float3 current, float3 target, float damping)
+{
+    float3 to_cur = make_float3(current.x - j_pos.x, current.y - j_pos.y, current.z - j_pos.z);
+    float3 to_tgt = make_float3(target.x  - j_pos.x, target.y  - j_pos.y, target.z  - j_pos.z);
+
+    // Project onto plane perpendicular to joint axis
+    float dc = to_cur.x*j_axis.x + to_cur.y*j_axis.y + to_cur.z*j_axis.z;
+    float dt = to_tgt.x*j_axis.x + to_tgt.y*j_axis.y + to_tgt.z*j_axis.z;
+    float3 pc = make_float3(to_cur.x - dc*j_axis.x, to_cur.y - dc*j_axis.y, to_cur.z - dc*j_axis.z);
+    float3 pt = make_float3(to_tgt.x - dt*j_axis.x, to_tgt.y - dt*j_axis.y, to_tgt.z - dt*j_axis.z);
+
+    float lc = sqrtf(pc.x*pc.x + pc.y*pc.y + pc.z*pc.z);
+    float lt = sqrtf(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z);
+    if (lc < 1e-6f || lt < 1e-6f) return 0.f;
+
+    float dv = (pc.x*pt.x + pc.y*pt.y + pc.z*pt.z) / (lc * lt);
+    dv = fmaxf(-1.f, fminf(1.f, dv));
+    float angle = acosf(dv);
+
+    float3 cr = make_float3(pc.y*pt.z - pc.z*pt.y,
+                            pc.z*pt.x - pc.x*pt.z,
+                            pc.x*pt.y - pc.y*pt.x);
+    float sign = (cr.x*j_axis.x + cr.y*j_axis.y + cr.z*j_axis.z) > 0 ? 1.f : -1.f;
+    return angle * sign * damping;
+}
+
+static void clamp_joint(UrdfJointInfo& info, float PI)
+{
+    if (info.type == 0) {
+        if (info.angle < info.lower) info.angle = info.lower;
+        if (info.angle > info.upper) info.angle = info.upper;
+    } else if (info.type == 2) {
+        while (info.angle >  PI) info.angle -= 2.f * PI;
+        while (info.angle < -PI) info.angle += 2.f * PI;
+    }
+}
+
+bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
+                   int max_iters, float tolerance)
+{
+    if (!h) return false;
+
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty()) return false;
+
+    UrdfJointInfo* joints = h->joint_infos.data();
+    const float PI = 3.14159265f;
+
+    std::vector<float3> jpos, jaxis;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        float3 ee = ik_forward(h, chain, jpos, jaxis);
+
+        float3 diff = make_float3(target_pos.x - ee.x, target_pos.y - ee.y, target_pos.z - ee.z);
+        float dist = sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
+        if (dist < tolerance) return true;
+
+        // CCD: iterate joints from tip to base
+        for (int ci = (int)chain.size() - 1; ci >= 0; ci--) {
+            int ji = chain[ci].ji;
+            if (ji < 0) continue;
+            UrdfJointInfo& info = joints[ji];
+            if (info.type != 0 && info.type != 2) continue;
+
+            ee = ik_forward(h, chain, jpos, jaxis);
+            float a = ccd_angle_for_joint(jpos[ci], jaxis[ci], ee, target_pos, 0.5f);
+            info.angle += a;
+            clamp_joint(info, PI);
+        }
+    }
+
+    float3 ee = ik_forward(h, chain, jpos, jaxis);
+    float3 diff = make_float3(target_pos.x - ee.x, target_pos.y - ee.y, target_pos.z - ee.z);
+    return sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z) < tolerance;
 }
 
 bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
@@ -1150,6 +1376,10 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
     // Walk kinematic chain, computing world transforms, and update triangles
     int cache_idx = 0;
 
+    // Track the last link's vertex centroid as end-effector position
+    float3 last_link_centroid = make_float3(0, 0, 0);
+    int    last_link_vert_count = 0;
+
     std::function<void(const std::string&, Mat4)> repose_link;
     repose_link = [&](const std::string& link_name, Mat4 world_xform) {
         if (cache_idx < (int)h->mesh_caches.size() &&
@@ -1158,6 +1388,10 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
             auto& mc = h->mesh_caches[cache_idx];
             const Mat4& local_xform = h->links[link_name].visual_origin;
             const Mat4& world = world_xform;
+
+            // Reset centroid tracking for this link (overwrite with later links)
+            last_link_centroid = make_float3(0, 0, 0);
+            last_link_vert_count = 0;
 
             // Update triangles in-place
             for (int ti = 0; ti < mc.tri_count; ++ti) {
@@ -1172,6 +1406,12 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
                 tri.v0 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i0]));
                 tri.v1 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i1]));
                 tri.v2 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i2]));
+
+                // Accumulate for ee centroid
+                last_link_centroid.x += tri.v0.x + tri.v1.x + tri.v2.x;
+                last_link_centroid.y += tri.v0.y + tri.v1.y + tri.v2.y;
+                last_link_centroid.z += tri.v0.z + tri.v1.z + tri.v2.z;
+                last_link_vert_count += 3;
 
                 if (i0 < (int)mc.raw.normals.size() && i1 < (int)mc.raw.normals.size() && i2 < (int)mc.raw.normals.size()) {
                     tri.n0 = world.transform_normal(local_xform.transform_normal(mc.raw.normals[i0]));
@@ -1216,6 +1456,15 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
     };
 
     repose_link(h->root_link, h->z_to_y);
+
+    // Cache ee position as centroid of the last link's mesh
+    if (last_link_vert_count > 0) {
+        float inv = 1.f / (float)last_link_vert_count;
+        h->ee_world_pos = make_float3(last_link_centroid.x * inv,
+                                      last_link_centroid.y * inv,
+                                      last_link_centroid.z * inv);
+    }
+
     return true;
 }
 

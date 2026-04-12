@@ -135,6 +135,18 @@ void pathtracer_visualize_material(
     float3* d_obj_colors, int num_obj_colors,
     int mode, cudaSurfaceObject_t surface, int dst_w, int dst_h);
 
+// ── Solid shading (camera-relative 3-point lighting, single ray cast) ───
+void pathtracer_solid_shade(
+    int src_w, int src_h, Camera cam,
+    BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+    BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+    GpuMaterial* d_materials, int num_materials,
+    cudaTextureObject_t* d_textures,
+    float3* d_obj_colors, int num_obj_colors,
+    int color_mode, float3 bg_color,
+    float3 key_dir, float3 fill_dir, float3 rim_dir,
+    cudaSurfaceObject_t surface, int dst_w, int dst_h);
+
 // ── AOV readback (GPU → CPU RGBA8 for Cosmos Transfer) ─────────────────
 // All output to caller-allocated h_rgba8 buffer (w * h * 4 bytes).
 void pathtracer_readback_beauty(const float4* d_accum, int w, int h,

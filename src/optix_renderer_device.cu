@@ -22,6 +22,9 @@ struct OptixLaunchParams {
     cudaTextureObject_t hdri_tex;
     float               hdri_intensity;
     float               hdri_yaw;
+    float               hdri_bg_blur;
+    float               hdri_bg_opacity;
+    float3              bg_color;
     float               firefly_clamp;
     OptixTraversableHandle traversable;
 };
@@ -258,7 +261,7 @@ static __forceinline__ __device__ bool scatter_gpu_material(
     return true;
 }
 
-static __forceinline__ __device__ float3 sample_sky(float3 dir)
+static __forceinline__ __device__ float3 sample_env(float3 dir)
 {
     if (params.hdri_tex != 0) {
         float phi = atan2f(dir.x, -dir.z) + params.hdri_yaw;
@@ -275,6 +278,45 @@ static __forceinline__ __device__ float3 sample_sky(float3 dir)
 
     float t = 0.5f * (normalize(dir).y + 1.f);
     return lerp(make_float3(1.f, 1.f, 1.f), make_float3(0.5f, 0.7f, 1.f), t);
+}
+
+// Lighting bounces: sharp HDRI, no blur/opacity.
+static __forceinline__ __device__ float3 sample_sky(float3 dir)
+{
+    return sample_env(dir);
+}
+
+// Primary ray background: blur + opacity + bg color blending.
+static __forceinline__ __device__ float3 sample_sky_background(float3 dir, unsigned int& rng)
+{
+    float3 env_color;
+
+    if (params.hdri_bg_blur > 0.001f) {
+        float cone_angle = params.hdri_bg_blur * 0.5f;
+        float3 n = normalize(dir);
+        float3 a = (fabsf(n.y) < 0.999f)
+            ? make_float3(0.f, 1.f, 0.f)
+            : make_float3(1.f, 0.f, 0.f);
+        float3 t = normalize(cross(a, n));
+        float3 b = cross(n, t);
+
+        float3 sum = make_float3(0.f, 0.f, 0.f);
+        const int N = 8;
+        for (int i = 0; i < N; ++i) {
+            float r1 = rand_f(rng);
+            float r2 = rand_f(rng);
+            float angle = r1 * 2.f * 3.14159265f;
+            float radius = sqrtf(r2) * cone_angle;
+            float3 jdir = normalize(dir + radius * (cosf(angle) * t + sinf(angle) * b));
+            sum += sample_env(jdir);
+        }
+        env_color = sum * (1.f / (float)N);
+    } else {
+        env_color = sample_env(dir);
+    }
+
+    float3 bg = params.bg_color;
+    return lerp(bg, env_color, params.hdri_bg_opacity);
 }
 
 static __forceinline__ __device__ void pack_pointer(void* ptr, unsigned int& i0, unsigned int& i1)
@@ -323,7 +365,10 @@ static __forceinline__ __device__ float3 trace_path(Ray ray, unsigned int& rng)
             u1);
 
         if (!prd.hit) {
-            radiance += throughput * sample_sky(ray.dir);
+            float3 sky = (depth == 0)
+                ? sample_sky_background(ray.dir, rng)
+                : sample_sky(ray.dir);
+            radiance += throughput * sky;
             break;
         }
 

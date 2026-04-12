@@ -180,6 +180,40 @@ void bvh_upload_triangles(
     cudaMemcpy(*d_prims, prims.data(), prims.size() * sizeof(Triangle),   cudaMemcpyHostToDevice);
 }
 
+// Refit BVH AABBs in-place from updated triangle positions.
+// Tree topology stays the same — only bounding boxes are recomputed.
+// Much cheaper than a full rebuild (O(N) vs O(N log N)), suitable for articulation.
+static AABB bvh_refit_node(std::vector<BVHNode>& nodes,
+                           const std::vector<Triangle>& prims, int idx)
+{
+    BVHNode& n = nodes[idx];
+    if (n.prim_start >= 0) {
+        // Leaf — recompute from triangles
+        AABB box = triangle_aabb(prims[n.prim_start]);
+        for (int i = 1; i < n.prim_count; i++)
+            box = aabb_union(box, triangle_aabb(prims[n.prim_start + i]));
+        n.aabb = box;
+        return box;
+    }
+    // Interior — union of children
+    AABB lb = bvh_refit_node(nodes, prims, n.left);
+    AABB rb = bvh_refit_node(nodes, prims, n.right);
+    n.aabb = aabb_union(lb, rb);
+    return n.aabb;
+}
+
+void bvh_refit_triangles(
+    std::vector<BVHNode>& nodes,
+    const std::vector<Triangle>& prims,
+    BVHNode* d_nodes)
+{
+    if (nodes.empty()) return;
+    bvh_refit_node(nodes, prims, 0);
+    // Re-upload only BVH nodes (not triangles — caller handles that)
+    cudaMemcpyAsync(d_nodes, nodes.data(), nodes.size() * sizeof(BVHNode),
+                    cudaMemcpyHostToDevice);
+}
+
 // ─────────────────────────────────────────────
 //  Device — sphere intersection
 // ─────────────────────────────────────────────

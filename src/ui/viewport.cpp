@@ -22,11 +22,13 @@ void viewport_draw(ViewportPanel& vp, VkDescriptorSet descriptor, ControlPanelSt
         // AOV pass selector in the menu bar
         // Maps combo index → ViewportPassMode enum value
         static const char* vp_aov_items[] = {
-            "Beauty", "Depth", "Normal", "Albedo",
+            "Beauty", "Solid", "Rasterized", "Depth", "Normal", "Albedo",
             "Metallic", "Roughness", "Emission", "SegId"
         };
         static const int vp_aov_map[] = {
             (int)ViewportPassMode::Final,
+            (int)ViewportPassMode::Solid,
+            (int)ViewportPassMode::Rasterized,
             (int)ViewportPassMode::DlssDepth,
             (int)ViewportPassMode::Normal,
             (int)ViewportPassMode::Albedo,

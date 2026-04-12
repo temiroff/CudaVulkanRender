@@ -22,6 +22,8 @@ enum class ViewportPassMode {
     Roughness,
     Emission,
     Segmentation,
+    Solid,
+    Rasterized,
     COUNT
 };
 
@@ -172,6 +174,15 @@ struct ControlPanelState {
     GizmoMode gizmo_mode   = GizmoMode::Translate;  // W=translate, E=rotate, R=scale
     bool overlay_orbit      = true;  // orbit pivot crosshair
     bool overlay_nim        = true;  // NIM VLM recognition result card
+    bool overlay_lights     = true;  // 3-point light direction indicators
+
+    // 3-point light rig offsets (camera-relative, used in Solid/Rasterized modes)
+    // Key/Fill: dir = normalize(cam_w + cam_u * u + cam_v * v)
+    // Rim:      dir = normalize(-cam_w + cam_u * u + cam_v * v)
+    float light_key_u  =  0.3f,  light_key_v  =  0.2f;
+    float light_fill_u = -0.4f,  light_fill_v = -0.1f;
+    float light_rim_u  =  0.0f,  light_rim_v  =  0.3f;
+    int   dragging_light = -1;  // -1 = none, 0 = key, 1 = fill, 2 = rim
 
     // Tools windows
     bool show_gpu_arch      = false; // GPU Architecture Viewer

@@ -55,6 +55,13 @@ void bvh_upload_triangles(
     Triangle** d_prims
 );
 
+// Refit BVH AABBs in-place from updated triangle positions (O(N), no realloc).
+void bvh_refit_triangles(
+    std::vector<BVHNode>& nodes,
+    const std::vector<Triangle>& prims,
+    BVHNode* d_nodes
+);
+
 __device__ bool bvh_hit_triangles(
     const BVHNode* nodes, const Triangle* prims,
     const Ray& r, float t_min, float t_max,

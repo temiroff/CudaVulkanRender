@@ -65,6 +65,8 @@ static const char* viewport_pass_name(int pass)
         case ViewportPassMode::Roughness:    return "Roughness";
         case ViewportPassMode::Emission:     return "Emission";
         case ViewportPassMode::Segmentation: return "Segmentation";
+        case ViewportPassMode::Solid:        return "Solid";
+        case ViewportPassMode::Rasterized:   return "Rasterized";
         default:                             return "Final";
     }
 }
@@ -163,13 +165,6 @@ bool control_panel_draw(ControlPanelState& s) {
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Overlays")) {
-            ImGui::MenuItem("Selection outline",      nullptr, &s.overlay_selection);
-            ImGui::MenuItem("Move gizmo",             nullptr, &s.overlay_gizmo);
-            ImGui::MenuItem("Orbit pivot",            nullptr, &s.overlay_orbit);
-            ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
-            ImGui::EndMenu();
-        }
         if (ImGui::BeginMenu("Tools")) {
             ImGui::MenuItem("GPU Architecture Viewer", nullptr, &s.show_gpu_arch);
             ImGui::EndMenu();
@@ -247,7 +242,7 @@ bool control_panel_draw(ControlPanelState& s) {
     if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
         cam_changed |= ImGui::SliderInt("SPP / frame", &s.spp,       1, 32);
         cam_changed |= ImGui::SliderInt("Max Depth",   &s.max_depth, 1, 32);
-        static const char* color_modes[] = { "Shaders", "Greyscale", "Random Colors", "USD Colors" };
+        static const char* color_modes[] = { "Shaders", "Grey", "Random Colors", "USD Colors" };
         cam_changed |= ImGui::Combo("Color Mode", &s.color_mode, color_modes, 4);
         ImGui::Separator();
         cam_changed |= ImGui::SliderFloat("Firefly Clamp", &s.firefly_clamp, 0.f, 100.f);
@@ -907,6 +902,7 @@ void control_panel_draw_main_menu(ControlPanelState& s) {
         ImGui::MenuItem("Move gizmo",             nullptr, &s.overlay_gizmo);
         ImGui::MenuItem("Orbit pivot",            nullptr, &s.overlay_orbit);
         ImGui::MenuItem("Scene recognition card", nullptr, &s.overlay_nim);
+        ImGui::MenuItem("Viewport lights",        nullptr, &s.overlay_lights);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Tools")) {

@@ -1,4 +1,5 @@
 #include "pathtracer.h"
+#include "shading_common.cuh"
 #include "ui/gpu_arch_sm_tracker.h"
 #include <cuda_runtime.h>
 #include <cstring>
@@ -482,8 +483,11 @@ __device__ float3 trace_path(Ray ray, const PathTracerParams& p, unsigned int& r
             did_scatter = scatter_gpu_material(
                 ray, rec, p.gpu_materials[rec.gpu_mat_idx],
                 p.textures, attenuation, emission, scattered, rng);
-            // Color mode override (greyscale applied to final radiance below, not here)
-            if (p.color_mode == 2 && p.obj_colors &&
+            // Color mode overrides
+            if (p.color_mode == 1) {
+                // Grey lambert: override attenuation to neutral grey
+                attenuation = make_float3(0.18f, 0.18f, 0.18f);
+            } else if (p.color_mode == 2 && p.obj_colors &&
                        rec.obj_id >= 0 && rec.obj_id < p.num_obj_colors) {
                 // Random per-object color
                 attenuation = p.obj_colors[rec.obj_id];
@@ -562,13 +566,6 @@ __global__ void pathtrace_kernel(PathTracerParams p) {
         color += sample;
     }
     color = color / (float)p.spp;
-
-    // Greyscale: convert fully-shaded PBR result to luminance AFTER all bounces,
-    // so reflections, normal maps, roughness, and lighting are all captured.
-    if (p.color_mode == 1) {
-        float lum = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
-        color = make_float3(lum, lum, lum);
-    }
 
     float4 prev  = p.accum_buffer[idx];
     float  t     = 1.f / (float)(p.frame_count + 1);
@@ -1337,6 +1334,111 @@ void pathtracer_visualize_material(
         d_materials, num_materials, d_textures,
         d_obj_colors, num_obj_colors,
         mode, surface, dst_w, dst_h);
+}
+
+// ── Solid shading (camera-relative 3-point lighting, single ray cast) ───
+
+__global__ void solid_shade_kernel(
+    int src_w, int src_h, Camera cam,
+    BVHNode* bvh, Sphere* prims, int num_prims,
+    BVHNode* tri_bvh, Triangle* triangles, int num_triangles,
+    GpuMaterial* materials, int num_materials,
+    cudaTextureObject_t* textures,
+    float3* obj_colors, int num_obj_colors,
+    int color_mode, float3 bg_color,
+    float3 key_dir, float3 fill_dir, float3 rim_dir,
+    cudaSurfaceObject_t surf, int dst_w, int dst_h)
+{
+    int dx = blockIdx.x * blockDim.x + threadIdx.x;
+    int dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= dst_w || dy >= dst_h) return;
+
+    int x = min(src_w - 1, max(0, (dx * src_w) / max(1, dst_w)));
+    int y = min(src_h - 1, max(0, (dy * src_h) / max(1, dst_h)));
+
+    float u = ((float)x + 0.5f) / (float)max(1, src_w);
+    float v = 1.f - ((float)y + 0.5f) / (float)max(1, src_h);
+    Ray ray = camera_ray_center(cam, u, v);
+
+    HitRecord rec;
+    bool any_hit = (num_prims > 0) && bvh_hit(bvh, prims, ray, 1e-3f, 1e20f, rec);
+    float t_max = any_hit ? rec.t : 1e20f;
+    if (tri_bvh && num_triangles > 0) {
+        HitRecord tri_rec;
+        if (bvh_hit_triangles(tri_bvh, triangles, ray, 1e-3f, t_max, tri_rec)) {
+            rec = tri_rec;
+            any_hit = true;
+        }
+    }
+
+    float3 c;
+    if (!any_hit) {
+        c = bg_color;
+    } else {
+        float3 base;
+        float met = 0.f, rough = 0.5f;
+
+        // Color mode 1: grey lambert — override everything to neutral grey
+        if (color_mode == 1) {
+            base = make_float3(0.18f, 0.18f, 0.18f);
+            met = 0.f; rough = 0.6f;
+        } else if (color_mode == 2 && obj_colors &&
+            rec.obj_id >= 0 && rec.obj_id < num_obj_colors) {
+            base = obj_colors[rec.obj_id];
+        } else if (rec.gpu_mat_idx >= 0 && rec.gpu_mat_idx < num_materials) {
+            const GpuMaterial& m = materials[rec.gpu_mat_idx];
+            base = sample_base_color(m, textures, rec.u, rec.v);
+            met = m.metallic;
+            rough = m.roughness;
+            if (m.metallic_rough_tex >= 0 && textures) {
+                float4 mr = tex2D<float4>(textures[m.metallic_rough_tex], rec.u, rec.v);
+                rough *= mr.y;
+                met   *= mr.z;
+            }
+        } else {
+            base = rec.albedo;
+            rough = rec.roughness;
+        }
+
+        // Color mode 3: flat N·L (USD style)
+        if (color_mode == 3) {
+            float3 L = make_float3(0.4f, 0.7f, -0.5f);
+            float nl = fabsf(dot(rec.normal, L));
+            float shade = 0.3f + 0.7f * nl;
+            c = base * shade;
+        } else {
+            c = three_point_shade(rec.normal, cam.w, key_dir, fill_dir, rim_dir, base, met, rough);
+        }
+
+        // Linear → sRGB gamma
+        c.x = powf(fmaxf(0.f, c.x), 1.f / 2.2f);
+        c.y = powf(fmaxf(0.f, c.y), 1.f / 2.2f);
+        c.z = powf(fmaxf(0.f, c.z), 1.f / 2.2f);
+    }
+    surf2Dwrite(make_float4(c.x, c.y, c.z, 1.f), surf, dx * (int)sizeof(float4), dy);
+}
+
+void pathtracer_solid_shade(
+    int src_w, int src_h, Camera cam,
+    BVHNode* d_bvh, Sphere* d_prims, int num_prims,
+    BVHNode* d_tri_bvh, Triangle* d_triangles, int num_triangles,
+    GpuMaterial* d_materials, int num_materials,
+    cudaTextureObject_t* d_textures,
+    float3* d_obj_colors, int num_obj_colors,
+    int color_mode, float3 bg_color,
+    float3 key_dir, float3 fill_dir, float3 rim_dir,
+    cudaSurfaceObject_t surface, int dst_w, int dst_h)
+{
+    dim3 block(16, 16);
+    dim3 grid((dst_w + 15) / 16, (dst_h + 15) / 16);
+    solid_shade_kernel<<<grid, block>>>(
+        src_w, src_h, cam,
+        d_bvh, d_prims, num_prims,
+        d_tri_bvh, d_triangles, num_triangles,
+        d_materials, num_materials, d_textures,
+        d_obj_colors, num_obj_colors,
+        color_mode, bg_color, key_dir, fill_dir, rim_dir,
+        surface, dst_w, dst_h);
 }
 
 // ── Surface readback (viewport content → CPU RGBA8) ─────────────────────

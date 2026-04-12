@@ -19,6 +19,7 @@
 #include "usd_loader.h"
 #include "urdf_loader.h"
 #include "restir.h"
+#include "rasterizer.h"
 #include "hdri.h"
 #include "denoiser.h"
 #include "optix_denoiser.h"
@@ -38,6 +39,7 @@
 #include "ui/material_panel.h"
 #include "ui/anim_panel.h"
 #include "ui/articulation_panel.h"
+#include "ui/robot_demo_panel.h"
 #include "ui/hydra_preview.h"
 
 #include <windows.h>
@@ -882,6 +884,7 @@ struct MeshState {
     std::vector<BVHNode>    bvh_nodes;
     std::vector<Triangle>   all_prims;  // canonical full list (never BVH-reordered)
     std::vector<Triangle>   prims;      // BVH-sorted visible subset (on GPU)
+    std::vector<int>        prim_remap; // prim_remap[i] = all_prims index for prims[i]
     std::vector<MeshObject> objects;    // one per glTF primitive
     std::vector<GpuTexture> gpu_textures;
 
@@ -919,6 +922,7 @@ struct MeshState {
         bvh_nodes.clear();
         all_prims.clear();
         prims.clear();
+        prim_remap.clear();
         objects.clear();
         host_mats.clear();
         num_mats = 0; num_texs = 0; num_obj_colors = 0; num_emissive = 0; tex_bytes = 0;
@@ -1189,20 +1193,111 @@ static void rebuild_visible_bvh(MeshState& ms)
     for (auto& obj : ms.objects)
         hidden_map[obj.obj_id] = obj.hidden;
 
+    // Build visible list and record which all_prims index each came from
     std::vector<Triangle> visible;
+    std::vector<int> vis_to_all;  // vis_to_all[k] = all_prims index
     visible.reserve(ms.all_prims.size());
-    for (auto& t : ms.all_prims)
-        if (!hidden_map[t.obj_id]) visible.push_back(t);
+    vis_to_all.reserve(ms.all_prims.size());
+    for (int j = 0; j < (int)ms.all_prims.size(); j++) {
+        if (!hidden_map[ms.all_prims[j].obj_id]) {
+            visible.push_back(ms.all_prims[j]);
+            vis_to_all.push_back(j);
+        }
+    }
 
     cudaFree(ms.d_bvh);   ms.d_bvh   = nullptr;
     cudaFree(ms.d_prims); ms.d_prims = nullptr;
     ms.bvh_nodes.clear();
     ms.prims.clear();
+    ms.prim_remap.clear();
 
     if (!visible.empty()) {
+        // BVH build reorders visible → prims (sorted by spatial locality)
         bvh_build_triangles(visible, ms.bvh_nodes, ms.prims);
         bvh_upload_triangles(ms.bvh_nodes, ms.prims, &ms.d_bvh, &ms.d_prims);
+
+        // Build prim_remap: prims[i] → all_prims index.
+        // BVH sort permuted the visible array. Match by finding which visible
+        // entry each prims[i] corresponds to (bit-exact vertex match pre-repose).
+        ms.prim_remap.resize(ms.prims.size(), -1);
+        // Build lookup from v0 bit pattern to vis_to_all index for O(N) matching
+        struct V0Key {
+            float x, y, z;
+            int obj_id;
+            bool operator==(const V0Key& o) const {
+                return x == o.x && y == o.y && z == o.z && obj_id == o.obj_id;
+            }
+        };
+        struct V0Hash {
+            size_t operator()(const V0Key& k) const {
+                size_t h = 0;
+                h ^= std::hash<float>{}(k.x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<float>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<float>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int>{}(k.obj_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+        // Map from v0+obj_id → list of all_prims indices (handles duplicates)
+        std::unordered_multimap<V0Key, int, V0Hash> key_to_all;
+        for (int k = 0; k < (int)visible.size(); k++) {
+            V0Key key = { visible[k].v0.x, visible[k].v0.y, visible[k].v0.z, visible[k].obj_id };
+            key_to_all.insert({ key, vis_to_all[k] });
+        }
+        for (int i = 0; i < (int)ms.prims.size(); i++) {
+            V0Key key = { ms.prims[i].v0.x, ms.prims[i].v0.y, ms.prims[i].v0.z, ms.prims[i].obj_id };
+            auto range = key_to_all.equal_range(key);
+            for (auto it = range.first; it != range.second; ++it) {
+                ms.prim_remap[i] = it->second;
+                key_to_all.erase(it);  // consume so duplicates get unique mappings
+                break;
+            }
+        }
     }
+}
+
+// Lightweight GPU re-upload: skip BVH rebuild, just memcpy updated triangles.
+// Uses prim_remap to copy transformed data from all_prims into BVH-sorted order,
+// keeping the BVH topology valid (only AABBs are stale — acceptable during drag).
+static void reupload_visible_prims(MeshState& ms)
+{
+    if (ms.all_prims.empty() || !ms.d_prims || ms.prims.empty()) return;
+
+    // Update prims from all_prims using BVH remap (preserves BVH sort order)
+    if (!ms.prim_remap.empty() && ms.prim_remap.size() == ms.prims.size()) {
+        for (int i = 0; i < (int)ms.prims.size(); i++) {
+            int src = ms.prim_remap[i];
+            if (src >= 0 && src < (int)ms.all_prims.size()) {
+                // Copy only geometry (v0-v2, n0-n2) — UVs/tangents/ids stay the same
+                ms.prims[i].v0 = ms.all_prims[src].v0;
+                ms.prims[i].v1 = ms.all_prims[src].v1;
+                ms.prims[i].v2 = ms.all_prims[src].v2;
+                ms.prims[i].n0 = ms.all_prims[src].n0;
+                ms.prims[i].n1 = ms.all_prims[src].n1;
+                ms.prims[i].n2 = ms.all_prims[src].n2;
+            }
+        }
+    } else {
+        // No remap (e.g. first time, or rasterized-only) — direct copy
+        bool any_hidden = false;
+        for (auto& obj : ms.objects)
+            if (obj.hidden) { any_hidden = true; break; }
+
+        if (!any_hidden && ms.prims.size() == ms.all_prims.size()) {
+            ms.prims = ms.all_prims;
+        } else {
+            std::unordered_map<int,bool> hidden_map;
+            for (auto& obj : ms.objects)
+                hidden_map[obj.obj_id] = obj.hidden;
+            ms.prims.clear();
+            ms.prims.reserve(ms.all_prims.size());
+            for (auto& t : ms.all_prims)
+                if (!hidden_map[t.obj_id]) ms.prims.push_back(t);
+        }
+    }
+
+    cudaMemcpyAsync(ms.d_prims, ms.prims.data(),
+                    ms.prims.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
 }
 
 // ─────────────────────────────────────────────
@@ -1369,6 +1464,10 @@ int main() {
 
     float4*      d_accum = pathtracer_alloc_accum(rt_w, rt_h);
 
+    // CUDA software rasterizer state (z-buffer, lazy-allocated on first use)
+    RasterizerState raster_state{};
+    rasterizer_init(raster_state);
+
     // DLSS auxiliary buffers — depth (float) and motion vectors (float2), render-res
     float*  d_depth  = nullptr;  cudaMalloc(&d_depth,  (size_t)rt_w * rt_h * sizeof(float));
     float2* d_motion = nullptr;  cudaMalloc(&d_motion, (size_t)rt_w * rt_h * sizeof(float2));
@@ -1395,6 +1494,7 @@ int main() {
 
     // URDF articulation — persistent handle for interactive joint control
     UrdfArticulation*        urdf_artic_handle = nullptr;
+    RobotDemoState           robot_demo;
 
     HdriMap        hdri;
     DenoiserState  denoiser;
@@ -1586,12 +1686,66 @@ int main() {
                 cam_changed = true;    // reset accumulation
             }
         }
-        // URDF articulation: re-pose geometry when joint sliders change
-        if (articulation_panel_draw(urdf_artic_handle)) {
-            if (urdf_repose(urdf_artic_handle, mesh.all_prims)) {
-                rebuild_visible_bvh(mesh);
+        // URDF articulation: re-pose geometry when joint sliders change.
+        // During interactive drag: fast reupload + BVH refit (all viewport modes).
+        // On slider release: full BVH rebuild for optimal tree quality.
+        {
+            static bool s_artic_was_active = false;
+            bool artic_changed = articulation_panel_draw(urdf_artic_handle, robot_demo.playing) &&
+                                 urdf_repose(urdf_artic_handle, mesh.all_prims);
+            if (artic_changed) {
+                reupload_visible_prims(mesh);
+                // Refit BVH AABBs from updated vertex positions (O(N), no rebuild)
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
                 ++mesh.scene_version;
                 cam_changed = true;
+                s_artic_was_active = true;
+            } else if (s_artic_was_active) {
+                // Sliders stopped — full BVH rebuild for optimal tree quality
+                rebuild_visible_bvh(mesh);
+                cam_changed = true;
+                ++mesh.scene_version;
+                s_artic_was_active = false;
+            }
+        }
+
+        // Robot demo: tick playback + draw panel
+        {
+            float dt = frame_ms * 0.001f;
+            bool demo_changed = robot_demo_tick(robot_demo, urdf_artic_handle, dt);
+            robot_demo_panel_draw(robot_demo, urdf_artic_handle);
+            // Scrub also triggers a pose update
+            demo_changed = demo_changed || robot_demo.scrub_changed;
+            robot_demo.scrub_changed = false;
+
+
+            if (demo_changed && urdf_artic_handle) {
+                urdf_repose(urdf_artic_handle, mesh.all_prims);
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                ++mesh.scene_version;
+                cam_changed = true;
+
+                // Move grasped object to follow end-effector
+                robot_demo_update_grasp(robot_demo, urdf_artic_handle,
+                                        prims_sorted, mesh.objects, mesh.all_prims);
+                if (robot_demo.grasp.active) {
+                    if (!robot_demo.grasp.is_mesh) {
+                        rebuild_bvh(bvh_nodes, prims_sorted, &d_bvh, &d_prims,
+                                    ctrl.selected_sphere,
+                                    ctrl.selected_sphere >= 0
+                                        ? prims_sorted[ctrl.selected_sphere].center
+                                        : make_float3(0,0,0));
+                    } else {
+                        // Mesh moved — re-upload triangles
+                        reupload_visible_prims(mesh);
+                        if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                            bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                        ++mesh.scene_version;
+                    }
+                }
             }
         }
 
@@ -1881,6 +2035,7 @@ int main() {
 
                 // Open URDF articulation handle for interactive joint control
                 if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
+                robot_demo = RobotDemoState{};
                 if (is_urdf_path(ctrl.gltf_path)) {
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                 }
@@ -1897,6 +2052,7 @@ int main() {
                 if (is_urdf_path(ctrl.gltf_path)) {
                     if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
+                    robot_demo = RobotDemoState{};
                 }
             }
         }
@@ -2292,8 +2448,16 @@ int main() {
         // ── ORBIT drag + scroll: arcball (pos rotates around pivot) ──
         // Alt held = temporary orbit override regardless of current mode.
         // Move mode shares the orbit camera — orbit with Alt or when not on gizmo.
+        // Release light drag if mouse is up (unconditional — prevents stuck state).
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            ctrl.dragging_light = -1;
+        // Suppress camera drag when the light HUD or IK gizmo has captured the mouse.
+        static bool s_ik_gizmo_active = false;
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            s_ik_gizmo_active = false;
+        bool light_hud_active = (ctrl.dragging_light >= 0) || s_ik_gizmo_active;
         bool alt_orbit = io.KeyAlt && vp.hovered;
-        if (ctrl.interact_mode == InteractMode::Orbit || alt_orbit) {
+        if ((ctrl.interact_mode == InteractMode::Orbit || alt_orbit) && !light_hud_active) {
             if (vp.lmb_dragging) {
                 float ox = ctrl.pos[0] - ctrl.orbit_pivot[0];
                 float oy = ctrl.pos[1] - ctrl.orbit_pivot[1];
@@ -2380,6 +2544,153 @@ int main() {
                 ctrl.vfov, (float)rt_w / (float)rt_h,
                 ctrl.aperture, ctrl.focus_dist);
             cam_changed = true;
+        }
+
+        // ── IK gizmo: XYZ move gizmo at end-effector for IK dragging ─
+        bool ik_gizmo_consuming = false;
+        if (robot_demo.ik_enabled && robot_demo.recording && urdf_artic_handle &&
+            !robot_demo.playing)
+        {
+            float3 ee = urdf_end_effector_pos(urdf_artic_handle);
+            float ik_aspect = (rt_w > 0 && rt_h > 0) ? (float)rt_w / (float)rt_h : 1.f;
+
+            // Persistent IK target — accumulates gizmo deltas instead of using ee pos.
+            static float3 ik_target = {0, 0, 0};
+            static bool   ik_target_init = false;
+            static int    ik_drag_axis = 0;
+            bool ik_needs_solve = false;
+
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) ik_drag_axis = 0;
+
+            // Sync target to FK ee when not dragging (matches what IK solver sees)
+            if (ik_drag_axis == 0) {
+                ik_target = urdf_fk_ee_pos(urdf_artic_handle);
+                ik_target_init = true;
+            }
+
+            ImVec2 ee_screen;
+            float ee_depth = world_to_screen(cam, ee, vp.origin, vp.size, ctrl.vfov, ik_aspect, ee_screen);
+
+            if (ee_depth > 0.f) {
+                ImDrawList* dl = ImGui::GetForegroundDrawList();
+                const float ARROW_PX = 80.f;
+                const float HIT_PX   = 8.f;
+                const float TIP_PX   = 10.f;
+                const float CENTER_SZ = 9.f;
+
+                float half_h = tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
+                float scale  = ee_depth * 2.f * half_h / vp.size.y * ARROW_PX;
+
+                float3 axis_dir[4]  = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1} };
+                ImU32  axis_col[4]  = { 0,
+                    IM_COL32(255, 100, 100, 255),
+                    IM_COL32(100, 255, 100, 255),
+                    IM_COL32(100, 150, 255, 255) };
+
+                ImVec2 tip[4];
+                for (int i = 1; i <= 3; ++i) {
+                    float3 w = { ee.x + axis_dir[i].x * scale,
+                                 ee.y + axis_dir[i].y * scale,
+                                 ee.z + axis_dir[i].z * scale };
+                    world_to_screen(cam, w, vp.origin, vp.size, ctrl.vfov, ik_aspect, tip[i]);
+                }
+
+                ImVec2 mouse = ImGui::GetIO().MousePos;
+                int hovered = 0;
+                if (ik_drag_axis == 0) {
+                    if (fabsf(mouse.x - ee_screen.x) < CENTER_SZ &&
+                        fabsf(mouse.y - ee_screen.y) < CENTER_SZ)
+                        hovered = 4;
+                    else {
+                        for (int i = 1; i <= 3; ++i) {
+                            if (seg_dist_sq(mouse.x, mouse.y,
+                                ee_screen.x, ee_screen.y, tip[i].x, tip[i].y) < HIT_PX*HIT_PX) {
+                                hovered = i; break;
+                            }
+                        }
+                    }
+                }
+
+                if (hovered > 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    ik_drag_axis = hovered;
+                    s_ik_gizmo_active = true;
+                }
+
+                ik_gizmo_consuming = (ik_drag_axis > 0) && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+                int display = ik_drag_axis > 0 ? ik_drag_axis : hovered;
+
+                // Draw axes
+                for (int i = 1; i <= 3; ++i) {
+                    ImU32 c = (i == display) ? IM_COL32(255, 255, 100, 255) : axis_col[i];
+                    dl->AddLine(ee_screen, tip[i], c, 2.5f);
+                    float ax = tip[i].x - ee_screen.x, ay = tip[i].y - ee_screen.y;
+                    float len = sqrtf(ax*ax + ay*ay);
+                    if (len > 0.f) {
+                        ax /= len; ay /= len;
+                        float px = -ay, py = ax;
+                        dl->AddTriangleFilled(
+                            tip[i],
+                            { tip[i].x - ax*TIP_PX + px*(TIP_PX*0.4f), tip[i].y - ay*TIP_PX + py*(TIP_PX*0.4f) },
+                            { tip[i].x - ax*TIP_PX - px*(TIP_PX*0.4f), tip[i].y - ay*TIP_PX - py*(TIP_PX*0.4f) },
+                            c);
+                    }
+                }
+                // Center diamond
+                ImU32 cc = (display == 4) ? IM_COL32(255, 255, 100, 255) : IM_COL32(255, 200, 100, 220);
+                ImVec2 diamond[4] = {
+                    { ee_screen.x, ee_screen.y - CENTER_SZ },
+                    { ee_screen.x + CENTER_SZ, ee_screen.y },
+                    { ee_screen.x, ee_screen.y + CENTER_SZ },
+                    { ee_screen.x - CENTER_SZ, ee_screen.y }
+                };
+                dl->AddConvexPolyFilled(diamond, 4, cc);
+                dl->AddPolyline(diamond, 4, IM_COL32(255, 255, 255, 150), ImDrawFlags_Closed, 1.5f);
+                dl->AddText({ ee_screen.x + CENTER_SZ + 4.f, ee_screen.y - 6.f },
+                            IM_COL32(255, 200, 100, 220), "IK");
+
+                // Apply drag: accumulate delta onto ik_target, then solve IK to target
+                ImVec2 delta = ImGui::GetIO().MouseDelta;
+                if (ik_drag_axis > 0 && (delta.x != 0.f || delta.y != 0.f)) {
+                    float wpp = scale / ARROW_PX;
+                    float3 world_delta = {0, 0, 0};
+
+                    if (ik_drag_axis == 4) {
+                        // Camera-space translate
+                        world_delta = {
+                            (cam.u.x * delta.x - cam.v.x * delta.y) * wpp,
+                            (cam.u.y * delta.x - cam.v.y * delta.y) * wpp,
+                            (cam.u.z * delta.x - cam.v.z * delta.y) * wpp };
+                    } else {
+                        float3 ad = axis_dir[ik_drag_axis];
+                        float sax = tip[ik_drag_axis].x - ee_screen.x;
+                        float say = tip[ik_drag_axis].y - ee_screen.y;
+                        float slen = sqrtf(sax*sax + say*say);
+                        if (slen > 0.f) {
+                            float proj = (delta.x * sax + delta.y * say) / slen;
+                            float move = proj * wpp;
+                            world_delta = { ad.x * move, ad.y * move, ad.z * move };
+                        }
+                    }
+
+                    // Accumulate onto the persistent target (NOT the ee position)
+                    ik_target.x += world_delta.x;
+                    ik_target.y += world_delta.y;
+                    ik_target.z += world_delta.z;
+
+                    ik_needs_solve = true;
+                }
+            }
+
+            // Solve IK
+            if (ik_needs_solve) {
+                urdf_solve_ik(urdf_artic_handle, ik_target);
+                urdf_repose(urdf_artic_handle, mesh.all_prims);
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                ++mesh.scene_version;
+                cam_changed = true;
+            }
         }
 
         // ── Gizmo (Move mode, sphere selected) ───────────────────────
@@ -2563,10 +2874,21 @@ int main() {
             }
 
             if (any_change) {
-                // Full clean BVH rebuild every frame during drag.
-                // This is correct and doesn't accumulate stale AABBs.
-                rebuild_visible_bvh(mesh);
+                if (ctrl.viewport_pass == (int)ViewportPassMode::Rasterized) {
+                    // Rasterized: no BVH needed, just re-upload triangles (fast)
+                    reupload_visible_prims(mesh);
+                } else {
+                    // Solid/Beauty: need valid BVH for ray casting
+                    rebuild_visible_bvh(mesh);
+                }
                 mesh_moved = true; cam_changed = true;
+                ++mesh.scene_version;
+            }
+
+            // Full BVH rebuild on mouse release (ensures clean state when switching modes)
+            if (drag_released) {
+                rebuild_visible_bvh(mesh);
+                cam_changed = true;
                 ++mesh.scene_version;
             }
         }
@@ -2695,6 +3017,152 @@ int main() {
                     dl->AddLine({ps.x - R, ps.y}, {ps.x + R, ps.y}, IM_COL32(100, 200, 255, 180), 1.f);
                     dl->AddLine({ps.x, ps.y - R}, {ps.x, ps.y + R}, IM_COL32(100, 200, 255, 180), 1.f);
                 }
+            }
+            // ── Viewport lights HUD (Solid/Rasterized only) ─────────────
+            if (ctrl.overlay_lights &&
+                (ctrl.viewport_pass == (int)ViewportPassMode::Solid ||
+                 ctrl.viewport_pass == (int)ViewportPassMode::Rasterized))
+            {
+                // Draw a 2D hemisphere diagram in the bottom-right corner
+                // showing where each light is relative to the camera.
+                // Camera looks into the diagram center; lights are dots on the dome.
+                const float HUD_R  = 60.f;  // hemisphere radius in pixels
+                const float PAD    = 20.f;
+                const float PI_F   = 3.14159265f;
+                ImVec2 center = { vp.origin.x + vp.size.x - HUD_R - PAD,
+                                  vp.origin.y + vp.size.y - HUD_R - PAD };
+
+                // Background circle (hemisphere dome outline)
+                dl->AddCircleFilled(center, HUD_R + 2.f, IM_COL32(0, 0, 0, 100), 32);
+                dl->AddCircle(center, HUD_R, IM_COL32(255, 255, 255, 80), 32, 1.f);
+                // Crosshair at center (camera look direction)
+                dl->AddLine({ center.x - 6.f, center.y }, { center.x + 6.f, center.y },
+                            IM_COL32(255, 255, 255, 60), 1.f);
+                dl->AddLine({ center.x, center.y - 6.f }, { center.x, center.y + 6.f },
+                            IM_COL32(255, 255, 255, 60), 1.f);
+
+                // Light directions from control panel offsets (same formula as shading)
+                auto norm3 = [](float3 v) -> float3 {
+                    float l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+                    if (l < 1e-7f) return make_float3(0.f, 0.f, 1.f);
+                    return make_float3(v.x/l, v.y/l, v.z/l);
+                };
+                float3 key_dir  = norm3(cam.w + cam.u * ctrl.light_key_u  + cam.v * ctrl.light_key_v);
+                float3 fill_dir = norm3(cam.w + cam.u * ctrl.light_fill_u + cam.v * ctrl.light_fill_v);
+                float3 rim_dir  = norm3(cam.w * -1.f + cam.u * ctrl.light_rim_u + cam.v * ctrl.light_rim_v);
+
+                // Project direction onto HUD disc: returns screen position
+                auto dir_to_disc = [&](float3 dir) -> ImVec2 {
+                    float hx = dot(dir, cam.u);
+                    float hy = -dot(dir, cam.v);  // screen Y is flipped
+                    float hz = -dot(dir, cam.w);   // positive = in front of camera
+                    float angle = atan2f(hy, hx);
+                    float r = acosf(fmaxf(-1.f, fminf(1.f, hz))) / PI_F;
+                    return { center.x + cosf(angle) * r * HUD_R,
+                             center.y + sinf(angle) * r * HUD_R };
+                };
+
+                struct LightHUD { float3 dir; ImU32 col; const char* label; float size; int idx; };
+                LightHUD lights[3] = {
+                    { key_dir,  IM_COL32(255, 220, 100, 255), "Key",  9.f, 0 },
+                    { fill_dir, IM_COL32(100, 150, 255, 240), "Fill", 7.f, 1 },
+                    { rim_dir,  IM_COL32(220, 220, 220, 220), "Rim",  6.f, 2 },
+                };
+
+                ImVec2 mp = ImGui::GetMousePos();
+
+                // Handle drag interaction — only pick up clicks inside the HUD disc
+                float hud_dx = mp.x - center.x, hud_dy = mp.y - center.y;
+                bool mouse_in_hud = (hud_dx*hud_dx + hud_dy*hud_dy) <= (HUD_R + 12.f) * (HUD_R + 12.f);
+
+                if (mouse_in_hud && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    // Check if click is on any light dot
+                    for (auto& lv : lights) {
+                        ImVec2 dp = dir_to_disc(lv.dir);
+                        float ddx = mp.x - dp.x, ddy = mp.y - dp.y;
+                        if (ddx*ddx + ddy*ddy <= (lv.size + 4.f) * (lv.size + 4.f)) {
+                            ctrl.dragging_light = lv.idx;
+                            break;
+                        }
+                    }
+                }
+
+                if (ctrl.dragging_light >= 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.f)) {
+                    // Convert mouse position on disc back to light u,v offsets
+                    float dx = (mp.x - center.x) / HUD_R;
+                    float dy = (mp.y - center.y) / HUD_R;
+                    float disc_r = sqrtf(dx*dx + dy*dy);
+                    if (disc_r > 0.95f) { // clamp to disc edge
+                        dx *= 0.95f / disc_r;
+                        dy *= 0.95f / disc_r;
+                        disc_r = 0.95f;
+                    }
+
+                    // Clamp disc_r per light type to stay in valid hemisphere
+                    // Key/Fill live in back hemisphere (disc_r > 0.5), Rim in front (disc_r < 0.5)
+                    bool is_rim = (ctrl.dragging_light == 2);
+                    if (!is_rim) disc_r = fmaxf(disc_r, 0.55f);  // keep behind camera
+                    else         disc_r = fminf(disc_r, 0.45f);   // keep in front of camera
+
+                    float theta = disc_r * PI_F;
+                    float angle = atan2f(dy, dx);
+                    float sin_t = sinf(theta), cos_t = cosf(theta);
+
+                    // Recover u,v offsets from disc position using correct inverse:
+                    // Key/Fill (w=+1): u = -sin/cos * cos(angle), v = sin/cos * sin(angle)
+                    // Rim     (w=-1): u =  sin/cos * cos(angle), v = -sin/cos * sin(angle)
+                    float tan_t = (fabsf(cos_t) > 0.01f) ? sin_t / cos_t : (cos_t < 0.f ? -100.f : 100.f);
+                    // Clamp to keep offsets reasonable
+                    tan_t = fmaxf(-5.f, fminf(5.f, tan_t));
+
+                    if (ctrl.dragging_light == 0) { // Key
+                        ctrl.light_key_u  = -tan_t * cosf(angle);
+                        ctrl.light_key_v  =  tan_t * sinf(angle);
+                    } else if (ctrl.dragging_light == 1) { // Fill
+                        ctrl.light_fill_u = -tan_t * cosf(angle);
+                        ctrl.light_fill_v =  tan_t * sinf(angle);
+                    } else { // Rim
+                        ctrl.light_rim_u  =  tan_t * cosf(angle);
+                        ctrl.light_rim_v  = -tan_t * sinf(angle);
+                    }
+
+                    // Recompute dragged light direction for immediate visual feedback
+                    if (ctrl.dragging_light == 0)
+                        lights[0].dir = norm3(cam.w + cam.u * ctrl.light_key_u + cam.v * ctrl.light_key_v);
+                    else if (ctrl.dragging_light == 1)
+                        lights[1].dir = norm3(cam.w + cam.u * ctrl.light_fill_u + cam.v * ctrl.light_fill_v);
+                    else
+                        lights[2].dir = norm3(cam.w * -1.f + cam.u * ctrl.light_rim_u + cam.v * ctrl.light_rim_v);
+                }
+
+                // Draw light dots
+                for (auto& lv : lights) {
+                    ImVec2 dp = dir_to_disc(lv.dir);
+
+                    // Highlight when hovered or being dragged
+                    float draw_size = lv.size;
+                    ImU32 draw_col = lv.col;
+                    float mdx = mp.x - dp.x, mdy = mp.y - dp.y;
+                    bool hovered = (mdx*mdx + mdy*mdy <= (lv.size + 4.f) * (lv.size + 4.f));
+                    if (hovered || ctrl.dragging_light == lv.idx) {
+                        draw_size += 2.f;
+                        draw_col = (draw_col & 0x00FFFFFFu) | 0xFF000000u;
+                    }
+
+                    // Line from center to light
+                    dl->AddLine(center, dp, (lv.col & 0x00FFFFFFu) | 0x50000000u, 1.f);
+
+                    // Light dot
+                    dl->AddCircleFilled(dp, draw_size, draw_col, 12);
+                    dl->AddCircle(dp, draw_size, IM_COL32(255, 255, 255, 120), 12, 1.f);
+
+                    // Label
+                    dl->AddText({ dp.x + draw_size + 3.f, dp.y - 6.f }, lv.col, lv.label);
+                }
+
+                // "CAM" label at center
+                dl->AddText({ center.x - 10.f, center.y + 8.f },
+                            IM_COL32(255, 255, 255, 100), "CAM");
             }
             // ── NIM VLM result overlay (bottom-left of viewport) ─────────
             if (ctrl.overlay_nim && ctrl.nim_result.success && ctrl.nim_result.object_type[0] != '\0') {
@@ -2967,10 +3435,16 @@ int main() {
         bool use_restir = ctrl.restir_enabled && mesh.num_emissive > 0 && mesh.d_bvh;
         bool use_optix_rt = ctrl.optix_rt_enabled && optix_rt.available && optix_rt.scene_ready;
 
+        // Solid/Rasterized modes write directly to the surface — skip pathtracer entirely.
+        bool skip_pathtracer = (ctrl.viewport_pass == (int)ViewportPassMode::Solid ||
+                                ctrl.viewport_pass == (int)ViewportPassMode::Rasterized);
+
         // CUPTI: start profiling pass when checkbox is enabled
         if (arch_state.profiling_enabled && arch_state.cupti_available)
             safe_cupti_begin_frame(cupti_profiler);
-        if (use_restir) {
+        if (skip_pathtracer) {
+            // No-op: Solid/Rasterized kernels run in the viewport pass switch below.
+        } else if (use_restir) {
             // Lazy-alloc reservoirs if not yet done (first frame or after resize w/o viewport event)
             if (!mesh.d_reservoirs) {
                 mesh.d_reservoirs  = restir_alloc_reservoirs(render_w, render_h);
@@ -3062,7 +3536,8 @@ int main() {
             arch_state.has_unit_counters = false;
         }
 
-        ++frame_count;
+        if (!skip_pathtracer)
+            ++frame_count;
 
         // ── Save Render (EXR — with or without tonemapping) ─────────
         if (ctrl.save_exr_requested) {
@@ -3354,6 +3829,16 @@ int main() {
             if (need_motion)
                 motion_maxmag = pathtracer_motion_maxmag(d_motion, render_w * render_h);
 
+            // Compute world-space 3-point light directions from control panel offsets
+            auto normalize3 = [](float3 v) -> float3 {
+                float l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+                if (l < 1e-7f) return make_float3(0.f, 0.f, 1.f);
+                return make_float3(v.x/l, v.y/l, v.z/l);
+            };
+            float3 light_key_dir  = normalize3(cam.w + cam.u * ctrl.light_key_u  + cam.v * ctrl.light_key_v);
+            float3 light_fill_dir = normalize3(cam.w + cam.u * ctrl.light_fill_u + cam.v * ctrl.light_fill_v);
+            float3 light_rim_dir  = normalize3(cam.w * -1.f + cam.u * ctrl.light_rim_u + cam.v * ctrl.light_rim_v);
+
             switch ((ViewportPassMode)ctrl.viewport_pass) {
 
             case ViewportPassMode::RawRender:
@@ -3465,6 +3950,28 @@ int main() {
                     mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
                     mesh.d_obj_colors, mesh.num_obj_colors,
                     5, interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::Solid:
+                pathtracer_solid_shade(render_w, render_h, cam,
+                    d_bvh, d_prims, (int)prims_sorted.size(),
+                    mesh.d_bvh, mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    ctrl.color_mode,
+                    make_float3(ctrl.bg_color[0], ctrl.bg_color[1], ctrl.bg_color[2]),
+                    light_key_dir, light_fill_dir, light_rim_dir,
+                    interop.surface, rt_w, rt_h);
+                break;
+
+            case ViewportPassMode::Rasterized:
+                rasterizer_render(raster_state, interop.surface, rt_w, rt_h, cam,
+                    mesh.d_prims, (int)mesh.prims.size(),
+                    mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                    mesh.d_obj_colors, mesh.num_obj_colors,
+                    ctrl.color_mode,
+                    make_float3(ctrl.bg_color[0], ctrl.bg_color[1], ctrl.bg_color[2]),
+                    light_key_dir, light_fill_dir, light_rim_dir);
                 break;
 
             case ViewportPassMode::Final:
@@ -3646,6 +4153,7 @@ int main() {
     mesh.free_gpu();
     cudaFree(d_accum); cudaFree(d_display);
     cudaFree(d_depth); cudaFree(d_motion);
+    rasterizer_destroy(raster_state);
     cudaFree(d_bvh); cudaFree(d_prims);
     cuda_interop_destroy(vk.device, interop);
     if (hydra_preview_ready)

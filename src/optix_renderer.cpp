@@ -36,6 +36,9 @@ struct OptixLaunchParams {
     cudaTextureObject_t hdri_tex;
     float               hdri_intensity;
     float               hdri_yaw;
+    float               hdri_bg_blur;
+    float               hdri_bg_opacity;
+    float3              bg_color;
     float               firefly_clamp;
     OptixTraversableHandle traversable;
 };
@@ -469,6 +472,9 @@ bool optix_renderer_render(OptixRendererState& s, const PathTracerParams& p, cud
     launch.hdri_tex = p.hdri_tex;
     launch.hdri_intensity = p.hdri_intensity;
     launch.hdri_yaw = p.hdri_yaw;
+    launch.hdri_bg_blur = p.hdri_bg_blur;
+    launch.hdri_bg_opacity = p.hdri_bg_opacity;
+    launch.bg_color = p.bg_color;
     launch.firefly_clamp = p.firefly_clamp;
     launch.traversable = static_cast<OptixTraversableHandle>(s.gas_handle);
 

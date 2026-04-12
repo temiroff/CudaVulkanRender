@@ -2,7 +2,7 @@
 #include <imgui.h>
 #include <cmath>
 
-bool articulation_panel_draw(UrdfArticulation* handle)
+bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active)
 {
     if (!ImGui::Begin("Articulation")) { ImGui::End(); return false; }
 
@@ -15,6 +15,8 @@ bool articulation_panel_draw(UrdfArticulation* handle)
     bool changed = false;
     int n = urdf_joint_count(handle);
     UrdfJointInfo* joints = urdf_joint_info(handle);
+
+    if (playback_active) ImGui::BeginDisabled();
 
     if (ImGui::Button("Reset All")) {
         for (int i = 0; i < n; ++i) joints[i].angle = 0.0f;
@@ -66,6 +68,8 @@ bool articulation_panel_draw(UrdfArticulation* handle)
         if (i < n - 1) ImGui::Spacing();
         ImGui::PopID();
     }
+
+    if (playback_active) ImGui::EndDisabled();
 
     ImGui::End();
     return changed;

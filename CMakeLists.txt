@@ -188,6 +188,7 @@ add_executable(pathtracer
     src/bvh.cu
     src/gpu_textures.cu
     src/restir.cu
+    src/rasterizer.cu
     src/hdri.cpp
     src/denoiser.cpp
     src/gltf_loader.cpp
@@ -213,6 +214,7 @@ add_executable(pathtracer
     src/ui/material_panel.cpp
     src/ui/anim_panel.cpp
     src/ui/articulation_panel.cpp
+    src/ui/robot_demo_panel.cpp
     src/ui/hydra_preview.cpp
     ${IMGUI_SOURCES}
     ${IMGUI_SOURCES_OPENGL3}
@@ -245,7 +247,7 @@ target_link_libraries(pathtracer PRIVATE
     CUDA::cuda_driver
     CUDA::nvml
     CUDA::nvrtc
-    ole32 shell32 uuid winhttp
+    ole32 shell32 uuid winhttp comdlg32
     # OpenUSD ??? core libs needed for geometry + shading traversal
     usd_tf usd_arch usd_vt usd_gf usd_js usd_plug usd_trace
     usd_work usd_sdf usd_pcp usd_usd usd_ar
