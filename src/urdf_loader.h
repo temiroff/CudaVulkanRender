@@ -46,6 +46,18 @@ float3 urdf_end_effector_pos(UrdfArticulation* h);
 bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
                    int max_iters = 10, float tolerance = 0.005f);
 
+// Solve IK for a specific joint in the chain (not the ee).
+// Only adjusts joints [0..joint_idx) to bring joint_idx toward target_pos.
+// joint_idx: 0-based movable joint index (e.g. 2 = 3rd movable joint).
+bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
+                         int max_iters = 6, float tolerance = 0.005f);
+
+// Get the world-space position of the Nth movable joint (0-based).
+float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx);
+
+// Get the number of movable joints in the IK chain.
+int urdf_ik_chain_length(UrdfArticulation* h);
+
 // Compute end-effector position via forward kinematics (from current joint angles).
 // Unlike urdf_end_effector_pos which returns a cached mesh centroid, this computes
 // the FK chain tip directly — consistent with what the IK solver uses internally.

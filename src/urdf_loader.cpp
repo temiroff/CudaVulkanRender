@@ -1284,6 +1284,44 @@ float3 urdf_fk_ee_pos(UrdfArticulation* h)
     return ik_forward(h, chain, jp, ja);
 }
 
+// Helper: map movable joint indices from chain
+static void ik_movable_indices(UrdfArticulation* h,
+                               const std::vector<IKChainEntry>& chain,
+                               std::vector<int>& movable)
+{
+    movable.clear();
+    UrdfJointInfo* joints = h->joint_infos.data();
+    for (int ci = 0; ci < (int)chain.size(); ci++)
+        if (chain[ci].ji >= 0 && (joints[chain[ci].ji].type == 0 || joints[chain[ci].ji].type == 2))
+            movable.push_back(ci);
+}
+
+int urdf_ik_chain_length(UrdfArticulation* h)
+{
+    if (!h) return 0;
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain)) return 0;
+    std::vector<int> movable;
+    ik_movable_indices(h, chain, movable);
+    return (int)movable.size();
+}
+
+float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx)
+{
+    if (!h) return make_float3(0, 0, 0);
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty())
+        return make_float3(0, 0, 0);
+    std::vector<int> movable;
+    ik_movable_indices(h, chain, movable);
+    if (joint_idx < 0 || joint_idx >= (int)movable.size())
+        return make_float3(0, 0, 0);
+    std::vector<float3> jp, ja;
+    ik_forward(h, chain, jp, ja);
+    return jp[movable[joint_idx]];
+}
+
+
 
 // CCD helper: compute the rotation angle for one joint to bring 'current' toward 'target'
 // around the joint's axis. Returns the signed angle (already damped).
@@ -1361,6 +1399,50 @@ bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
 
     float3 ee = ik_forward(h, chain, jpos, jaxis);
     float3 diff = make_float3(target_pos.x - ee.x, target_pos.y - ee.y, target_pos.z - ee.z);
+    return sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z) < tolerance;
+}
+
+bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
+                         int max_iters, float tolerance)
+{
+    if (!h) return false;
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty()) return false;
+
+    std::vector<int> movable;
+    ik_movable_indices(h, chain, movable);
+    if (joint_idx < 1 || joint_idx >= (int)movable.size()) return false;
+
+    UrdfJointInfo* joints = h->joint_infos.data();
+    const float PI = 3.14159265f;
+    std::vector<float3> jpos, jaxis;
+
+    int target_ci = movable[joint_idx];
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        ik_forward(h, chain, jpos, jaxis);
+        float3 cur = jpos[target_ci];
+
+        float3 diff = make_float3(target_pos.x - cur.x, target_pos.y - cur.y, target_pos.z - cur.z);
+        float dist = sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
+        if (dist < tolerance) return true;
+
+        // CCD on joints [0..joint_idx) only
+        for (int mi = joint_idx - 1; mi >= 0; mi--) {
+            int ci = movable[mi];
+            UrdfJointInfo& info = joints[chain[ci].ji];
+
+            ik_forward(h, chain, jpos, jaxis);
+            float a = ccd_angle_for_joint(jpos[ci], jaxis[ci],
+                                          jpos[target_ci], target_pos, 0.5f);
+            info.angle += a;
+            clamp_joint(info, PI);
+        }
+    }
+
+    ik_forward(h, chain, jpos, jaxis);
+    float3 cur = jpos[target_ci];
+    float3 diff = make_float3(target_pos.x - cur.x, target_pos.y - cur.y, target_pos.z - cur.z);
     return sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z) < tolerance;
 }
 

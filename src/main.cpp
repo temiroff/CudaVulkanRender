@@ -2681,8 +2681,81 @@ int main() {
                 }
             }
 
-            // Solve IK
-            if (ik_needs_solve) {
+            // ── Chain grab points (one per movable joint, except first/last) ─
+            static int grab_dragging = -1;  // which joint index is being dragged
+            static float3 grab_target = {0,0,0};
+            bool grab_needs_solve = false;
+
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) grab_dragging = -1;
+
+            int chain_len = urdf_ik_chain_length(urdf_artic_handle);
+
+            if (chain_len >= 3 && ik_drag_axis == 0) {
+                ImDrawList* dl = ImGui::GetForegroundDrawList();
+                ImVec2 mouse = ImGui::GetIO().MousePos;
+
+                // Draw grab points for joints 1 .. chain_len-2
+                for (int ji = 1; ji < chain_len - 1; ji++) {
+                    float3 jpos = urdf_joint_pos(urdf_artic_handle, ji);
+                    ImVec2 js;
+                    float jd = world_to_screen(cam, jpos, vp.origin, vp.size,
+                                               ctrl.vfov, ik_aspect, js);
+                    if (jd <= 0.f) continue;
+
+                    const float R = 6.f;
+                    float dx = mouse.x - js.x, dy = mouse.y - js.y;
+                    bool hov = (dx*dx + dy*dy) <= (R + 5.f) * (R + 5.f);
+                    bool active = (grab_dragging == ji);
+
+                    if (hov && grab_dragging < 0 && !ik_gizmo_consuming &&
+                        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        grab_dragging = ji;
+                        grab_target = jpos;
+                        s_ik_gizmo_active = true;
+                    }
+                    if (active) ik_gizmo_consuming = true;
+
+                    // Color gradient along chain: blue at base → cyan at tip
+                    float t = (float)ji / (float)(chain_len - 1);
+                    int r = (int)(80 + 50 * t), g = (int)(150 + 80 * t), b = 230;
+                    ImU32 col = active ? IM_COL32(100, 240, 255, 255)
+                              : hov   ? IM_COL32(120, 220, 255, 240)
+                                      : IM_COL32(r, g, b, 180);
+
+                    dl->AddCircleFilled(js, R, col, 10);
+                    dl->AddCircle(js, R, IM_COL32(255, 255, 255, 140), 10, 1.f);
+
+                    // Drag
+                    if (active) {
+                        ImVec2 delta = ImGui::GetIO().MouseDelta;
+                        if (delta.x != 0.f || delta.y != 0.f) {
+                            float half_h = tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
+                            float wpp = jd * 2.f * half_h / vp.size.y;
+                            grab_target.x += (cam.u.x * delta.x - cam.v.x * delta.y) * wpp;
+                            grab_target.y += (cam.u.y * delta.x - cam.v.y * delta.y) * wpp;
+                            grab_target.z += (cam.u.z * delta.x - cam.v.z * delta.y) * wpp;
+                            grab_needs_solve = true;
+                        }
+
+                        // Target line
+                        ImVec2 ts;
+                        if (world_to_screen(cam, grab_target, vp.origin, vp.size,
+                                            ctrl.vfov, ik_aspect, ts) > 0.f)
+                            dl->AddLine(js, ts, IM_COL32(100, 240, 255, 100), 1.f);
+                    }
+                }
+            }
+
+            // Solve: grab point takes priority over ee gizmo
+            if (grab_needs_solve && grab_dragging >= 1) {
+                urdf_solve_ik_joint(urdf_artic_handle, grab_dragging, grab_target);
+                urdf_repose(urdf_artic_handle, mesh.all_prims);
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                ++mesh.scene_version;
+                cam_changed = true;
+            } else if (ik_needs_solve) {
                 urdf_solve_ik(urdf_artic_handle, ik_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
