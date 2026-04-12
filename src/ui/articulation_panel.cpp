@@ -1,14 +1,13 @@
 #include "articulation_panel.h"
 #include <imgui.h>
 #include <cmath>
-#include <algorithm>
 
 bool articulation_panel_draw(UrdfArticulation* handle)
 {
     if (!ImGui::Begin("Articulation")) { ImGui::End(); return false; }
 
     if (!handle || urdf_joint_count(handle) == 0) {
-        ImGui::TextDisabled("No URDF loaded — load a .urdf file to articulate joints.");
+        ImGui::TextDisabled("No URDF loaded");
         ImGui::End();
         return false;
     }
@@ -28,43 +27,43 @@ bool articulation_panel_draw(UrdfArticulation* handle)
         UrdfJointInfo& j = joints[i];
         ImGui::PushID(i);
 
+        // Joint name as label
+        ImGui::Text("%s", j.name);
+
+        // Reset button on same line, right-aligned
+        float btn_w = 24.f;
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - btn_w + ImGui::GetCursorPosX());
+        if (ImGui::SmallButton("R")) { j.angle = 0; changed = true; }
+
         if (j.type == 0 || j.type == 2) {
-            // Revolute / continuous — show in degrees, store in radians
             float deg = j.angle * (180.0f / 3.14159265f);
             float lo_deg = j.lower * (180.0f / 3.14159265f);
             float hi_deg = j.upper * (180.0f / 3.14159265f);
-
             if (j.type == 2) { lo_deg = -360.0f; hi_deg = 360.0f; }
-
-            // Snap to zero when very close
             if (fabsf(deg) < 0.5f) deg = 0.0f;
 
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-            if (ImGui::SliderFloat(j.name, &deg, lo_deg, hi_deg, "%.1f")) {
-                // Snap to zero in a small dead zone
+            ImGui::SetNextItemWidth(-1.f);
+            if (ImGui::SliderFloat("##slider", &deg, lo_deg, hi_deg, "%.1f deg")) {
                 if (fabsf(deg) < 0.5f) deg = 0.0f;
                 j.angle = deg * (3.14159265f / 180.0f);
                 changed = true;
             }
-            // Double-click to type exact value
-            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
         }
         else if (j.type == 1) {
-            // Prismatic — show in mm, store in meters
             float mm = j.angle * 1000.0f;
             float lo = j.lower * 1000.0f;
             float hi = j.upper * 1000.0f;
-
             if (fabsf(mm) < 0.1f) mm = 0.0f;
 
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-            if (ImGui::SliderFloat(j.name, &mm, lo, hi, "%.1f mm")) {
+            ImGui::SetNextItemWidth(-1.f);
+            if (ImGui::SliderFloat("##slider", &mm, lo, hi, "%.1f mm")) {
                 if (fabsf(mm) < 0.1f) mm = 0.0f;
                 j.angle = mm * 0.001f;
                 changed = true;
             }
         }
 
+        if (i < n - 1) ImGui::Spacing();
         ImGui::PopID();
     }
 

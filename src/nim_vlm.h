@@ -7,8 +7,9 @@
 // The NIM container is started with:
 //   docker run -it --gpus all -p 8000:8000 nvcr.io/nim/<model>
 // Typical models: microsoft/phi-3.5-vision-instruct
-//                 meta/llama-3.2-11b-vision-instruct
-//                 nvidia/llava-v1.6-34b
+//                 meta/llama-3.2-90b-vision-instruct
+//                 nvidia/nemotron-nano-12b-v2-vl
+//                 nvidia/llama-3.1-nemotron-nano-vl-8b-v1
 
 struct NimVlmConfig {
     // ── Endpoint ──────────────────────────────────────────────────────────────

@@ -981,12 +981,6 @@ __global__ void visualize_motion_kernel(const float2* motion, int src_w, int src
     float r = 0.f, g = 0.f, b = 0.f;
     if (mag_px > 0.001f && max_mag > 0.001f) {
         float norm = fminf(1.f, mag_px / max_mag);           // normalised [0..1]
-        const float dead_zone = 0.03f;                       // suppress tiny shimmer
-        if (norm <= dead_zone) {
-            surf2Dwrite(make_float4(0.f, 0.f, 0.f, 1.f), surf, dx * (int)sizeof(float4), dy);
-            return;
-        }
-        norm = (norm - dead_zone) / (1.f - dead_zone);
         float mag_v = powf(norm, 0.65f);                     // perceptual boost for mid motion
         float sat   = 0.90f;
         float angle = atan2f(-px_y, px_x);                   // screen-space: +Y down

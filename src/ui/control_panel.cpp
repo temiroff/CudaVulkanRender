@@ -189,6 +189,19 @@ bool control_panel_draw(ControlPanelState& s) {
     if (ImGui::RadioButton("Orbit", s.interact_mode == InteractMode::Orbit))
         s.interact_mode = InteractMode::Orbit;
 
+    if (s.interact_mode == InteractMode::Move) {
+        ImGui::Text("Gizmo:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("W Translate", s.gizmo_mode == GizmoMode::Translate))
+            s.gizmo_mode = GizmoMode::Translate;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("E Rotate", s.gizmo_mode == GizmoMode::Rotate))
+            s.gizmo_mode = GizmoMode::Rotate;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("R Scale", s.gizmo_mode == GizmoMode::Scale))
+            s.gizmo_mode = GizmoMode::Scale;
+    }
+
     ImGui::Separator();
 
     // ?????? Camera ??????????????????????????????????????????????????????????????????????????????????????????
@@ -280,12 +293,21 @@ bool control_panel_draw(ControlPanelState& s) {
 
         float btn_w = ImGui::GetContentRegionAvail().x;
 
-        // Big browse button
+        // Browse button — replaces entire scene
         if (ImGui::Button("Browse...", ImVec2(btn_w, 32.f))) {
             std::string picked = open_gltf_picker();
             if (!picked.empty()) {
                 strncpy_s(s.gltf_path, sizeof(s.gltf_path), picked.c_str(), _TRUNCATE);
                 s.load_gltf_requested = true;
+            }
+        }
+
+        // Import button — adds to existing scene
+        if (ImGui::Button("Import into Scene...", ImVec2(btn_w, 28.f))) {
+            std::string picked = open_gltf_picker();
+            if (!picked.empty()) {
+                strncpy_s(s.gltf_path, sizeof(s.gltf_path), picked.c_str(), _TRUNCATE);
+                s.import_requested = true;
             }
         }
 

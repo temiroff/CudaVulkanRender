@@ -366,7 +366,7 @@ static float seg_dist_sq(float px, float py,
     return ex*ex + ey*ey;
 }
 
-// Draw XYZ translate gizmo. Returns active axis (1=X,2=Y,3=Z, 0=none).
+// Draw XYZ translate gizmo. Returns active axis (1=X,2=Y,3=Z, 4=center/camera-space, 0=none).
 // out_delta: world-space movement to apply this frame.
 static int draw_move_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
                             float vfov, float aspect,
@@ -378,24 +378,23 @@ static int draw_move_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
 
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) drag_axis = 0;
 
-    ImVec2 cs; // center screen pos
+    ImVec2 cs;
     float depth = world_to_screen(cam, center, vp_origin, vp_size, vfov, aspect, cs);
     if (depth <= 0.f) return 0;
 
-    // Gizmo arrow length in screen pixels
     const float ARROW_PX = 80.f;
     const float HIT_PX   = 8.f;
     const float TIP_PX   = 10.f;
+    const float CENTER_SZ = 7.f;
 
-    // World-space scale so arrow = ARROW_PX screen pixels
     float half_h = tanf(vfov * 0.5f * 3.14159265f / 180.f);
     float scale  = depth * 2.f * half_h / vp_size.y * ARROW_PX;
 
     float3 axis_dir[4]  = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1} };
     ImU32  axis_col[4]  = { 0,
-        IM_COL32(220, 60,  60, 255),   // X red
-        IM_COL32( 60,200,  60, 255),   // Y green
-        IM_COL32( 60,120, 220, 255) }; // Z blue
+        IM_COL32(220, 60,  60, 255),
+        IM_COL32( 60,200,  60, 255),
+        IM_COL32( 60,120, 220, 255) };
 
     ImVec2 tip[4];
     for (int i = 1; i <= 3; ++i) {
@@ -406,14 +405,18 @@ static int draw_move_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
         world_to_screen(cam, w, vp_origin, vp_size, vfov, aspect, tip[i]);
     }
 
-    // Hover detection (only when not dragging)
     ImVec2 mouse = ImGui::GetIO().MousePos;
     int hovered = 0;
     if (drag_axis == 0) {
-        for (int i = 1; i <= 3; ++i) {
-            if (seg_dist_sq(mouse.x, mouse.y,
-                            cs.x, cs.y, tip[i].x, tip[i].y) < HIT_PX*HIT_PX) {
-                hovered = i; break;
+        // Check center square first
+        if (fabsf(mouse.x - cs.x) < CENTER_SZ && fabsf(mouse.y - cs.y) < CENTER_SZ)
+            hovered = 4;
+        else {
+            for (int i = 1; i <= 3; ++i) {
+                if (seg_dist_sq(mouse.x, mouse.y,
+                    cs.x, cs.y, tip[i].x, tip[i].y) < HIT_PX*HIT_PX) {
+                    hovered = i; break;
+                }
             }
         }
     }
@@ -423,11 +426,10 @@ static int draw_move_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
 
     int display = drag_axis > 0 ? drag_axis : hovered;
 
-    // Draw
+    // Draw axes
     for (int i = 1; i <= 3; ++i) {
         ImU32 c = (i == display) ? IM_COL32(255, 255, 100, 255) : axis_col[i];
         dl->AddLine(cs, tip[i], c, 2.5f);
-        // Arrowhead
         float ax = tip[i].x - cs.x, ay = tip[i].y - cs.y;
         float len = sqrtf(ax*ax + ay*ay);
         if (len > 0.f) {
@@ -440,29 +442,221 @@ static int draw_move_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
                 c);
         }
     }
-    dl->AddCircleFilled(cs, 4.f, IM_COL32(255, 255, 255, 200));
+    // Center square (camera-space translate)
+    ImU32 cc = (display == 4) ? IM_COL32(255, 255, 100, 255) : IM_COL32(255, 255, 255, 180);
+    dl->AddRectFilled({ cs.x - CENTER_SZ, cs.y - CENTER_SZ },
+                      { cs.x + CENTER_SZ, cs.y + CENTER_SZ }, cc);
 
-    // Apply drag movement
+    // Apply drag
     ImVec2 delta = ImGui::GetIO().MouseDelta;
     if (drag_axis > 0 && (delta.x != 0.f || delta.y != 0.f)) {
-        float3 ad = axis_dir[drag_axis];
-        float sax = tip[drag_axis].x - cs.x;
-        float say = tip[drag_axis].y - cs.y;
-        float slen = sqrtf(sax*sax + say*say);
-        if (slen > 0.f) {
-            float proj = (delta.x * sax + delta.y * say) / slen;
-            float wpp  = scale / ARROW_PX; // world units per screen pixel
-            float move = proj * wpp;
-            out_delta = { ad.x * move, ad.y * move, ad.z * move };
+        float wpp = scale / ARROW_PX;
+        if (drag_axis == 4) {
+            // Camera-space translate: mouse X → cam.u, mouse Y → -cam.v
+            out_delta = {
+                (cam.u.x * delta.x - cam.v.x * delta.y) * wpp,
+                (cam.u.y * delta.x - cam.v.y * delta.y) * wpp,
+                (cam.u.z * delta.x - cam.v.z * delta.y) * wpp };
+        } else {
+            float3 ad = axis_dir[drag_axis];
+            float sax = tip[drag_axis].x - cs.x;
+            float say = tip[drag_axis].y - cs.y;
+            float slen = sqrtf(sax*sax + say*say);
+            if (slen > 0.f) {
+                float proj = (delta.x * sax + delta.y * say) / slen;
+                float move = proj * wpp;
+                out_delta = { ad.x * move, ad.y * move, ad.z * move };
+            }
         }
     }
 
     return (drag_axis > 0) ? drag_axis : hovered;
 }
 
-// ─────────────────────────────────────────────
+// Draw XYZ rotation gizmo (circles per axis). Returns active axis (1=X,2=Y,3=Z, 0=none).
+// out_angles: rotation in radians around each world axis this frame.
+static int draw_rotate_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
+                              float vfov, float aspect,
+                              ImVec2 vp_origin, ImVec2 vp_size,
+                              float3& out_angles)
+{
+    static int drag_axis = 0;
+    out_angles = {0.f, 0.f, 0.f};
+
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) drag_axis = 0;
+
+    ImVec2 cs;
+    float depth = world_to_screen(cam, center, vp_origin, vp_size, vfov, aspect, cs);
+    if (depth <= 0.f) return 0;
+
+    const float RADIUS_PX = 70.f;
+    const float HIT_PX    = 10.f;
+    const int   SEGMENTS  = 48;
+
+    float3 axis_dir[4] = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1} };
+    ImU32  axis_col[4] = { 0,
+        IM_COL32(220, 60,  60, 255),
+        IM_COL32( 60,200,  60, 255),
+        IM_COL32( 60,120, 220, 255) };
+
+    float half_h = tanf(vfov * 0.5f * 3.14159265f / 180.f);
+    float scale  = depth * 2.f * half_h / vp_size.y * RADIUS_PX;
+
+    // Draw circles and detect hover
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    int hovered = 0;
+
+    for (int ax = 1; ax <= 3; ++ax) {
+        // Two perpendicular directions to the axis
+        float3 u_dir, v_dir;
+        if (ax == 1)      { u_dir = {0,1,0}; v_dir = {0,0,1}; }
+        else if (ax == 2) { u_dir = {1,0,0}; v_dir = {0,0,1}; }
+        else              { u_dir = {1,0,0}; v_dir = {0,1,0}; }
+
+        ImVec2 pts[SEGMENTS + 1];
+        for (int s = 0; s <= SEGMENTS; ++s) {
+            float angle = (float)s / SEGMENTS * 2.f * 3.14159265f;
+            float3 wp = {
+                center.x + (u_dir.x * cosf(angle) + v_dir.x * sinf(angle)) * scale,
+                center.y + (u_dir.y * cosf(angle) + v_dir.y * sinf(angle)) * scale,
+                center.z + (u_dir.z * cosf(angle) + v_dir.z * sinf(angle)) * scale };
+            world_to_screen(cam, wp, vp_origin, vp_size, vfov, aspect, pts[s]);
+        }
+
+        // Check hover distance to circle
+        if (drag_axis == 0) {
+            for (int s = 0; s < SEGMENTS; ++s) {
+                if (seg_dist_sq(mouse.x, mouse.y,
+                    pts[s].x, pts[s].y, pts[s+1].x, pts[s+1].y) < HIT_PX*HIT_PX) {
+                    hovered = ax; break;
+                }
+            }
+        }
+
+        int display = drag_axis > 0 ? drag_axis : hovered;
+        ImU32 c = (ax == display) ? IM_COL32(255, 255, 100, 255) : axis_col[ax];
+        for (int s = 0; s < SEGMENTS; ++s)
+            dl->AddLine(pts[s], pts[s+1], c, 2.0f);
+    }
+
+    dl->AddCircleFilled(cs, 4.f, IM_COL32(255, 255, 255, 200));
+
+    if (hovered > 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        drag_axis = hovered;
+
+    // Compute rotation from mouse drag
+    ImVec2 delta = ImGui::GetIO().MouseDelta;
+    if (drag_axis > 0 && (delta.x != 0.f || delta.y != 0.f)) {
+        // Rotation speed: screen pixels → radians
+        float rot_speed = 0.01f;
+        float rot = (delta.x + delta.y) * rot_speed;
+        if (drag_axis == 1) out_angles.x = rot;
+        if (drag_axis == 2) out_angles.y = rot;
+        if (drag_axis == 3) out_angles.z = rot;
+    }
+
+    return (drag_axis > 0) ? drag_axis : hovered;
+}
+
+// Draw XYZ scale gizmo (lines with boxes). Returns active axis (1=X,2=Y,3=Z, 4=uniform, 0=none).
+// out_scale: scale delta per axis this frame (add to 1.0).
+static int draw_scale_gizmo(ImDrawList* dl, const Camera& cam, float3 center,
+                             float vfov, float aspect,
+                             ImVec2 vp_origin, ImVec2 vp_size,
+                             float3& out_scale)
+{
+    static int drag_axis = 0;
+    out_scale = {0.f, 0.f, 0.f};
+
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) drag_axis = 0;
+
+    ImVec2 cs;
+    float depth = world_to_screen(cam, center, vp_origin, vp_size, vfov, aspect, cs);
+    if (depth <= 0.f) return 0;
+
+    const float ARROW_PX  = 70.f;
+    const float HIT_PX    = 8.f;
+    const float BOX_PX    = 5.f;
+    const float CENTER_SZ = 7.f;
+
+    float half_h = tanf(vfov * 0.5f * 3.14159265f / 180.f);
+    float scale  = depth * 2.f * half_h / vp_size.y * ARROW_PX;
+
+    float3 axis_dir[4] = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1} };
+    ImU32  axis_col[4] = { 0,
+        IM_COL32(220, 60,  60, 255),
+        IM_COL32( 60,200,  60, 255),
+        IM_COL32( 60,120, 220, 255) };
+
+    ImVec2 tip[4];
+    for (int i = 1; i <= 3; ++i) {
+        float3 w = {
+            center.x + axis_dir[i].x * scale,
+            center.y + axis_dir[i].y * scale,
+            center.z + axis_dir[i].z * scale };
+        world_to_screen(cam, w, vp_origin, vp_size, vfov, aspect, tip[i]);
+    }
+
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    int hovered = 0;
+    if (drag_axis == 0) {
+        // Center square first (uniform scale)
+        if (fabsf(mouse.x - cs.x) < CENTER_SZ && fabsf(mouse.y - cs.y) < CENTER_SZ)
+            hovered = 4;
+        else {
+            for (int i = 1; i <= 3; ++i) {
+                if (seg_dist_sq(mouse.x, mouse.y,
+                    cs.x, cs.y, tip[i].x, tip[i].y) < HIT_PX*HIT_PX) {
+                    hovered = i; break;
+                }
+            }
+        }
+    }
+
+    if (hovered > 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        drag_axis = hovered;
+
+    int display = drag_axis > 0 ? drag_axis : hovered;
+
+    for (int i = 1; i <= 3; ++i) {
+        ImU32 c = (i == display) ? IM_COL32(255, 255, 100, 255) : axis_col[i];
+        dl->AddLine(cs, tip[i], c, 2.5f);
+        dl->AddRectFilled(
+            { tip[i].x - BOX_PX, tip[i].y - BOX_PX },
+            { tip[i].x + BOX_PX, tip[i].y + BOX_PX }, c);
+    }
+    // Center square (uniform scale)
+    ImU32 cc = (display == 4) ? IM_COL32(255, 255, 100, 255) : IM_COL32(255, 255, 255, 180);
+    dl->AddRectFilled({ cs.x - CENTER_SZ, cs.y - CENTER_SZ },
+                      { cs.x + CENTER_SZ, cs.y + CENTER_SZ }, cc);
+
+    ImVec2 delta = ImGui::GetIO().MouseDelta;
+    if (drag_axis > 0 && (delta.x != 0.f || delta.y != 0.f)) {
+        if (drag_axis == 4) {
+            // Uniform scale: horizontal drag right = bigger
+            float s = (delta.x - delta.y) * 0.003f;
+            out_scale = { s, s, s };
+        } else {
+            float3 ad = axis_dir[drag_axis];
+            float sax = tip[drag_axis].x - cs.x;
+            float say = tip[drag_axis].y - cs.y;
+            float slen = sqrtf(sax*sax + say*say);
+            if (slen > 0.f) {
+                float proj = (delta.x * sax + delta.y * say) / slen;
+                float s = proj * 0.005f;
+                if (drag_axis == 1) out_scale.x = s;
+                if (drag_axis == 2) out_scale.y = s;
+                if (drag_axis == 3) out_scale.z = s;
+            }
+        }
+    }
+
+    return (drag_axis > 0) ? drag_axis : hovered;
+}
+
+// ─────────────────────────���───────────────────
 //  Silhouette edge detection (CPU, for selection outline)
-// ─────────────────────────────────────────────
+// ────────��────────────────────────────────────
 
 struct EdgeKey {
     int64_t x0,y0,z0, x1,y1,z1;
@@ -879,6 +1073,111 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
         ctrl.selected_sphere   = -1;
         ctrl.selected_mesh_obj = -1;
     }
+    return true;
+}
+
+static void rebuild_visible_bvh(MeshState& ms);  // forward decl
+
+// Import a 3D file into the existing scene (append, don't replace).
+// Offsets obj_ids and mat_indices so they don't clash with existing data.
+static bool import_into_scene(const std::string& path, MeshState& ms,
+                               ControlPanelState& ctrl)
+{
+    std::vector<Triangle>     tris;
+    std::vector<GpuMaterial>  mats;
+    std::vector<TextureImage> tex_images;
+    std::vector<MeshObject>   new_objects;
+
+    const bool is_usd  = is_usd_scene_path(path);
+    const bool is_urdf = is_urdf_path(path);
+
+    bool load_ok = is_urdf
+        ? urdf_load(path, tris, mats, tex_images, new_objects)
+        : is_usd
+            ? usd_load (path, tris, mats, tex_images, new_objects)
+            : gltf_load(path, tris, mats, tex_images, new_objects);
+    if (!load_ok) return false;
+
+    // Compute offsets
+    int obj_id_offset = 0;
+    for (auto& obj : ms.objects)
+        if (obj.obj_id >= obj_id_offset) obj_id_offset = obj.obj_id + 1;
+    int mat_offset = ms.num_mats;
+    int tex_offset = ms.num_texs;
+
+    // Offset triangle references
+    for (auto& tri : tris) {
+        tri.obj_id  += obj_id_offset;
+        tri.mat_idx += mat_offset;
+        // Offset texture indices in UVs (if they reference texture array)
+    }
+    for (auto& obj : new_objects)
+        obj.obj_id += obj_id_offset;
+    for (auto& m : mats) {
+        if (m.base_color_tex    >= 0) m.base_color_tex    += tex_offset;
+        if (m.metallic_rough_tex >= 0) m.metallic_rough_tex += tex_offset;
+        if (m.normal_tex        >= 0) m.normal_tex        += tex_offset;
+        if (m.emissive_tex      >= 0) m.emissive_tex      += tex_offset;
+    }
+
+    // Append textures
+    for (auto& ti : tex_images) {
+        if (ti.width > 0 && ti.height > 0 && !ti.pixels.empty()) {
+            ms.gpu_textures.push_back(gpu_texture_upload_rgba8(ti.pixels.data(), ti.width, ti.height, ti.srgb));
+            ms.tex_bytes += (size_t)ti.width * ti.height * 4;
+        }
+    }
+    // Re-upload texture handle array
+    cudaFree(ms.d_tex_hdls); ms.d_tex_hdls = nullptr;
+    ms.d_tex_hdls = gpu_textures_upload_handles(ms.gpu_textures);
+    ms.num_texs   = (int)ms.gpu_textures.size();
+
+    // Append materials
+    ms.host_mats.insert(ms.host_mats.end(), mats.begin(), mats.end());
+    cudaFree(ms.d_mats); ms.d_mats = nullptr;
+    if (!ms.host_mats.empty()) {
+        cudaMalloc(&ms.d_mats, ms.host_mats.size() * sizeof(GpuMaterial));
+        cudaMemcpy(ms.d_mats, ms.host_mats.data(),
+                   ms.host_mats.size() * sizeof(GpuMaterial), cudaMemcpyHostToDevice);
+        ms.num_mats = (int)ms.host_mats.size();
+    }
+
+    // Append objects
+    ms.objects.insert(ms.objects.end(), new_objects.begin(), new_objects.end());
+
+    // Append triangles
+    ms.all_prims.insert(ms.all_prims.end(), tris.begin(), tris.end());
+
+    // Regenerate per-object colors for ALL objects
+    {
+        int max_id = -1;
+        for (auto& obj : ms.objects) if (obj.obj_id > max_id) max_id = obj.obj_id;
+        if (max_id >= 0) {
+            std::vector<float3> palette(max_id + 1);
+            for (int i = 0; i <= max_id; ++i) {
+                unsigned h = (unsigned)i * 2654435761u;
+                float r = (float)((h >> 0) & 0xFF) / 255.f * 0.7f + 0.3f;
+                float g = (float)((h >> 8) & 0xFF) / 255.f * 0.7f + 0.3f;
+                float b = (float)((h >> 16) & 0xFF) / 255.f * 0.7f + 0.3f;
+                palette[i] = make_float3(r, g, b);
+            }
+            cudaFree(ms.d_obj_colors); ms.d_obj_colors = nullptr;
+            cudaMalloc(&ms.d_obj_colors, palette.size() * sizeof(float3));
+            cudaMemcpy(ms.d_obj_colors, palette.data(),
+                       palette.size() * sizeof(float3), cudaMemcpyHostToDevice);
+            ms.num_obj_colors = (int)palette.size();
+        }
+    }
+
+    // Rebuild BVH with all triangles
+    rebuild_visible_bvh(ms);
+
+    ctrl.mesh_loaded   = true;
+    ctrl.num_mesh_tris = (int)ms.all_prims.size();
+    ++ms.scene_version;
+
+    std::cerr << "[import] added " << tris.size() << " triangles, "
+              << new_objects.size() << " objects from " << path << '\n';
     return true;
 }
 
@@ -1588,6 +1887,20 @@ int main() {
             }
         }
 
+        // ── Import into existing scene ────────────────────────────────
+        if (ctrl.import_requested) {
+            ctrl.import_requested = false;
+            if (import_into_scene(ctrl.gltf_path, mesh, ctrl)) {
+                cam_changed = true;
+
+                // Open URDF articulation for the imported file
+                if (is_urdf_path(ctrl.gltf_path)) {
+                    if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
+                    urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
+                }
+            }
+        }
+
         // ── HDRI load / clear ─────────────────────────────────────────
         if (ctrl.load_hdri_requested) {
             ctrl.load_hdri_requested = false;
@@ -1855,7 +2168,9 @@ int main() {
                 }
                 cam_changed = true;
             };
-            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_UP)    == GLFW_PRESS)
+            // In Move mode, W/E/R are gizmo shortcuts — don't move camera
+            bool move_mode = (ctrl.interact_mode == InteractMode::Move);
+            if (!move_mode && (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS))
                 pan( fwd_x*spd, 0.f,  fwd_z*spd);
             if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_DOWN)  == GLFW_PRESS)
                 pan(-fwd_x*spd, 0.f, -fwd_z*spd);
@@ -1865,8 +2180,9 @@ int main() {
                 pan(-rgt_x*spd, 0.f, -rgt_z*spd);
             if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
                 pan(0.f,  spd, 0.f);
-            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
+            if (!move_mode && (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS))
                 pan(0.f, -spd, 0.f);
+            // R was used for nothing in WASD — no conflict
         }
 
         // ── Mode-change sync (no jump on switch) ─────────────────────
@@ -1878,8 +2194,8 @@ int main() {
                     ctrl.orbit_pivot[0] = ctrl.pos[0] + look_x * ctrl.orbit_dist;
                     ctrl.orbit_pivot[1] = ctrl.pos[1] + look_y * ctrl.orbit_dist;
                     ctrl.orbit_pivot[2] = ctrl.pos[2] + look_z * ctrl.orbit_dist;
-                } else {
-                    // Orbit → FPS: derive yaw/pitch from pos→pivot direction
+                } else if (ctrl.interact_mode == InteractMode::Select) {
+                    // Orbit/Move → FPS: derive yaw/pitch from pos→pivot direction
                     float dx = ctrl.orbit_pivot[0] - ctrl.pos[0];
                     float dy = ctrl.orbit_pivot[1] - ctrl.pos[1];
                     float dz = ctrl.orbit_pivot[2] - ctrl.pos[2];
@@ -1890,14 +2206,92 @@ int main() {
                         if (cp > 1e-5f)
                             ctrl.yaw = atan2f(dx/d, -dz/d) * (180.f / 3.14159265f);
                     }
-                    // pos is already the camera world position — no sync needed
                 }
+                // Orbit ↔ Move: no sync needed, both share orbit state
                 s_prev = ctrl.interact_mode;
             }
         }
 
+        // ── W / E / R gizmo mode shortcuts (Move mode only) ──────────
+        if (ctrl.interact_mode == InteractMode::Move && !io.WantCaptureKeyboard) {
+            if (ImGui::IsKeyPressed(ImGuiKey_W, false))
+                ctrl.gizmo_mode = GizmoMode::Translate;
+            if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+                ctrl.gizmo_mode = GizmoMode::Rotate;
+            if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+                ctrl.gizmo_mode = GizmoMode::Scale;
+        }
+
+        // ── F key: frame selected object (or entire scene if nothing selected) ──
+        if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            float3 mn = make_float3( 1e30f,  1e30f,  1e30f);
+            float3 mx = make_float3(-1e30f, -1e30f, -1e30f);
+            bool has_sel = ctrl.selected_mesh_obj >= 0 && !multi_sel.empty();
+
+            for (const Triangle& tri : mesh.all_prims) {
+                if (has_sel) {
+                    // Only selected objects
+                    bool in_sel = false;
+                    for (int idx : multi_sel) {
+                        if (idx >= 0 && idx < (int)mesh.objects.size() &&
+                            tri.obj_id == mesh.objects[idx].obj_id) { in_sel = true; break; }
+                    }
+                    if (!in_sel) continue;
+                }
+                float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
+                for (auto& v : verts) {
+                    if (v.x < mn.x) mn.x = v.x; if (v.x > mx.x) mx.x = v.x;
+                    if (v.y < mn.y) mn.y = v.y; if (v.y > mx.y) mx.y = v.y;
+                    if (v.z < mn.z) mn.z = v.z; if (v.z > mx.z) mx.z = v.z;
+                }
+            }
+
+            // Also consider spheres if no mesh
+            if (mn.x > mx.x && !prims_sorted.empty()) {
+                for (auto& s : prims_sorted) {
+                    if (s.center.x - s.radius < mn.x) mn.x = s.center.x - s.radius;
+                    if (s.center.x + s.radius > mx.x) mx.x = s.center.x + s.radius;
+                    if (s.center.y - s.radius < mn.y) mn.y = s.center.y - s.radius;
+                    if (s.center.y + s.radius > mx.y) mx.y = s.center.y + s.radius;
+                    if (s.center.z - s.radius < mn.z) mn.z = s.center.z - s.radius;
+                    if (s.center.z + s.radius > mx.z) mx.z = s.center.z + s.radius;
+                }
+            }
+
+            if (mn.x <= mx.x) {
+                float cx = (mn.x + mx.x) * 0.5f;
+                float cy = (mn.y + mx.y) * 0.5f;
+                float cz = (mn.z + mx.z) * 0.5f;
+                float dx = mx.x - mn.x, dy = mx.y - mn.y, dz = mx.z - mn.z;
+                float diag = sqrtf(dx*dx + dy*dy + dz*dz);
+                float dist = diag * 0.8f / tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
+
+                ctrl.orbit_pivot[0] = cx;
+                ctrl.orbit_pivot[1] = cy;
+                ctrl.orbit_pivot[2] = cz;
+
+                // Place camera looking from current direction but at correct distance
+                float fx = ctrl.pos[0] - cx, fy = ctrl.pos[1] - cy, fz = ctrl.pos[2] - cz;
+                float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+                if (fl > 1e-5f) { fx/=fl; fy/=fl; fz/=fl; }
+                else { fx = 0; fy = 0.3f; fz = 1.0f; }
+
+                ctrl.pos[0] = cx + fx * dist;
+                ctrl.pos[1] = cy + fy * dist;
+                ctrl.pos[2] = cz + fz * dist;
+                ctrl.cam_from[0] = ctrl.pos[0];
+                ctrl.cam_from[1] = ctrl.pos[1];
+                ctrl.cam_from[2] = ctrl.pos[2];
+                ctrl.cam_at[0] = cx; ctrl.cam_at[1] = cy; ctrl.cam_at[2] = cz;
+                ctrl.orbit_dist = dist;
+                ctrl.interact_mode = InteractMode::Orbit;
+                cam_changed = true;
+            }
+        }
+
         // ── ORBIT drag + scroll: arcball (pos rotates around pivot) ──
-        // Alt held = temporary orbit override regardless of current mode
+        // Alt held = temporary orbit override regardless of current mode.
+        // Move mode shares the orbit camera — orbit with Alt or when not on gizmo.
         bool alt_orbit = io.KeyAlt && vp.hovered;
         if (ctrl.interact_mode == InteractMode::Orbit || alt_orbit) {
             if (vp.lmb_dragging) {
@@ -1930,7 +2324,9 @@ int main() {
         }
 
         // ── Camera derivation ─────────────────────────────────────────
-        if (ctrl.interact_mode == InteractMode::Orbit || alt_orbit) {
+        // Move mode shares orbit camera (look at pivot, not FPS yaw/pitch)
+        if (ctrl.interact_mode == InteractMode::Orbit ||
+            ctrl.interact_mode == InteractMode::Move  || alt_orbit) {
             ctrl.cam_from[0] = ctrl.pos[0];
             ctrl.cam_from[1] = ctrl.pos[1];
             ctrl.cam_from[2] = ctrl.pos[2];
@@ -2019,36 +2415,55 @@ int main() {
             }
         }
 
-        // ── Mesh object gizmo ─────────────────────────────────────────
+        // ── Mesh object gizmo (W=translate, E=rotate, R=scale) ────────
         if (ctrl.overlay_gizmo && ctrl.selected_mesh_obj >= 0 &&
             ctrl.selected_mesh_obj < (int)mesh.objects.size() &&
             !multi_sel.empty() &&
             ctrl.interact_mode == InteractMode::Move && !alt_orbit)
         {
-            // Gizmo centred on the primary selected object
             MeshObject& mobj = mesh.objects[ctrl.selected_mesh_obj];
-            int gr = draw_move_gizmo(
-                ImGui::GetForegroundDrawList(), cam,
-                mobj.centroid,
-                ctrl.vfov, (float)rt_w / (float)rt_h,
-                vp.origin, vp.size, gizmo_delta);
+            float3 pivot = mobj.centroid;
+
+            // Dispatch gizmo by mode
+            float3 gizmo_rotate = {0,0,0};
+            float3 gizmo_scale_d = {0,0,0};
+            int gr = 0;
+
+            if (ctrl.gizmo_mode == GizmoMode::Translate) {
+                gr = draw_move_gizmo(
+                    ImGui::GetForegroundDrawList(), cam, pivot,
+                    ctrl.vfov, (float)rt_w / (float)rt_h,
+                    vp.origin, vp.size, gizmo_delta);
+            } else if (ctrl.gizmo_mode == GizmoMode::Rotate) {
+                gr = draw_rotate_gizmo(
+                    ImGui::GetForegroundDrawList(), cam, pivot,
+                    ctrl.vfov, (float)rt_w / (float)rt_h,
+                    vp.origin, vp.size, gizmo_rotate);
+            } else if (ctrl.gizmo_mode == GizmoMode::Scale) {
+                gr = draw_scale_gizmo(
+                    ImGui::GetForegroundDrawList(), cam, pivot,
+                    ctrl.vfov, (float)rt_w / (float)rt_h,
+                    vp.origin, vp.size, gizmo_scale_d);
+            }
 
             if (!gizmo_consuming)
                 gizmo_consuming = (gr > 0) && ImGui::IsMouseDown(ImGuiMouseButton_Left);
 
-            // Track drag-end to trigger full BVH rebuild
             static bool s_mesh_dragging = false;
             bool dragging_now = (gr > 0) && ImGui::IsMouseDown(ImGuiMouseButton_Left);
             bool drag_released = s_mesh_dragging && !dragging_now;
             s_mesh_dragging = dragging_now;
 
-            if (gizmo_delta.x != 0.f || gizmo_delta.y != 0.f || gizmo_delta.z != 0.f) {
-                // Translate ALL objects in the current selection group
+            bool any_change = false;
+
+            // ── TRANSLATE ──
+            if (ctrl.gizmo_mode == GizmoMode::Translate &&
+                (gizmo_delta.x != 0.f || gizmo_delta.y != 0.f || gizmo_delta.z != 0.f))
+            {
                 for (int idx : multi_sel) {
                     if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
                     MeshObject& obj = mesh.objects[idx];
                     int oid = obj.obj_id;
-
                     auto translate_tri = [&](Triangle& tri) {
                         if (tri.obj_id != oid) return;
                         tri.v0.x += gizmo_delta.x; tri.v0.y += gizmo_delta.y; tri.v0.z += gizmo_delta.z;
@@ -2057,38 +2472,101 @@ int main() {
                     };
                     for (Triangle& tri : mesh.all_prims) translate_tri(tri);
                     for (Triangle& tri : mesh.prims)     translate_tri(tri);
-
                     obj.centroid.x += gizmo_delta.x;
                     obj.centroid.y += gizmo_delta.y;
                     obj.centroid.z += gizmo_delta.z;
                 }
-
-                // During drag: expand every BVH node AABB by the movement delta
-                // so no moved triangle gets culled. O(nodes) — instant.
-                // Full tight rebuild happens on mouse release.
-                float3 d = gizmo_delta;
-                for (auto& node : mesh.bvh_nodes) {
-                    if (d.x > 0.f) node.aabb.mx.x += d.x; else node.aabb.mn.x += d.x;
-                    if (d.y > 0.f) node.aabb.mx.y += d.y; else node.aabb.mn.y += d.y;
-                    if (d.z > 0.f) node.aabb.mx.z += d.z; else node.aabb.mn.z += d.z;
-                }
-                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
-                    cudaMemcpy(mesh.d_bvh, mesh.bvh_nodes.data(),
-                               mesh.bvh_nodes.size() * sizeof(BVHNode),
-                               cudaMemcpyHostToDevice);
-                if (mesh.d_prims && !mesh.prims.empty())
-                    cudaMemcpy(mesh.d_prims, mesh.prims.data(),
-                               mesh.prims.size() * sizeof(Triangle),
-                               cudaMemcpyHostToDevice);
-                mesh_moved  = true;
-                cam_changed = true;
-                ++mesh.scene_version;  // OptiX RT re-uploads BVH
+                any_change = true;
             }
 
-            // Full BVH rebuild when the user releases the gizmo
-            if (drag_released) {
+            // ── ROTATE ──
+            if (ctrl.gizmo_mode == GizmoMode::Rotate &&
+                (gizmo_rotate.x != 0.f || gizmo_rotate.y != 0.f || gizmo_rotate.z != 0.f))
+            {
+                // Build rotation matrix around pivot
+                float cx = cosf(gizmo_rotate.x), sx = sinf(gizmo_rotate.x);
+                float cy = cosf(gizmo_rotate.y), sy = sinf(gizmo_rotate.y);
+                float cz = cosf(gizmo_rotate.z), sz = sinf(gizmo_rotate.z);
+
+                // Combined Rz * Ry * Rx
+                auto rotate_pt = [&](float3 p) -> float3 {
+                    float3 r = p;
+                    // Rx
+                    float y1 = cx*r.y - sx*r.z, z1 = sx*r.y + cx*r.z; r.y = y1; r.z = z1;
+                    // Ry
+                    float x2 = cy*r.x + sy*r.z, z2 = -sy*r.x + cy*r.z; r.x = x2; r.z = z2;
+                    // Rz
+                    float x3 = cz*r.x - sz*r.y, y3 = sz*r.x + cz*r.y; r.x = x3; r.y = y3;
+                    return r;
+                };
+
+                for (int idx : multi_sel) {
+                    if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
+                    MeshObject& obj = mesh.objects[idx];
+                    int oid = obj.obj_id;
+                    auto rotate_tri = [&](Triangle& tri) {
+                        if (tri.obj_id != oid) return;
+                        // Rotate around pivot
+                        auto rot = [&](float3 v) -> float3 {
+                            float3 local = { v.x - pivot.x, v.y - pivot.y, v.z - pivot.z };
+                            float3 r = rotate_pt(local);
+                            return { r.x + pivot.x, r.y + pivot.y, r.z + pivot.z };
+                        };
+                        tri.v0 = rot(tri.v0); tri.v1 = rot(tri.v1); tri.v2 = rot(tri.v2);
+                        tri.n0 = rotate_pt(tri.n0); tri.n1 = rotate_pt(tri.n1); tri.n2 = rotate_pt(tri.n2);
+                    };
+                    for (Triangle& tri : mesh.all_prims) rotate_tri(tri);
+                    for (Triangle& tri : mesh.prims)     rotate_tri(tri);
+                    // Centroid rotates too
+                    float3 lc = { obj.centroid.x - pivot.x, obj.centroid.y - pivot.y, obj.centroid.z - pivot.z };
+                    float3 rc = rotate_pt(lc);
+                    obj.centroid = { rc.x + pivot.x, rc.y + pivot.y, rc.z + pivot.z };
+                }
+                any_change = true;
+            }
+
+            // ── SCALE ──
+            if (ctrl.gizmo_mode == GizmoMode::Scale &&
+                (gizmo_scale_d.x != 0.f || gizmo_scale_d.y != 0.f || gizmo_scale_d.z != 0.f))
+            {
+                float sx = 1.f + gizmo_scale_d.x;
+                float sy = 1.f + gizmo_scale_d.y;
+                float sz = 1.f + gizmo_scale_d.z;
+
+                for (int idx : multi_sel) {
+                    if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
+                    MeshObject& obj = mesh.objects[idx];
+                    int oid = obj.obj_id;
+                    auto scale_tri = [&](Triangle& tri) {
+                        if (tri.obj_id != oid) return;
+                        auto sc = [&](float3 v) -> float3 {
+                            return { pivot.x + (v.x - pivot.x) * sx,
+                                     pivot.y + (v.y - pivot.y) * sy,
+                                     pivot.z + (v.z - pivot.z) * sz };
+                        };
+                        tri.v0 = sc(tri.v0); tri.v1 = sc(tri.v1); tri.v2 = sc(tri.v2);
+                        // Normals: inverse-transpose scale
+                        auto sn = [&](float3 n) -> float3 {
+                            float3 r = { n.x / sx, n.y / sy, n.z / sz };
+                            float l = sqrtf(r.x*r.x + r.y*r.y + r.z*r.z);
+                            if (l > 1e-7f) { r.x/=l; r.y/=l; r.z/=l; }
+                            return r;
+                        };
+                        tri.n0 = sn(tri.n0); tri.n1 = sn(tri.n1); tri.n2 = sn(tri.n2);
+                    };
+                    for (Triangle& tri : mesh.all_prims) scale_tri(tri);
+                    for (Triangle& tri : mesh.prims)     scale_tri(tri);
+                    float3 lc = { obj.centroid.x - pivot.x, obj.centroid.y - pivot.y, obj.centroid.z - pivot.z };
+                    obj.centroid = { pivot.x + lc.x*sx, pivot.y + lc.y*sy, pivot.z + lc.z*sz };
+                }
+                any_change = true;
+            }
+
+            if (any_change) {
+                // Full clean BVH rebuild every frame during drag.
+                // This is correct and doesn't accumulate stale AABBs.
                 rebuild_visible_bvh(mesh);
-                cam_changed = true;
+                mesh_moved = true; cam_changed = true;
                 ++mesh.scene_version;
             }
         }
@@ -2564,7 +3042,8 @@ int main() {
             pathtracer_sw_upscale(d_accum, render_w, render_h, interop.surface, rt_w, rt_h);
 
         // ── OptiX RT: blit accum → surface so it's visible (raygen writes d_accum only) ─
-        if (use_optix_rt)
+        // Skip when neural DLSS is active — DLSS reads d_accum and writes surface itself.
+        if (use_optix_rt && !dlss_active)
             pathtracer_blit_surface(d_accum, interop.surface, rt_w, rt_h);
 
         // CUPTI: end profiling pass and update real metrics
@@ -2904,10 +3383,39 @@ int main() {
                 break;
 
             case ViewportPassMode::DlssMotion:
-                // Auto-normalized: fastest pixel = full saturation, static = black.
-                pathtracer_visualize_motion(d_motion, render_w, render_h,
-                                            motion_maxmag,
-                                            interop.surface, rt_w, rt_h);
+                // When camera is nearly static, generate fake motion vectors from
+                // a small virtual orbit so the visualization isn't just black dots.
+                if (motion_maxmag < 0.5f) {
+                    float fake_yaw = 0.02f; // small virtual rotation
+                    float cx = ctrl.orbit_pivot[0], cy = ctrl.orbit_pivot[1], cz = ctrl.orbit_pivot[2];
+                    float ox = ctrl.pos[0] - cx, oy = ctrl.pos[1] - cy, oz = ctrl.pos[2] - cz;
+                    float c = cosf(fake_yaw), s = sinf(fake_yaw);
+                    float fx = ox*c + oz*s, fz = -ox*s + oz*c;
+                    Camera fake_prev = Camera::make(
+                        make_float3(cx + fx, cy + oy, cz + fz),
+                        make_float3(cx, cy, cz),
+                        make_float3(0.f, 1.f, 0.f),
+                        ctrl.vfov, (float)rt_w / (float)rt_h,
+                        ctrl.aperture, ctrl.focus_dist);
+                    DlssAuxParams fake_aux{};
+                    fake_aux.width = render_w; fake_aux.height = render_h;
+                    fake_aux.cam = pt.cam; fake_aux.prev_cam = fake_prev;
+                    fake_aux.has_prev_camera = 1;
+                    fake_aux.camera_near = 0.01f; fake_aux.camera_far = 1000.f;
+                    fake_aux.bvh = d_bvh; fake_aux.prims = d_prims;
+                    fake_aux.num_prims = (int)prims_sorted.size();
+                    fake_aux.tri_bvh = mesh.d_bvh; fake_aux.triangles = mesh.d_prims;
+                    fake_aux.num_triangles = (int)mesh.prims.size();
+                    fake_aux.motion_buffer = d_motion;
+                    pathtracer_write_dlss_aux(fake_aux);
+                    cudaDeviceSynchronize();
+                    float fake_max = pathtracer_motion_maxmag(d_motion, render_w * render_h);
+                    pathtracer_visualize_motion(d_motion, render_w, render_h,
+                                                fake_max, interop.surface, rt_w, rt_h);
+                } else {
+                    pathtracer_visualize_motion(d_motion, render_w, render_h,
+                                                motion_maxmag, interop.surface, rt_w, rt_h);
+                }
                 break;
 
             case ViewportPassMode::Normal:
