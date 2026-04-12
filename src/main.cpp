@@ -1719,6 +1719,22 @@ int main() {
             demo_changed = demo_changed || robot_demo.scrub_changed;
             robot_demo.scrub_changed = false;
 
+            // Reset grasped object to original position on loop/restart
+            if (robot_demo.needs_grasp_reset) {
+                robot_demo_reset_grasp(robot_demo, prims_sorted, mesh.objects, mesh.all_prims);
+                robot_demo.needs_grasp_reset = false;
+                // Re-upload moved geometry
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                rebuild_bvh(bvh_nodes, prims_sorted, &d_bvh, &d_prims,
+                            ctrl.selected_sphere,
+                            ctrl.selected_sphere >= 0
+                                ? prims_sorted[ctrl.selected_sphere].center
+                                : make_float3(0,0,0));
+                ++mesh.scene_version;
+                cam_changed = true;
+            }
 
             if (demo_changed && urdf_artic_handle) {
                 urdf_repose(urdf_artic_handle, mesh.all_prims);

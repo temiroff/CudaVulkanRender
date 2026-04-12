@@ -125,7 +125,7 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
         if (state.loop) {
             state.playback_time = state.waypoints.front().time;
             // Reset grasp on loop restart
-            state.grasp.active = false;
+            state.needs_grasp_reset = true;
             state.prev_gripper_closed = false;
         } else {
             state.playback_time = end_time;
@@ -152,6 +152,23 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
 }
 
 // ── Grasp update ─────────────────────────────────────────────────────────────
+
+// 3x3 matrix helpers for rotation
+static void mat3_from_mat4(const float* m16, float* m9) {
+    m9[0]=m16[0]; m9[1]=m16[1]; m9[2]=m16[2];
+    m9[3]=m16[4]; m9[4]=m16[5]; m9[5]=m16[6];
+    m9[6]=m16[8]; m9[7]=m16[9]; m9[8]=m16[10];
+}
+static void mat3_transpose(const float* in, float* out) {
+    out[0]=in[0]; out[1]=in[3]; out[2]=in[6];
+    out[3]=in[1]; out[4]=in[4]; out[5]=in[7];
+    out[6]=in[2]; out[7]=in[5]; out[8]=in[8];
+}
+static float3 mat3_mul_vec(const float* m, float3 v) {
+    return make_float3(m[0]*v.x + m[1]*v.y + m[2]*v.z,
+                       m[3]*v.x + m[4]*v.y + m[5]*v.z,
+                       m[6]*v.x + m[7]*v.y + m[8]*v.z);
+}
 
 void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
                              std::vector<Sphere>& spheres,
@@ -180,9 +197,7 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
                                    spheres[i].center.z - ee.z);
             float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
             if (dist < best_dist) {
-                best_dist = dist;
-                best_idx = i;
-                best_is_mesh = false;
+                best_dist = dist; best_idx = i; best_is_mesh = false;
             }
         }
 
@@ -193,9 +208,7 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
             float3 d = make_float3(c.x - ee.x, c.y - ee.y, c.z - ee.z);
             float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
             if (dist < best_dist) {
-                best_dist = dist;
-                best_idx = i;
-                best_is_mesh = true;
+                best_dist = dist; best_idx = i; best_is_mesh = true;
             }
         }
 
@@ -203,14 +216,46 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
             state.grasp.active  = true;
             state.grasp.is_mesh = best_is_mesh;
             state.grasp.obj_idx = best_idx;
+
+            // Get ee full transform at grab time
+            float ee_mat[16];
+            urdf_fk_ee_transform(handle, ee_mat);
+            float ee_rot[9];
+            mat3_from_mat4(ee_mat, ee_rot);
+            mat3_transpose(ee_rot, state.grasp.grab_inv_rot);  // inverse = transpose for rotation
+
             if (best_is_mesh) {
                 float3 c = objects[best_idx].centroid;
+                if (!state.grasp.has_original) {
+                    state.grasp.original_pos = c;
+                    state.grasp.has_original = true;
+                }
+                // Store all vertices in ee-local space for rotation support,
+                // and save original world positions for reset
+                int target_id = objects[best_idx].obj_id;
+                state.grasp.local_verts.clear();
+                state.grasp.original_verts.clear();
+                for (auto& tri : all_prims) {
+                    if (tri.obj_id != target_id) continue;
+                    float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
+                    for (auto& v : verts) {
+                        // Save original world position
+                        state.grasp.original_verts.push_back(v);
+                        // Transform to ee-local space
+                        float3 rel = make_float3(v.x - ee.x, v.y - ee.y, v.z - ee.z);
+                        state.grasp.local_verts.push_back(mat3_mul_vec(state.grasp.grab_inv_rot, rel));
+                    }
+                }
                 state.grasp.offset = make_float3(c.x - ee.x, c.y - ee.y, c.z - ee.z);
             } else {
                 state.grasp.offset = make_float3(
                     spheres[best_idx].center.x - ee.x,
                     spheres[best_idx].center.y - ee.y,
                     spheres[best_idx].center.z - ee.z);
+                if (!state.grasp.has_original) {
+                    state.grasp.original_pos = spheres[best_idx].center;
+                    state.grasp.has_original = true;
+                }
             }
         }
     }
@@ -222,31 +267,86 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
     // Move attached object each frame
     if (!state.grasp.active || state.grasp.obj_idx < 0) return;
 
-    float3 new_pos = make_float3(ee.x + state.grasp.offset.x,
-                                 ee.y + state.grasp.offset.y,
-                                 ee.z + state.grasp.offset.z);
-
     if (!state.grasp.is_mesh) {
-        // Move sphere
+        // Sphere: position only (no rotation for spheres)
+        float3 new_pos = make_float3(ee.x + state.grasp.offset.x,
+                                     ee.y + state.grasp.offset.y,
+                                     ee.z + state.grasp.offset.z);
         if (state.grasp.obj_idx < (int)spheres.size())
             spheres[state.grasp.obj_idx].center = new_pos;
     } else {
-        // Move mesh object: translate all its triangles
+        // Mesh: apply full transform (position + rotation)
         if (state.grasp.obj_idx < (int)objects.size()) {
-            float3 old_c = objects[state.grasp.obj_idx].centroid;
-            float3 delta = make_float3(new_pos.x - old_c.x,
-                                       new_pos.y - old_c.y,
-                                       new_pos.z - old_c.z);
+            float ee_mat[16];
+            urdf_fk_ee_transform(handle, ee_mat);
+            float cur_rot[9];
+            mat3_from_mat4(ee_mat, cur_rot);
+
             int target_id = objects[state.grasp.obj_idx].obj_id;
+            int vi = 0;
+            float3 centroid_sum = make_float3(0, 0, 0);
+            int vert_count = 0;
+
             for (auto& tri : all_prims) {
                 if (tri.obj_id != target_id) continue;
-                tri.v0.x += delta.x; tri.v0.y += delta.y; tri.v0.z += delta.z;
-                tri.v1.x += delta.x; tri.v1.y += delta.y; tri.v1.z += delta.z;
-                tri.v2.x += delta.x; tri.v2.y += delta.y; tri.v2.z += delta.z;
+                float3* tv[3] = { &tri.v0, &tri.v1, &tri.v2 };
+                for (int k = 0; k < 3; k++) {
+                    if (vi < (int)state.grasp.local_verts.size()) {
+                        // local_vert is in ee-local space at grab time
+                        // new world pos = ee_pos + cur_rot * local_vert
+                        float3 world = mat3_mul_vec(cur_rot, state.grasp.local_verts[vi]);
+                        tv[k]->x = ee.x + world.x;
+                        tv[k]->y = ee.y + world.y;
+                        tv[k]->z = ee.z + world.z;
+                        centroid_sum.x += tv[k]->x;
+                        centroid_sum.y += tv[k]->y;
+                        centroid_sum.z += tv[k]->z;
+                        vert_count++;
+                    }
+                    vi++;
+                }
             }
-            objects[state.grasp.obj_idx].centroid = new_pos;
+            if (vert_count > 0) {
+                float inv = 1.f / (float)vert_count;
+                objects[state.grasp.obj_idx].centroid = make_float3(
+                    centroid_sum.x * inv, centroid_sum.y * inv, centroid_sum.z * inv);
+            }
         }
     }
+}
+
+// Reset grasped object to its original position + rotation.
+void robot_demo_reset_grasp(RobotDemoState& state,
+                            std::vector<Sphere>& spheres,
+                            std::vector<MeshObject>& objects,
+                            std::vector<Triangle>& all_prims)
+{
+    if (!state.grasp.has_original) return;
+
+    if (!state.grasp.is_mesh) {
+        if (state.grasp.obj_idx >= 0 && state.grasp.obj_idx < (int)spheres.size())
+            spheres[state.grasp.obj_idx].center = state.grasp.original_pos;
+    } else {
+        if (state.grasp.obj_idx >= 0 && state.grasp.obj_idx < (int)objects.size()) {
+            int target_id = objects[state.grasp.obj_idx].obj_id;
+            int vi = 0;
+
+            if (!state.grasp.original_verts.empty()) {
+                // Restore exact original vertices (position + rotation)
+                for (auto& tri : all_prims) {
+                    if (tri.obj_id != target_id) continue;
+                    if (vi + 2 < (int)state.grasp.original_verts.size()) {
+                        tri.v0 = state.grasp.original_verts[vi];
+                        tri.v1 = state.grasp.original_verts[vi + 1];
+                        tri.v2 = state.grasp.original_verts[vi + 2];
+                    }
+                    vi += 3;
+                }
+            }
+            objects[state.grasp.obj_idx].centroid = state.grasp.original_pos;
+        }
+    }
+    state.grasp.active = false;
 }
 
 // ── Save / Load JSON ─────────────────────────────────────────────────────────
@@ -397,17 +497,18 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
             } else {
                 if (ImGui::Button("Play")) {
                     state.playing = true;
-                    if (state.playback_time >= state.waypoints.back().time)
+                    if (state.playback_time >= state.waypoints.back().time) {
                         state.playback_time = state.waypoints.front().time;
+                        state.needs_grasp_reset = true;
+                    }
                     state.prev_gripper_closed = false;
-                    state.grasp.active = false;
                 }
             }
             ImGui::SameLine();
             if (ImGui::Button("Reset")) {
                 state.playing = false;
                 state.playback_time = state.waypoints.front().time;
-                state.grasp.active = false;
+                state.needs_grasp_reset = true;
                 state.prev_gripper_closed = false;
             }
 

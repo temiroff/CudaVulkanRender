@@ -1235,7 +1235,8 @@ static bool ik_collect_chain(UrdfArticulation* h,
 static float3 ik_forward(UrdfArticulation* h,
                          const std::vector<IKChainEntry>& chain,
                          std::vector<float3>& joint_pos,
-                         std::vector<float3>& joint_axis)
+                         std::vector<float3>& joint_axis,
+                         Mat4* out_ee_xform = nullptr)
 {
     joint_pos.resize(chain.size());
     joint_axis.resize(chain.size());
@@ -1271,6 +1272,7 @@ static float3 ik_forward(UrdfArticulation* h,
         }
     }
 
+    if (out_ee_xform) *out_ee_xform = xform;
     return xform.transform_point(make_float3(0, 0, 0));
 }
 
@@ -1282,6 +1284,22 @@ float3 urdf_fk_ee_pos(UrdfArticulation* h)
         return h ? h->ee_world_pos : make_float3(0, 0, 0);
     std::vector<float3> jp, ja;
     return ik_forward(h, chain, jp, ja);
+}
+
+void urdf_fk_ee_transform(UrdfArticulation* h, float* out_mat16)
+{
+    if (!h || !out_mat16) return;
+    // Identity fallback
+    for (int i = 0; i < 16; i++) out_mat16[i] = (i % 5 == 0) ? 1.f : 0.f;
+
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty()) return;
+    std::vector<float3> jp, ja;
+    Mat4 ee_xform;
+    ik_forward(h, chain, jp, ja, &ee_xform);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out_mat16[r * 4 + c] = ee_xform.m[r][c];
 }
 
 // Helper: map movable joint indices from chain

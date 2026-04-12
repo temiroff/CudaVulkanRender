@@ -63,6 +63,10 @@ int urdf_ik_chain_length(UrdfArticulation* h);
 // the FK chain tip directly — consistent with what the IK solver uses internally.
 float3 urdf_fk_ee_pos(UrdfArticulation* h);
 
+// Get the full 4x4 end-effector transform (position + rotation) from FK chain.
+// out_mat: 16 floats in row-major order (m[row][col]).
+void urdf_fk_ee_transform(UrdfArticulation* h, float* out_mat16);
+
 // Re-evaluate geometry from current joint angles.
 // Updates triangles_out in-place (must be same size as initial_tris).
 // Returns true if any geometry changed.
