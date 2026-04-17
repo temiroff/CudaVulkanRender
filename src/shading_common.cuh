@@ -12,18 +12,17 @@ __device__ inline float blinn_spec(float3 N, float3 L, float3 V, float shininess
 }
 
 // Camera-relative 3-point Blinn-Phong lighting for solid/rasterized viewport modes.
-// N: surface normal (world space, unit), cam_w: camera back direction (= view dir V),
+// N: surface normal (world space, unit), V: surface→camera view direction (world space, unit),
 // key_dir/fill_dir/rim_dir: pre-computed unit light directions (world space),
 // base_color: material albedo (linear RGB),
 // metallic/roughness: PBR params (roughness→shininess, metallic→spec color).
-__device__ inline float3 three_point_shade(float3 N, float3 cam_w,
-                                           float3 key_dir, float3 fill_dir, float3 rim_dir,
-                                           float3 base_color,
-                                           float metallic = 0.f, float roughness = 0.5f)
+__device__ inline float3 three_point_shade_view(float3 N, float3 V,
+                                                float3 key_dir, float3 fill_dir, float3 rim_dir,
+                                                float3 base_color,
+                                                float metallic = 0.f, float roughness = 0.5f)
 {
-    // cam_w points FROM target TOWARD camera (away from scene).
-    // View direction V (surface→camera) = +cam_w.
-    float3 V = cam_w;  // already unit length
+    float ndv = fmaxf(0.f, dot(N, V));
+    float fresnel = powf(1.f - ndv, 5.f);
 
     // Roughness → Blinn-Phong shininess (perceptual mapping)
     float smooth = 1.f - roughness;
@@ -37,33 +36,43 @@ __device__ inline float3 three_point_shade(float3 N, float3 cam_w,
 
     // Specular intensity scales with smoothness
     float spec_strength = 0.5f + smooth * 0.5f;
+    float grazing_boost = 1.f + fresnel * (1.5f + smooth);
 
     // Key light
     float  key_ndl = fmaxf(0.f, dot(N, key_dir));
     float3 key_tint = make_float3(1.0f, 0.98f, 0.95f);
     float3 key_diff = base_color * key_tint * (key_ndl * 0.55f);
-    float3 key_spec = spec_color * key_tint * (blinn_spec(N, key_dir, V, shininess) * key_ndl * spec_strength * 0.6f);
+    float3 key_spec = spec_color * key_tint * (blinn_spec(N, key_dir, V, shininess) * key_ndl * spec_strength * 0.6f * grazing_boost);
 
     // Fill light
     float  fill_ndl = fmaxf(0.f, dot(N, fill_dir));
     float3 fill_tint = make_float3(0.9f, 0.92f, 1.0f);
     float3 fill_diff = base_color * fill_tint * (fill_ndl * 0.25f);
-    float3 fill_spec = spec_color * fill_tint * (blinn_spec(N, fill_dir, V, shininess) * fill_ndl * spec_strength * 0.2f);
+    float3 fill_spec = spec_color * fill_tint * (blinn_spec(N, fill_dir, V, shininess) * fill_ndl * spec_strength * 0.2f * grazing_boost);
 
     // Rim light
     float  rim_ndl = fmaxf(0.f, dot(N, rim_dir));
     float3 rim_diff = base_color * (rim_ndl * 0.1f);
-    float  rim_spec_val = blinn_spec(N, rim_dir, V, fmaxf(8.f, shininess * 0.25f)) * rim_ndl;
-    float3 rim_spec = make_float3(rim_spec_val * 0.3f, rim_spec_val * 0.3f, rim_spec_val * 0.3f);
+    float3 rim_spec = make_float3(0.f, 0.f, 0.f);
 
     // Ambient
-    float3 ambient = base_color * 0.1f;
+    float3 ambient = base_color * (0.08f + 0.04f * fresnel);
 
     float3 c = ambient + key_diff + key_spec + fill_diff + fill_spec + rim_diff + rim_spec;
     c.x = fminf(c.x, 1.f);
     c.y = fminf(c.y, 1.f);
     c.z = fminf(c.z, 1.f);
     return c;
+}
+
+__device__ inline float3 three_point_shade(float3 N, float3 cam_w,
+                                           float3 key_dir, float3 fill_dir, float3 rim_dir,
+                                           float3 base_color,
+                                           float metallic = 0.f, float roughness = 0.5f)
+{
+    // cam_w points from the target toward the camera, which matches surface→camera.
+    return three_point_shade_view(N, cam_w, key_dir, fill_dir, rim_dir,
+                                  base_color, metallic, roughness);
 }
 
 // Sample base color from a GpuMaterial, applying texture if present.

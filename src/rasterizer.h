@@ -4,11 +4,13 @@
 #include <cuda_runtime.h>
 
 struct RasterizerState {
-    float* d_zbuffer    = nullptr;
-    int*   d_large_tris = nullptr;   // indices of screen-filling triangles
-    int*   d_large_count = nullptr;  // atomic counter
-    int    zbuf_w       = 0;
-    int    zbuf_h       = 0;
+    float*    d_zbuffer             = nullptr;
+    int*      d_large_tris          = nullptr;   // indices of screen-filling triangles
+    int*      d_large_count         = nullptr;   // atomic counter
+    Triangle* d_large_clipped_tris  = nullptr;   // generated near-plane-clipped large triangles
+    int*      d_large_clipped_count = nullptr;   // atomic counter
+    int       zbuf_w                = 0;
+    int       zbuf_h                = 0;
 };
 
 void rasterizer_init(RasterizerState& state);

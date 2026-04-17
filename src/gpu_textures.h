@@ -9,13 +9,13 @@
 // ─────────────────────────────────────────────
 
 struct GpuTexture {
-    cudaArray_t         array = nullptr;
-    cudaTextureObject_t tex   = 0;
+    cudaMipmappedArray_t mip_array = nullptr;
+    cudaTextureObject_t  tex       = 0;
 };
 
 // Upload an RGBA8 image to a CUDA texture object.
 // The texture is configured for normalized float reads, linear filtering,
-// and repeat wrap mode.  width*height*4 bytes are read from data.
+// repeat wrap mode, and mip filtering. width*height*4 bytes are read from data.
 // srgb=true: RGB channels are linearised (sRGB→linear) before upload so the
 //   path tracer always works in linear light.  Alpha is left as-is.
 GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
