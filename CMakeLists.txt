@@ -194,6 +194,7 @@ add_executable(pathtracer
     src/gltf_loader.cpp
     src/usd_loader.cpp
     src/urdf_loader.cpp
+    src/mjcf_loader.cpp
     src/post_process.cpp
     src/nim_vlm.cpp
     src/nim_cosmos.cpp

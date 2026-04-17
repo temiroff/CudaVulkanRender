@@ -12,6 +12,7 @@
 // ─────────────────────────────────────────────
 
 #include "urdf_loader.h"
+#include "urdf_internal.h"
 
 #include <iostream>
 #include <fstream>
@@ -31,35 +32,9 @@ namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────
 //  Minimal XML parser (read-only, no validation)
-//  Just enough to parse URDF and COLLADA files.
+//  Just enough to parse URDF, MJCF, and COLLADA files.
+//  XmlAttr/XmlNode are defined in urdf_internal.h.
 // ─────────────────────────────────────────────
-
-struct XmlAttr {
-    std::string name, value;
-};
-
-struct XmlNode {
-    std::string                tag;
-    std::string                text;       // inner text (non-element content)
-    std::vector<XmlAttr>       attrs;
-    std::vector<XmlNode>       children;
-
-    const XmlNode* child(const std::string& t) const {
-        for (auto& c : children) if (c.tag == t) return &c;
-        return nullptr;
-    }
-
-    std::vector<const XmlNode*> children_with_tag(const std::string& t) const {
-        std::vector<const XmlNode*> out;
-        for (auto& c : children) if (c.tag == t) out.push_back(&c);
-        return out;
-    }
-
-    std::string attr(const std::string& name, const std::string& def = "") const {
-        for (auto& a : attrs) if (a.name == name) return a.value;
-        return def;
-    }
-};
 
 static void skip_ws(const char*& p) { while (*p && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) ++p; }
 
@@ -130,7 +105,7 @@ static bool parse_node(const char*& p, XmlNode& node) {
     return true;
 }
 
-static XmlNode parse_xml(const std::string& xml_str) {
+XmlNode parse_xml(const std::string& xml_str) {
     const char* p = xml_str.c_str();
     XmlNode root;
     while (*p) {
@@ -146,7 +121,7 @@ static XmlNode parse_xml(const std::string& xml_str) {
     return root;
 }
 
-static std::string read_file_text(const std::string& path) {
+std::string read_file_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
     std::ostringstream ss;
@@ -155,56 +130,8 @@ static std::string read_file_text(const std::string& path) {
 }
 
 // ─────────────────────────────────────────────
-//  Math: 4x4 matrix, RPY rotation
+//  Math helpers — Mat4 is defined in urdf_internal.h
 // ─────────────────────────────────────────────
-
-struct Mat4 {
-    float m[4][4] = {{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}};
-
-    static Mat4 identity() { Mat4 r; return r; }
-
-    static Mat4 from_rpy_xyz(float roll, float pitch, float yaw,
-                              float x, float y, float z) {
-        float cr = cosf(roll),  sr = sinf(roll);
-        float cp = cosf(pitch), sp = sinf(pitch);
-        float cy = cosf(yaw),   sy = sinf(yaw);
-        Mat4 T;
-        T.m[0][0] = cy*cp;  T.m[0][1] = cy*sp*sr - sy*cr;  T.m[0][2] = cy*sp*cr + sy*sr;  T.m[0][3] = x;
-        T.m[1][0] = sy*cp;  T.m[1][1] = sy*sp*sr + cy*cr;  T.m[1][2] = sy*sp*cr - cy*sr;  T.m[1][3] = y;
-        T.m[2][0] = -sp;    T.m[2][1] = cp*sr;              T.m[2][2] = cp*cr;              T.m[2][3] = z;
-        T.m[3][0] = 0;      T.m[3][1] = 0;                  T.m[3][2] = 0;                  T.m[3][3] = 1;
-        return T;
-    }
-
-    Mat4 operator*(const Mat4& b) const {
-        Mat4 r;
-        for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 4; ++j) {
-                r.m[i][j] = 0;
-                for (int k = 0; k < 4; ++k)
-                    r.m[i][j] += m[i][k] * b.m[k][j];
-            }
-        return r;
-    }
-
-    float3 transform_point(float3 p) const {
-        return make_float3(
-            m[0][0]*p.x + m[0][1]*p.y + m[0][2]*p.z + m[0][3],
-            m[1][0]*p.x + m[1][1]*p.y + m[1][2]*p.z + m[1][3],
-            m[2][0]*p.x + m[2][1]*p.y + m[2][2]*p.z + m[2][3]);
-    }
-
-    float3 transform_normal(float3 n) const {
-        // Normals transform by upper 3x3 (assumes orthonormal rotation)
-        float3 r = make_float3(
-            m[0][0]*n.x + m[0][1]*n.y + m[0][2]*n.z,
-            m[1][0]*n.x + m[1][1]*n.y + m[1][2]*n.z,
-            m[2][0]*n.x + m[2][1]*n.y + m[2][2]*n.z);
-        float len = sqrtf(r.x*r.x + r.y*r.y + r.z*r.z);
-        if (len > 1e-7f) { r.x /= len; r.y /= len; r.z /= len; }
-        return r;
-    }
-};
 
 static Mat4 parse_origin(const XmlNode* origin) {
     if (!origin) return Mat4::identity();
@@ -249,21 +176,9 @@ static std::string resolve_mesh_path(const std::string& filename,
 //  STL binary loader
 // ─────────────────────────────────────────────
 
-struct DaeMaterial {
-    float4 diffuse  = make_float4(0.7f, 0.7f, 0.7f, 1.0f);
-    float  specular_intensity = 0.25f;
-    float  shininess = 0.0f;
-};
+// DaeMaterial and RawMesh are defined in urdf_internal.h
 
-struct RawMesh {
-    std::vector<float3> vertices;
-    std::vector<float3> normals;    // per-vertex
-    std::vector<int>    indices;    // triangle indices (3 per face)
-    std::vector<int>    mat_ids;    // per-triangle material index into dae_materials
-    std::vector<DaeMaterial> dae_materials;
-};
-
-static bool load_stl(const std::string& path, RawMesh& out) {
+bool load_stl(const std::string& path, RawMesh& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
 
@@ -364,7 +279,7 @@ static float4 parse_color4(const std::string& text) {
     return make_float4(0.7f, 0.7f, 0.7f, 1.0f);
 }
 
-static bool load_dae(const std::string& path, RawMesh& out) {
+bool load_dae(const std::string& path, RawMesh& out) {
     std::string xml_str = read_file_text(path);
     if (xml_str.empty()) return false;
 
@@ -672,23 +587,8 @@ static bool load_dae(const std::string& path, RawMesh& out) {
 }
 
 // ─────────────────────────────────────────────
-//  URDF data structures
+//  URDF data structures — defined in urdf_internal.h
 // ─────────────────────────────────────────────
-
-struct URDFLink {
-    std::string name;
-    std::string visual_mesh_path;   // resolved filesystem path
-    Mat4        visual_origin;
-};
-
-struct URDFJoint {
-    std::string name;
-    std::string type;   // revolute, prismatic, fixed, continuous
-    std::string parent;
-    std::string child;
-    Mat4        origin;
-    float3      axis = {0, 0, 1};
-};
 
 // ─────────────────────────────────────────────
 //  URDF parser
@@ -763,6 +663,12 @@ static bool parse_urdf(const std::string& urdf_path,
             j.axis = make_float3(ax, ay, az);
         }
 
+        auto* limit_node = joint_node->child("limit");
+        if (limit_node) {
+            j.lower = (float)std::atof(limit_node->attr("lower", "0").c_str());
+            j.upper = (float)std::atof(limit_node->attr("upper", "0").c_str());
+        }
+
         joints.push_back(j);
         child_links.insert(j.child);
     }
@@ -785,7 +691,7 @@ static bool parse_urdf(const std::string& urdf_path,
 //  Build Triangle/Material output
 // ─────────────────────────────────────────────
 
-static bool load_link_mesh(const std::string& mesh_path, RawMesh& raw) {
+bool load_link_mesh(const std::string& mesh_path, RawMesh& raw) {
     if (mesh_path.empty() || !fs::exists(mesh_path)) return false;
 
     auto ext = fs::path(mesh_path).extension().string();
@@ -793,9 +699,153 @@ static bool load_link_mesh(const std::string& mesh_path, RawMesh& raw) {
 
     if (ext == ".stl") return load_stl(mesh_path, raw);
     if (ext == ".dae") return load_dae(mesh_path, raw);
+    if (ext == ".obj") return load_obj(mesh_path, raw);
 
     std::cerr << "[urdf_loader] unsupported mesh format: " << ext << '\n';
     return false;
+}
+
+// ─────────────────────────────────────────────
+//  OBJ loader (MJCF meshes)
+//  Minimal Wavefront OBJ parser — v/vn/f only.
+//  Triangulates polygons as fans. Ignores textures,
+//  groups, materials (MJCF assigns materials externally
+//  per-geom, not per-face).
+// ─────────────────────────────────────────────
+
+bool load_obj(const std::string& path, RawMesh& out)
+{
+    std::ifstream f(path);
+    if (!f) return false;
+
+    std::vector<float3> positions;
+    std::vector<float3> normals;
+    positions.reserve(1024);
+    normals.reserve(1024);
+
+    // Deduplicate (v,vn) pairs so we can emit unique vertices.
+    struct PairKey { int v, n; };
+    auto make_key = [](int v, int n) -> long long {
+        return ((long long)(uint32_t)v << 32) | (uint32_t)n;
+    };
+    std::unordered_map<long long, int> key_to_vidx;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        const char* p = line.c_str();
+        while (*p == ' ' || *p == '\t') ++p;
+        if (p[0] == '#' || p[0] == '\0') continue;
+
+        if (p[0] == 'v' && (p[1] == ' ' || p[1] == '\t')) {
+            float x, y, z;
+            if (sscanf(p + 1, "%f %f %f", &x, &y, &z) == 3)
+                positions.push_back(make_float3(x, y, z));
+        } else if (p[0] == 'v' && p[1] == 'n') {
+            float x, y, z;
+            if (sscanf(p + 2, "%f %f %f", &x, &y, &z) == 3)
+                normals.push_back(make_float3(x, y, z));
+        } else if (p[0] == 'f' && (p[1] == ' ' || p[1] == '\t')) {
+            // Parse face tokens like "v/vt/vn" or "v//vn" or "v"
+            std::vector<int> face_v;
+            std::vector<int> face_n;
+            const char* q = p + 1;
+            while (*q) {
+                while (*q == ' ' || *q == '\t') ++q;
+                if (!*q || *q == '\n' || *q == '\r') break;
+
+                int vi = 0, ti = 0, ni = 0;
+                // parse vertex index
+                bool neg = false;
+                if (*q == '-') { neg = true; ++q; }
+                while (*q >= '0' && *q <= '9') { vi = vi*10 + (*q - '0'); ++q; }
+                if (neg) vi = -vi;
+
+                if (*q == '/') {
+                    ++q;
+                    // texture index (skip)
+                    bool tneg = false;
+                    if (*q == '-') { tneg = true; ++q; }
+                    while (*q >= '0' && *q <= '9') { ti = ti*10 + (*q - '0'); ++q; }
+                    if (tneg) ti = -ti;
+
+                    if (*q == '/') {
+                        ++q;
+                        bool nneg = false;
+                        if (*q == '-') { nneg = true; ++q; }
+                        while (*q >= '0' && *q <= '9') { ni = ni*10 + (*q - '0'); ++q; }
+                        if (nneg) ni = -ni;
+                    }
+                }
+
+                // OBJ indices are 1-based; negative = relative-from-end
+                int v_idx = (vi > 0) ? vi - 1 : (int)positions.size() + vi;
+                int n_idx = (ni > 0) ? ni - 1 : (ni < 0 ? (int)normals.size() + ni : -1);
+
+                face_v.push_back(v_idx);
+                face_n.push_back(n_idx);
+
+                // skip any remaining chars to next whitespace
+                while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') ++q;
+            }
+
+            if (face_v.size() < 3) continue;
+
+            // Fan triangulation
+            auto emit_vertex = [&](int v, int n) -> int {
+                long long k = make_key(v, n);
+                auto it = key_to_vidx.find(k);
+                if (it != key_to_vidx.end()) return it->second;
+
+                if (v < 0 || v >= (int)positions.size()) return -1;
+                float3 pos = positions[v];
+                float3 nrm;
+                if (n >= 0 && n < (int)normals.size()) nrm = normals[n];
+                else nrm = make_float3(0, 0, 0);    // will be replaced by face normal
+
+                int idx = (int)out.vertices.size();
+                out.vertices.push_back(pos);
+                out.normals.push_back(nrm);
+                key_to_vidx[k] = idx;
+                return idx;
+            };
+
+            int i0 = emit_vertex(face_v[0], face_n[0]);
+            if (i0 < 0) continue;
+            for (size_t k = 1; k + 1 < face_v.size(); ++k) {
+                int i1 = emit_vertex(face_v[k],   face_n[k]);
+                int i2 = emit_vertex(face_v[k+1], face_n[k+1]);
+                if (i1 < 0 || i2 < 0) continue;
+
+                // If any vertex lacks a normal, synthesize one from the face.
+                bool missing_normal =
+                    (face_n[0]   < 0) ||
+                    (face_n[k]   < 0) ||
+                    (face_n[k+1] < 0);
+                if (missing_normal) {
+                    float3 v0 = out.vertices[i0];
+                    float3 v1 = out.vertices[i1];
+                    float3 v2 = out.vertices[i2];
+                    float3 e1 = make_float3(v1.x-v0.x, v1.y-v0.y, v1.z-v0.z);
+                    float3 e2 = make_float3(v2.x-v0.x, v2.y-v0.y, v2.z-v0.z);
+                    float3 fn = make_float3(e1.y*e2.z - e1.z*e2.y,
+                                            e1.z*e2.x - e1.x*e2.z,
+                                            e1.x*e2.y - e1.y*e2.x);
+                    float len = sqrtf(fn.x*fn.x + fn.y*fn.y + fn.z*fn.z);
+                    if (len > 1e-7f) { fn.x/=len; fn.y/=len; fn.z/=len; }
+                    if (face_n[0]   < 0) out.normals[i0] = fn;
+                    if (face_n[k]   < 0) out.normals[i1] = fn;
+                    if (face_n[k+1] < 0) out.normals[i2] = fn;
+                }
+
+                out.indices.push_back(i0);
+                out.indices.push_back(i1);
+                out.indices.push_back(i2);
+            }
+        }
+    }
+
+    return !out.vertices.empty();
 }
 
 static float3 compute_centroid(const std::vector<float3>& verts) {
@@ -978,46 +1028,10 @@ bool urdf_load(const std::string&          path,
 
 // ─────────────────────────────────────────────
 //  URDF Articulation — persistent state
+//  (LinkMeshCache and UrdfArticulation defined in urdf_internal.h)
 // ─────────────────────────────────────────────
 
-// Cached mesh data per link (topology + raw verts for re-posing)
-struct LinkMeshCache {
-    std::string link_name;
-    RawMesh     raw;
-    int         tri_start;   // index into the flat Triangle array
-    int         tri_count;
-    int         obj_id;
-    // Per-triangle material indices (relative to link_mat_base)
-    std::vector<int> mat_ids;
-    int         link_mat_base;
-};
-
-struct UrdfArticulation {
-    // Parsed URDF data
-    std::unordered_map<std::string, URDFLink> links;
-    std::vector<URDFJoint>                    joints;
-    std::string                               root_link;
-    std::unordered_map<std::string, std::vector<const URDFJoint*>> children_map;
-
-    // Articulated joints (excludes fixed)
-    std::vector<UrdfJointInfo> joint_infos;
-    // Map from joint name → index into joint_infos
-    std::unordered_map<std::string, int> joint_name_to_idx;
-
-    // Cached mesh data per link
-    std::vector<LinkMeshCache> mesh_caches;
-
-    // Axis correction
-    Mat4 z_to_y;
-
-    // End-effector: deepest leaf link (cached on open)
-    std::string ee_link_name;
-    float3 ee_world_pos = {0, 0, 0};  // updated by urdf_repose
-
-    int total_tris = 0;
-};
-
-static Mat4 axis_angle_rotation(float3 axis, float angle)
+Mat4 axis_angle_rotation(float3 axis, float angle)
 {
     float ax = axis.x, ay = axis.y, az = axis.z;
     float len = sqrtf(ax*ax + ay*ay + az*az);
@@ -1032,28 +1046,25 @@ static Mat4 axis_angle_rotation(float3 axis, float angle)
     return R;
 }
 
-UrdfArticulation* urdf_articulation_open(const std::string& path,
-                                          const std::vector<Triangle>& initial_tris)
+void urdf_articulation_finalize(UrdfArticulation* h,
+                                const std::vector<Triangle>& initial_tris)
 {
-    auto* h = new UrdfArticulation;
-
-    // Re-parse URDF (lightweight — just XML, no mesh loading)
-    if (!parse_urdf(path, h->links, h->joints, h->root_link)) {
-        delete h;
-        return nullptr;
-    }
+    if (!h) return;
 
     // Build children map
+    h->children_map.clear();
     for (auto& j : h->joints)
         h->children_map[j.parent].push_back(&j);
 
-    // Axis correction
+    // Axis correction (Z-up → Y-up)
     h->z_to_y = Mat4::identity();
     h->z_to_y.m[0][0] =  1; h->z_to_y.m[0][1] =  0; h->z_to_y.m[0][2] =  0;
     h->z_to_y.m[1][0] =  0; h->z_to_y.m[1][1] =  0; h->z_to_y.m[1][2] =  1;
     h->z_to_y.m[2][0] =  0; h->z_to_y.m[2][1] = -1; h->z_to_y.m[2][2] =  0;
 
-    // Build joint info list (only movable joints)
+    // Build joint info list (only movable joints). Limits come directly from URDFJoint.
+    h->joint_infos.clear();
+    h->joint_name_to_idx.clear();
     for (auto& j : h->joints) {
         if (j.type == "fixed") continue;
         UrdfJointInfo ji{};
@@ -1063,31 +1074,11 @@ UrdfArticulation* urdf_articulation_open(const std::string& path,
         else if (j.type == "continuous") ji.type = 2;
         else ji.type = 3;
 
-        // Parse limits from URDF joints
-        // (limits were stored during parse_urdf but not kept — re-parse)
-        ji.lower = 0; ji.upper = 0; ji.angle = 0;
+        ji.lower = j.lower;
+        ji.upper = j.upper;
+        ji.angle = 0;
         h->joint_name_to_idx[j.name] = (int)h->joint_infos.size();
         h->joint_infos.push_back(ji);
-    }
-
-    // Re-parse to get limits (parse_urdf doesn't store them in URDFJoint currently)
-    {
-        std::string xml_str = read_file_text(path);
-        XmlNode doc = parse_xml(xml_str);
-        if (doc.tag != "robot") {
-            auto* robot = find_node(doc, "robot");
-            if (robot) doc = *robot;
-        }
-        for (auto& jn : doc.children_with_tag("joint")) {
-            std::string name = jn->attr("name");
-            auto it = h->joint_name_to_idx.find(name);
-            if (it == h->joint_name_to_idx.end()) continue;
-            auto* limit = jn->child("limit");
-            if (limit) {
-                h->joint_infos[it->second].lower = std::atof(limit->attr("lower", "0").c_str());
-                h->joint_infos[it->second].upper = std::atof(limit->attr("upper", "0").c_str());
-            }
-        }
     }
 
     // Cache mesh data per link by re-loading meshes
@@ -1173,12 +1164,22 @@ UrdfArticulation* urdf_articulation_open(const std::string& path,
         }
     }
 
-    std::cerr << "[urdf_articulation] opened: " << h->joint_infos.size()
+    std::cerr << "[urdf_articulation] finalized: " << h->joint_infos.size()
               << " joints, " << h->mesh_caches.size() << " mesh caches, "
               << h->total_tris << " triangles, ee=" << h->ee_link_name
               << " pos=(" << h->ee_world_pos.x << "," << h->ee_world_pos.y
               << "," << h->ee_world_pos.z << ")\n";
+}
 
+UrdfArticulation* urdf_articulation_open(const std::string& path,
+                                          const std::vector<Triangle>& initial_tris)
+{
+    auto* h = new UrdfArticulation;
+    if (!parse_urdf(path, h->links, h->joints, h->root_link)) {
+        delete h;
+        return nullptr;
+    }
+    urdf_articulation_finalize(h, initial_tris);
     return h;
 }
 

@@ -18,13 +18,14 @@ static std::string open_gltf_picker() {
                                        IID_IFileOpenDialog, reinterpret_cast<void**>(&pfd))))
         {
             COMDLG_FILTERSPEC types[] = {
-                { L"3D Scenes (glTF / USD / URDF)", L"*.gltf;*.glb;*.usd;*.usda;*.usdc;*.usdz;*.urdf" },
+                { L"3D Scenes (glTF / USD / URDF / MJCF)", L"*.gltf;*.glb;*.usd;*.usda;*.usdc;*.usdz;*.urdf;*.xml" },
                 { L"glTF / GLB",                    L"*.gltf;*.glb"                                    },
                 { L"USD / USDA / USDC",             L"*.usd;*.usda;*.usdc;*.usdz"                      },
                 { L"URDF (Robot Description)",      L"*.urdf"                                           },
+                { L"MJCF (MuJoCo XML)",             L"*.xml"                                            },
                 { L"All Files",                     L"*.*"                                              }
             };
-            pfd->SetFileTypes(5, types);
+            pfd->SetFileTypes(6, types);
             pfd->SetFileTypeIndex(1);
             pfd->SetTitle(L"Open 3D Scene");
 

@@ -18,6 +18,7 @@
 #include "gltf_loader.h"
 #include "usd_loader.h"
 #include "urdf_loader.h"
+#include "mjcf_loader.h"
 #include "restir.h"
 #include "rasterizer.h"
 #include "hdri.h"
@@ -943,6 +944,13 @@ static bool is_urdf_path(const std::string& path)
     return (ext == ".urdf");
 }
 
+static bool is_mjcf_path(const std::string& path)
+{
+    auto ext = std::filesystem::path(path).extension().string();
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    return (ext == ".xml");
+}
+
 static bool load_gltf_into(const std::string& path, MeshState& ms,
                             ControlPanelState& ctrl)
 {
@@ -955,12 +963,15 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
     // Route by extension
     const bool is_usd  = is_usd_scene_path(path);
     const bool is_urdf = is_urdf_path(path);
+    const bool is_mjcf = is_mjcf_path(path);
 
     bool load_ok = is_urdf
         ? urdf_load(path, tris, mats, tex_images, ms.objects)
-        : is_usd
-            ? usd_load (path, tris, mats, tex_images, ms.objects)
-            : gltf_load(path, tris, mats, tex_images, ms.objects);
+        : is_mjcf
+            ? mjcf_load(path, tris, mats, tex_images, ms.objects)
+            : is_usd
+                ? usd_load (path, tris, mats, tex_images, ms.objects)
+                : gltf_load(path, tris, mats, tex_images, ms.objects);
     if (!load_ok) return false;
 
     // Upload textures
@@ -1094,12 +1105,15 @@ static bool import_into_scene(const std::string& path, MeshState& ms,
 
     const bool is_usd  = is_usd_scene_path(path);
     const bool is_urdf = is_urdf_path(path);
+    const bool is_mjcf = is_mjcf_path(path);
 
     bool load_ok = is_urdf
         ? urdf_load(path, tris, mats, tex_images, new_objects)
-        : is_usd
-            ? usd_load (path, tris, mats, tex_images, new_objects)
-            : gltf_load(path, tris, mats, tex_images, new_objects);
+        : is_mjcf
+            ? mjcf_load(path, tris, mats, tex_images, new_objects)
+            : is_usd
+                ? usd_load (path, tris, mats, tex_images, new_objects)
+                : gltf_load(path, tris, mats, tex_images, new_objects);
     if (!load_ok) return false;
 
     // Compute offsets
@@ -2054,6 +2068,8 @@ int main() {
                 robot_demo = RobotDemoState{};
                 if (is_urdf_path(ctrl.gltf_path)) {
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
+                } else if (is_mjcf_path(ctrl.gltf_path)) {
+                    urdf_artic_handle = mjcf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                 }
             }
         }
@@ -2068,6 +2084,10 @@ int main() {
                 if (is_urdf_path(ctrl.gltf_path)) {
                     if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
+                    robot_demo = RobotDemoState{};
+                } else if (is_mjcf_path(ctrl.gltf_path)) {
+                    if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
+                    urdf_artic_handle = mjcf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                     robot_demo = RobotDemoState{};
                 }
             }
