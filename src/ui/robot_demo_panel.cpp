@@ -151,6 +151,30 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
     return true;
 }
 
+// ── Gripper snap toggle ──────────────────────────────────────────────────────
+
+bool gripper_toggle(RobotDemoState& state, UrdfArticulation* handle, bool close)
+{
+    if (!handle) return false;
+    std::vector<int> fingers;
+    urdf_gripper_finger_indices(handle, fingers);
+    if (fingers.empty()) return false;
+
+    int n = urdf_joint_count(handle);
+    UrdfJointInfo* joints = urdf_joint_info(handle);
+    bool changed = false;
+    for (int ji : fingers) {
+        if (ji < 0 || ji >= n) continue;
+        UrdfJointInfo& j = joints[ji];
+        float lo = j.lower, hi = j.upper;
+        if (!(hi > lo)) { lo = 0.f; hi = 0.f; }
+        float target = close ? lo : hi;
+        if (j.angle != target) { j.angle = target; changed = true; }
+    }
+    state.gripper_closed = close;
+    return changed;
+}
+
 // ── Grasp update ─────────────────────────────────────────────────────────────
 
 // 3x3 matrix helpers for rotation
@@ -177,7 +201,11 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
 {
     if (!handle) return;
 
-    float3 ee = urdf_end_effector_pos(handle);
+    // Grip reference: offset from the ee link origin toward the fingertips
+    // (local +Z). urdf_end_effector_pos returns the hand-link centroid which
+    // sits ~10 cm above the actual grip point for Panda-style grippers, so
+    // small objects between the fingers fell outside the proximity threshold.
+    float3 ee = urdf_gripper_grip_point(handle, state.grip_forward);
 
     // Detect gripper transitions
     bool just_closed = (state.gripper_closed && !state.prev_gripper_closed);
@@ -185,6 +213,24 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
     state.prev_gripper_closed = state.gripper_closed;
 
     if (just_closed && !state.grasp.active) {
+        // Build a set of candidate contact points: the grip reference plus
+        // every "finger" link world origin. Grasp distance uses the nearest
+        // candidate, so the grab zone covers the whole gripper, not a single
+        // tool-frame point.
+        std::vector<float3> contact_pts;
+        urdf_gripper_finger_worlds(handle, contact_pts);
+        contact_pts.push_back(ee);
+
+        auto min_dist_to_contact = [&](float3 p) {
+            float best = 1e30f;
+            for (const auto& c : contact_pts) {
+                float3 d = make_float3(p.x - c.x, p.y - c.y, p.z - c.z);
+                float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+                if (dist < best) best = dist;
+            }
+            return best;
+        };
+
         float best_dist = state.grasp_threshold;
         int   best_idx  = -1;
         bool  best_is_mesh = false;
@@ -192,10 +238,7 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
         // Check spheres
         for (int i = 0; i < (int)spheres.size(); i++) {
             if (spheres[i].radius > 50.f) continue;
-            float3 d = make_float3(spheres[i].center.x - ee.x,
-                                   spheres[i].center.y - ee.y,
-                                   spheres[i].center.z - ee.z);
-            float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+            float dist = min_dist_to_contact(spheres[i].center);
             if (dist < best_dist) {
                 best_dist = dist; best_idx = i; best_is_mesh = false;
             }
@@ -204,9 +247,7 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
         // Check mesh objects by centroid
         for (int i = 0; i < (int)objects.size(); i++) {
             if (objects[i].hidden) continue;
-            float3 c = objects[i].centroid;
-            float3 d = make_float3(c.x - ee.x, c.y - ee.y, c.z - ee.z);
-            float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+            float dist = min_dist_to_contact(objects[i].centroid);
             if (dist < best_dist) {
                 best_dist = dist; best_idx = i; best_is_mesh = true;
             }

@@ -67,6 +67,15 @@ void urdf_set_ik_lock_joint(UrdfArticulation* h, int joint_idx);
 // Returns -1 if nothing is movable.
 int  urdf_ik_lock_joint_effective(UrdfArticulation* h);
 
+// Joint rotated by the [ / ] keyboard shortcuts. -1 = "follow IK lock"
+// (the default, preserves the original hotkey behaviour).
+int  urdf_kb_joint(UrdfArticulation* h);
+void urdf_set_kb_joint(UrdfArticulation* h, int joint_idx);
+
+// Resolve the effective keyboard-driven joint: falls back to the IK-locked
+// joint when kb_joint is -1. Returns -1 if nothing is available.
+int  urdf_kb_joint_effective(UrdfArticulation* h);
+
 // Per-joint multi-lock. Any joint marked locked is excluded from IK, so
 // the solver has to find a solution without moving it. The primary lock
 // (above) is implicitly locked as well. Joint index is into urdf_joint_info().
@@ -107,6 +116,25 @@ bool urdf_repose_with_body_xforms(UrdfArticulation* h,
                                    const std::vector<std::string>& body_names,
                                    const std::vector<float>& body_mats_flat,
                                    std::vector<Triangle>& triangles_out);
+
+// Indices (into urdf_joint_info array) of gripper finger joints — joints
+// whose name contains "finger" and are drivable (revolute, prismatic, or
+// continuous). Empty if no fingers are recognizable. Used by the UI to
+// expose a dedicated Open/Close gripper control.
+void urdf_gripper_finger_indices(UrdfArticulation* h, std::vector<int>& out);
+
+// World-space "grip point" — where a grasped object should be anchored.
+// Computed as the EE link origin projected forward along the hand's local
+// +Z axis (the conventional direction fingers extend in URDF/MJCF gripper
+// definitions) by `forward_offset` meters. For Panda, 0.08–0.10 m puts this
+// between the fingertips. Falls back to urdf_end_effector_pos when FK fails.
+float3 urdf_gripper_grip_point(UrdfArticulation* h, float forward_offset);
+
+// World-space origins of every link whose name contains "finger", computed
+// by walking the full kinematic tree with the current joint angles applied.
+// Used for proximity-based grasp detection so the "grab zone" covers both
+// fingertips rather than a single tool-frame point.
+void urdf_gripper_finger_worlds(UrdfArticulation* h, std::vector<float3>& out);
 
 // Free all cached data.
 void urdf_articulation_close(UrdfArticulation* h);

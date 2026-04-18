@@ -48,7 +48,8 @@ struct RobotDemoState {
 
     // Grasp
     GraspState grasp;
-    float grasp_threshold = 0.15f;  // proximity distance for auto-attach
+    float grasp_threshold = 0.25f;  // proximity distance for auto-attach (m)
+    float grip_forward    = 0.08f;  // offset from ee origin along hand +Z (m)
 
     // Internal
     bool prev_gripper_closed = false;
@@ -80,3 +81,8 @@ void robot_demo_reset_grasp(RobotDemoState& state,
 // Save/load trajectory to/from JSON.
 bool robot_demo_save(const RobotDemoState& state, const char* path);
 bool robot_demo_load(RobotDemoState& state, const char* path);
+
+// Snap fingers to lower (close=true) or upper (open=false) limits, flip
+// state.gripper_closed so the next grasp update sees the transition.
+// Returns true if finger angles changed.
+bool gripper_toggle(RobotDemoState& state, UrdfArticulation* handle, bool close);

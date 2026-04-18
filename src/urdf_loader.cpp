@@ -1426,6 +1426,31 @@ int urdf_ik_lock_joint_effective(UrdfArticulation* h)
     return -1;
 }
 
+int urdf_kb_joint(UrdfArticulation* h)
+{
+    return h ? h->kb_joint : -1;
+}
+
+void urdf_set_kb_joint(UrdfArticulation* h, int joint_idx)
+{
+    if (!h) return;
+    if (joint_idx < -1 || joint_idx >= (int)h->joint_infos.size()) return;
+    h->kb_joint = joint_idx;
+}
+
+int urdf_kb_joint_effective(UrdfArticulation* h)
+{
+    if (!h || h->joint_infos.empty()) return -1;
+    int n = (int)h->joint_infos.size();
+    if (h->kb_joint >= 0 && h->kb_joint < n) {
+        int t = h->joint_infos[h->kb_joint].type;
+        // Any drivable joint: revolute, prismatic, or continuous.
+        if (t == 0 || t == 1 || t == 2) return h->kb_joint;
+    }
+    // Default: the IK-locked joint (what [ / ] rotated before this API).
+    return urdf_ik_lock_joint_effective(h);
+}
+
 bool urdf_ik_is_locked(UrdfArticulation* h, int joint_idx)
 {
     if (!h || joint_idx < 0 || joint_idx >= (int)h->ik_locked_mask.size()) return false;
@@ -1460,6 +1485,81 @@ void urdf_ik_clear_all_locks(UrdfArticulation* h)
 {
     if (!h) return;
     std::fill(h->ik_locked_mask.begin(), h->ik_locked_mask.end(), 0);
+}
+
+float3 urdf_gripper_grip_point(UrdfArticulation* h, float forward_offset)
+{
+    if (!h) return make_float3(0, 0, 0);
+    float m[16];
+    urdf_fk_ee_transform(h, m);
+    // m is row-major 4x4; column 2 (m[0][2], m[1][2], m[2][2]) is the hand's
+    // local +Z axis in world space. Origin is column 3.
+    float ox = m[3], oy = m[7], oz = m[11];
+    float zx = m[2], zy = m[6], zz = m[10];
+    return make_float3(ox + zx * forward_offset,
+                       oy + zy * forward_offset,
+                       oz + zz * forward_offset);
+}
+
+void urdf_gripper_finger_indices(UrdfArticulation* h, std::vector<int>& out)
+{
+    out.clear();
+    if (!h) return;
+    int n = (int)h->joint_infos.size();
+    for (int i = 0; i < n; ++i) {
+        int t = h->joint_infos[i].type;
+        if (t != 0 && t != 1 && t != 2) continue;   // driveable only
+        std::string nm = h->joint_infos[i].name;
+        std::string lower;
+        lower.reserve(nm.size());
+        for (char c : nm) lower += (char)tolower((unsigned char)c);
+        if (lower.find("finger") != std::string::npos) out.push_back(i);
+    }
+}
+
+void urdf_gripper_finger_worlds(UrdfArticulation* h, std::vector<float3>& out)
+{
+    out.clear();
+    if (!h) return;
+
+    // Joint-name → current angle map. Same data the repose walker uses.
+    std::unordered_map<std::string, float> angles;
+    for (auto& ji : h->joint_infos) angles[ji.name] = ji.angle;
+
+    // Recursive tree walk mirroring urdf_repose's joint-transform logic, but
+    // recording origin positions instead of transforming geometry.
+    std::function<void(const std::string&, Mat4)> walk;
+    walk = [&](const std::string& link_name, Mat4 world_xform) {
+        if (link_name == h->root_body_link)
+            world_xform = world_xform * h->root_xform;
+
+        std::string low;
+        low.reserve(link_name.size());
+        for (char c : link_name) low += (char)tolower((unsigned char)c);
+        if (low.find("finger") != std::string::npos)
+            out.push_back(world_xform.transform_point(make_float3(0, 0, 0)));
+
+        auto jit = h->children_map.find(link_name);
+        if (jit == h->children_map.end()) return;
+        for (auto* joint : jit->second) {
+            Mat4 jx = world_xform * joint->origin;
+            float a = 0.f;
+            auto ait = angles.find(joint->name);
+            if (ait != angles.end()) a = ait->second;
+            if ((joint->type == "revolute" || joint->type == "continuous") && a != 0.f) {
+                jx = jx * axis_angle_rotation(joint->axis, a);
+            } else if (joint->type == "prismatic" && a != 0.f) {
+                Mat4 slide = Mat4::identity();
+                slide.m[0][3] = joint->axis.x * a;
+                slide.m[1][3] = joint->axis.y * a;
+                slide.m[2][3] = joint->axis.z * a;
+                jx = jx * slide;
+            }
+            walk(joint->child, jx);
+        }
+    };
+
+    walk(h->root_link, h->z_to_y);
 }
 
 float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx)
@@ -1607,6 +1707,25 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
     }
     const int N = (int)use_ci.size();
     if (N == 0) return false;
+
+    // Weighted DLS: per-joint stiffness w[k] (higher = harder to move). The
+    // first two driven revolute joints on a serial arm (base twist, shoulder
+    // pitch on Panda/UR/Kinova) swing through the largest arcs in world space
+    // and dominate the unweighted least-squares solution. Up-weighting them
+    // pushes IK to prefer moving the elbow/wrist instead. Implemented by
+    // scaling Jacobian columns by 1/sqrt(w) so the existing DLS math works
+    // unchanged; final Δq is rescaled on step application.
+    std::vector<float> inv_sqrt_w(N, 1.f);
+    {
+        int rev_seen = 0;
+        for (int k = 0; k < N; ++k) {
+            int ji = chain[use_ci[k]].ji;
+            if (joints[ji].type != 0) continue;   // revolute only
+            if (rev_seen == 0)      inv_sqrt_w[k] = 1.f / sqrtf(5.0f);
+            else if (rev_seen == 1) inv_sqrt_w[k] = 1.f / sqrtf(2.5f);
+            ++rev_seen;
+        }
+    }
 
     // Orientation constraints — one per user-frozen joint that has at
     // least one movable ancestor to drive its child link.
@@ -1761,6 +1880,15 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             }
         }
 
+        // Apply per-joint weights: J̃ = J · W^(-1/2). From here on, everything
+        // (A, y, dq, null-space bias) operates on J̃; the real joint delta is
+        // recovered by multiplying dq[k] by inv_sqrt_w[k] on step application.
+        for (int k = 0; k < N; ++k) {
+            float s = inv_sqrt_w[k];
+            if (s == 1.f) continue;
+            for (int r = 0; r < M; ++r) J[r*N + k] *= s;
+        }
+
         // A = J Jᵀ + λ² I  (M×M).
         std::fill(A.begin(), A.end(), 0.f);
         for (int r = 0; r < M; ++r)
@@ -1811,7 +1939,9 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                 float lo = info.lower, hi = info.upper;
                 if (!(hi > lo)) continue;       // skip unlimited/degenerate
                 float center = 0.5f * (lo + hi);
-                qb[k] = bias_gain * (center - info.angle);
+                // qb is in weighted space (q̃b = W^(1/2)·qb_joint), so divide
+                // the joint-space bias by inv_sqrt_w[k] = 1/√w.
+                qb[k] = bias_gain * (center - info.angle) / inv_sqrt_w[k];
             }
             // J qb  (M)
             std::vector<float> Jqb((size_t)M, 0.f);
@@ -1835,9 +1965,12 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             }
         }
 
+        // Step cap operates on the real joint-space delta dq[k]·inv_sqrt_w[k],
+        // not the weighted-space dq[k], so max_dq is still the true radians
+        // cap per iteration regardless of weighting.
         float max_abs = 0.f;
         for (int k = 0; k < N; ++k) {
-            float a = fabsf(dq[k]);
+            float a = fabsf(dq[k] * inv_sqrt_w[k]);
             if (a > max_abs) max_abs = a;
         }
         float scale = 1.f;
@@ -1845,7 +1978,7 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
 
         for (int k = 0; k < N; ++k) {
             UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
-            info.angle += scale * dq[k];
+            info.angle += scale * dq[k] * inv_sqrt_w[k];
             clamp_joint(info, PI);
         }
     }

@@ -167,9 +167,12 @@ struct UrdfArticulation {
     std::string                               ee_link_name;
     float3                                    ee_world_pos = {0, 0, 0};
 
-    // Primary locked joint — the one [ / ] hotkeys rotate. -1 = auto (last
-    // movable). Index into joint_infos.
+    // Primary locked joint — excluded from IK. -1 = auto (last movable).
+    // Index into joint_infos.
     int                                       ik_lock_joint = -1;
+
+    // Joint driven by [ / ] keyboard shortcuts. -1 = follow ik_lock_joint.
+    int                                       kb_joint      = -1;
 
     // Per-joint IK lock. When set, the solver preserves the WORLD rotation
     // of the joint's child link (so a vertical tool stays vertical while the

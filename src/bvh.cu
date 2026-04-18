@@ -257,7 +257,11 @@ __device__ static bool sphere_hit(const Sphere& s, const Ray& r, float t_min, fl
 __device__ static bool tri_hit(const Triangle& tri, const Ray& r,
                                 float t_min, float t_max, HitRecord& rec)
 {
-    const float EPS = 1e-7f;
+    // Determinant epsilon only exists to avoid 1/0 on truly parallel rays.
+    // `a` scales with triangle area, so a larger value silently drops sub-mm
+    // mesh detail (SO-ARM100, small screws, fillets). Keep it right above
+    // float underflow instead of a geometric threshold.
+    const float EPS = 1e-30f;
     float3 e1 = tri.v1 - tri.v0;
     float3 e2 = tri.v2 - tri.v0;
     float3 h  = cross(r.dir, e2);

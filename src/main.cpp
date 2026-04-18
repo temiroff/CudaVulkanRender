@@ -42,6 +42,7 @@
 #include "ui/anim_panel.h"
 #include "ui/articulation_panel.h"
 #include "ui/robot_demo_panel.h"
+#include "ui/sensor_panel.h"
 #include "ui/hydra_preview.h"
 
 #include <windows.h>
@@ -1253,38 +1254,52 @@ static void rebuild_visible_bvh(MeshState& ms)
         // Build prim_remap: prims[i] → all_prims index.
         // BVH sort permuted the visible array. Match by finding which visible
         // entry each prims[i] corresponds to (bit-exact vertex match pre-repose).
+        // Key must include all three vertices — two triangles of a ground-plane
+        // quad share v0, so a v0-only key was ambiguous and produced swapped
+        // v1/v2 entries, which looked like flickering UVs on the floor every
+        // time the BVH was rebuilt.
         ms.prim_remap.resize(ms.prims.size(), -1);
-        // Build lookup from v0 bit pattern to vis_to_all index for O(N) matching
-        struct V0Key {
-            float x, y, z;
+        struct TriKey {
+            float v0x, v0y, v0z;
+            float v1x, v1y, v1z;
+            float v2x, v2y, v2z;
             int obj_id;
-            bool operator==(const V0Key& o) const {
-                return x == o.x && y == o.y && z == o.z && obj_id == o.obj_id;
+            bool operator==(const TriKey& o) const {
+                return v0x == o.v0x && v0y == o.v0y && v0z == o.v0z
+                    && v1x == o.v1x && v1y == o.v1y && v1z == o.v1z
+                    && v2x == o.v2x && v2y == o.v2y && v2z == o.v2z
+                    && obj_id == o.obj_id;
             }
         };
-        struct V0Hash {
-            size_t operator()(const V0Key& k) const {
+        struct TriHash {
+            size_t operator()(const TriKey& k) const {
                 size_t h = 0;
-                h ^= std::hash<float>{}(k.x) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                h ^= std::hash<float>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                h ^= std::hash<float>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                h ^= std::hash<int>{}(k.obj_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                auto mix = [&](auto v) {
+                    h ^= std::hash<decltype(v)>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                };
+                mix(k.v0x); mix(k.v0y); mix(k.v0z);
+                mix(k.v1x); mix(k.v1y); mix(k.v1z);
+                mix(k.v2x); mix(k.v2y); mix(k.v2z);
+                mix(k.obj_id);
                 return h;
             }
         };
-        // Map from v0+obj_id → list of all_prims indices (handles duplicates)
-        std::unordered_multimap<V0Key, int, V0Hash> key_to_all;
-        for (int k = 0; k < (int)visible.size(); k++) {
-            V0Key key = { visible[k].v0.x, visible[k].v0.y, visible[k].v0.z, visible[k].obj_id };
-            key_to_all.insert({ key, vis_to_all[k] });
-        }
+        auto make_key = [](const Triangle& t) {
+            return TriKey{
+                t.v0.x, t.v0.y, t.v0.z,
+                t.v1.x, t.v1.y, t.v1.z,
+                t.v2.x, t.v2.y, t.v2.z,
+                t.obj_id
+            };
+        };
+        std::unordered_multimap<TriKey, int, TriHash> key_to_all;
+        for (int k = 0; k < (int)visible.size(); k++)
+            key_to_all.insert({ make_key(visible[k]), vis_to_all[k] });
         for (int i = 0; i < (int)ms.prims.size(); i++) {
-            V0Key key = { ms.prims[i].v0.x, ms.prims[i].v0.y, ms.prims[i].v0.z, ms.prims[i].obj_id };
-            auto range = key_to_all.equal_range(key);
-            for (auto it = range.first; it != range.second; ++it) {
-                ms.prim_remap[i] = it->second;
-                key_to_all.erase(it);  // consume so duplicates get unique mappings
-                break;
+            auto range = key_to_all.equal_range(make_key(ms.prims[i]));
+            if (range.first != range.second) {
+                ms.prim_remap[i] = range.first->second;
+                key_to_all.erase(range.first);
             }
         }
     }
@@ -1529,6 +1544,7 @@ int main() {
     // URDF articulation — persistent handle for interactive joint control
     UrdfArticulation*        urdf_artic_handle = nullptr;
     RobotDemoState           robot_demo;
+    SensorState              sensor_state;
 
     // Physics sim — owns authoritative state (qpos/qvel) when active. Joint
     // angles flow from sim into the articulation each frame; the existing
@@ -1758,7 +1774,10 @@ int main() {
         // On slider release: full BVH rebuild for optimal tree quality.
         {
             static bool s_artic_was_active = false;
-            bool artic_changed = articulation_panel_draw(urdf_artic_handle, robot_demo.playing) &&
+            bool panel_changed = articulation_panel_draw(urdf_artic_handle,
+                                                         robot_demo.playing,
+                                                         &robot_demo);
+            bool artic_changed = panel_changed &&
                                  urdf_repose(urdf_artic_handle, mesh.all_prims);
             if (artic_changed) {
                 reupload_visible_prims(mesh);
@@ -1768,6 +1787,29 @@ int main() {
                 ++mesh.scene_version;
                 cam_changed = true;
                 s_artic_was_active = true;
+
+                // Feed the gripper/pose change through the same grasp pipeline
+                // the robot demo uses — attach on close, drop on open, follow
+                // the ee while held. Skipped during playback: the demo tick
+                // loop already runs this block.
+                if (!robot_demo.playing) {
+                    robot_demo_update_grasp(robot_demo, urdf_artic_handle,
+                                            prims_sorted, mesh.objects, mesh.all_prims);
+                    if (robot_demo.grasp.active) {
+                        if (!robot_demo.grasp.is_mesh) {
+                            rebuild_bvh(bvh_nodes, prims_sorted, &d_bvh, &d_prims,
+                                        ctrl.selected_sphere,
+                                        ctrl.selected_sphere >= 0
+                                            ? prims_sorted[ctrl.selected_sphere].center
+                                            : make_float3(0,0,0));
+                        } else {
+                            reupload_visible_prims(mesh);
+                            if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                                bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                            ++mesh.scene_version;
+                        }
+                    }
+                }
             } else if (s_artic_was_active) {
                 // Sliders stopped — full BVH rebuild for optimal tree quality
                 rebuild_visible_bvh(mesh);
@@ -1934,6 +1976,7 @@ int main() {
                 ? robot_demo_tick(robot_demo, urdf_artic_handle, dt)
                 : false;
             robot_demo_panel_draw(robot_demo, urdf_artic_handle);
+            sensor_panel_draw(sensor_state, urdf_artic_handle);
             // Scrub also triggers a pose update
             demo_changed = demo_changed || robot_demo.scrub_changed;
             robot_demo.scrub_changed = false;
@@ -2656,33 +2699,37 @@ int main() {
             }
         }
 
-        // ── [ / ] — manually rotate the locked end-effector joint ─────
-        // IK leaves the user-chosen (or auto) locked joint alone. Hold
-        // Shift for fast, plain keys for fine control.
+        // ── [ / ] — drive the user-picked keyboard joint ──────────────
+        // The Articulation panel's "Keyboard joint" combo chooses which joint
+        // these shortcuts rotate; default follows the IK-locked joint so the
+        // prior behaviour is unchanged. Hold Shift for fast, plain for fine.
         if (urdf_artic_handle && !io.WantCaptureKeyboard) {
             bool k_prev = ImGui::IsKeyDown(ImGuiKey_LeftBracket);
             bool k_next = ImGui::IsKeyDown(ImGuiKey_RightBracket);
             if (k_prev || k_next) {
                 UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
-                int last = urdf_ik_lock_joint_effective(urdf_artic_handle);
-                if (last >= 0) {
+                int kb = urdf_kb_joint_effective(urdf_artic_handle);
+                if (kb >= 0) {
                     bool fast = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
                                 ImGui::IsKeyDown(ImGuiKey_RightShift);
-                    float rate = fast ? 2.5f : 0.6f; // rad/sec
+                    // Prismatic uses m/sec; revolute/continuous uses rad/sec.
+                    bool prismatic = (ji[kb].type == 1);
+                    float rate = prismatic ? (fast ? 0.20f : 0.05f)
+                                           : (fast ? 2.5f  : 0.6f);
                     float dt = io.DeltaTime;
                     float d = (k_next ? rate : -rate) * dt;
                     if (k_prev && k_next) d = 0.f;
-                    float a = ji[last].angle + d;
-                    if (ji[last].type == 0) {
-                        if (a < ji[last].lower) a = ji[last].lower;
-                        if (a > ji[last].upper) a = ji[last].upper;
+                    float a = ji[kb].angle + d;
+                    if (ji[kb].type == 0 || ji[kb].type == 1) {
+                        if (a < ji[kb].lower) a = ji[kb].lower;
+                        if (a > ji[kb].upper) a = ji[kb].upper;
                     } else {
                         const float PI = 3.14159265f;
                         while (a >  PI) a -= 2.f * PI;
                         while (a < -PI) a += 2.f * PI;
                     }
-                    if (a != ji[last].angle) {
-                        ji[last].angle = a;
+                    if (a != ji[kb].angle) {
+                        ji[kb].angle = a;
                         if (urdf_repose(urdf_artic_handle, mesh.all_prims)) {
                             reupload_visible_prims(mesh);
                             if (mesh.d_bvh && !mesh.bvh_nodes.empty())
@@ -3064,6 +3111,7 @@ int main() {
             }
 
             // Solve: grab point takes priority over ee gizmo
+            bool ik_solved = false;
             if (grab_needs_solve && grab_dragging >= 1) {
                 urdf_solve_ik_joint(urdf_artic_handle, grab_dragging, grab_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
@@ -3072,6 +3120,7 @@ int main() {
                     bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
                 ++mesh.scene_version;
                 cam_changed = true;
+                ik_solved = true;
             } else if (ik_needs_solve) {
                 urdf_solve_ik(urdf_artic_handle, ik_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
@@ -3080,6 +3129,27 @@ int main() {
                     bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
                 ++mesh.scene_version;
                 cam_changed = true;
+                ik_solved = true;
+            }
+
+            // Keep a grasped object attached to the ee while IK-dragging.
+            // The articulation-panel block handles the close→attach transition;
+            // this block handles follow-through as the arm moves.
+            if (ik_solved && !robot_demo.playing && robot_demo.grasp.active) {
+                robot_demo_update_grasp(robot_demo, urdf_artic_handle,
+                                        prims_sorted, mesh.objects, mesh.all_prims);
+                if (!robot_demo.grasp.is_mesh) {
+                    rebuild_bvh(bvh_nodes, prims_sorted, &d_bvh, &d_prims,
+                                ctrl.selected_sphere,
+                                ctrl.selected_sphere >= 0
+                                    ? prims_sorted[ctrl.selected_sphere].center
+                                    : make_float3(0,0,0));
+                } else {
+                    reupload_visible_prims(mesh);
+                    if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                        bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                    ++mesh.scene_version;
+                }
             }
         }
 
@@ -4393,6 +4463,17 @@ int main() {
                     break;
                 }
             }
+
+            // Sensor PiP (gripper camera) — rendered last so it sits on top of
+            // the main viewport image, independent of the DLSS debug overlay.
+            sensor_render_and_blit(sensor_state, urdf_artic_handle,
+                                   interop.surface, rt_w, rt_h,
+                                   mesh.d_prims, (int)mesh.prims.size(),
+                                   mesh.d_mats, mesh.num_mats, mesh.d_tex_hdls,
+                                   mesh.d_obj_colors, mesh.num_obj_colors,
+                                   ctrl.color_mode,
+                                   make_float3(ctrl.bg_color[0], ctrl.bg_color[1], ctrl.bg_color[2]),
+                                   light_key_dir, light_fill_dir, light_rim_dir);
         }
 
         // Ensure all CUDA writes to interop.surface are complete before Vulkan reads it.
