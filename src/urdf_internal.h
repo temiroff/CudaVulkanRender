@@ -152,9 +152,32 @@ struct UrdfArticulation {
     std::vector<LinkMeshCache>                mesh_caches;
 
     Mat4                                      z_to_y;
+    // Extra transform applied to the root link before the kinematic chain,
+    // in Z-up (pre-z_to_y) space. Used by the physics backend to inject
+    // freejoint motion (root-body drift/rotation) into rendering. Identity
+    // by default, so non-sim flows are unaffected.
+    Mat4                                      root_xform = Mat4::identity();
+    // Link name that should receive root_xform. For plain URDFs this equals
+    // root_link. For MJCFs, root_link is the synthetic __world__ (which also
+    // carries floor geoms as siblings of the robot), so we need to scope
+    // root_xform to only the robot's top-level body — otherwise the floor
+    // drifts with the freejoint delta.
+    std::string                               root_body_link;
 
     std::string                               ee_link_name;
     float3                                    ee_world_pos = {0, 0, 0};
+
+    // Primary locked joint — the one [ / ] hotkeys rotate. -1 = auto (last
+    // movable). Index into joint_infos.
+    int                                       ik_lock_joint = -1;
+
+    // Per-joint IK lock. When set, the solver preserves the WORLD rotation
+    // of the joint's child link (so a vertical tool stays vertical while the
+    // arm moves). Parallel to joint_infos; sized during finalize().
+    // ik_locked_rot stores the captured world rotation of the child link at
+    // the moment the lock was enabled — it's the orientation target.
+    std::vector<uint8_t>                      ik_locked_mask;
+    std::vector<Mat4>                         ik_locked_rot;
 
     int                                       total_tris = 0;
 };

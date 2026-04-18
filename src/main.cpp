@@ -19,6 +19,7 @@
 #include "usd_loader.h"
 #include "urdf_loader.h"
 #include "mjcf_loader.h"
+#include "sim/sim_backend.h"
 #include "restir.h"
 #include "rasterizer.h"
 #include "hdri.h"
@@ -57,6 +58,7 @@
 #include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
 #include <fstream>
 
 static bool env_flag_enabled(const char* name)
@@ -1528,6 +1530,39 @@ int main() {
     UrdfArticulation*        urdf_artic_handle = nullptr;
     RobotDemoState           robot_demo;
 
+    // Physics sim — owns authoritative state (qpos/qvel) when active. Joint
+    // angles flow from sim into the articulation each frame; the existing
+    // repose+BVH pipeline renders the current pose.
+    std::unique_ptr<ISimBackend> sim_backend;
+    SimBackendId                 sim_selected       = SimBackendId::None;
+    bool                         sim_running        = false;
+    bool                         sim_gravity_on     = true;
+    std::string                  sim_active_path;
+    std::vector<std::string>     sim_joint_names;   // cached from articulation
+    std::vector<float>           sim_angle_buf;
+    // Per-body world transforms read from the sim each frame. Fed into
+    // urdf_repose_with_body_xforms so rendering snaps to MuJoCo's xpos/xmat
+    // exactly — no reimplemented FK divergence.
+    std::vector<std::string>     sim_body_names;
+    std::vector<float>           sim_body_mats;
+
+    auto refresh_sim_joint_names = [&]() {
+        sim_joint_names.clear();
+        if (!urdf_artic_handle) return;
+        int n = urdf_joint_count(urdf_artic_handle);
+        UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+        sim_joint_names.reserve(n);
+        for (int i = 0; i < n; ++i) sim_joint_names.emplace_back(ji[i].name);
+    };
+
+    auto stop_sim = [&]() {
+        sim_running = false;
+        sim_backend.reset();
+        sim_body_names.clear();
+        sim_body_mats.clear();
+        if (urdf_artic_handle) urdf_clear_root_xform(urdf_artic_handle);
+    };
+
     HdriMap        hdri;
     DenoiserState  denoiser;
     denoiser_init(denoiser, rt_w, rt_h);
@@ -1742,10 +1777,162 @@ int main() {
             }
         }
 
+        // Physics sim: step + sync joint angles into the articulation.
+        // The sim owns authoritative qpos when running; the articulation is
+        // driven from it, overriding IK/playback for that frame.
+        {
+            // Small sim-control window.
+            ImGui::Begin("Sim Backend");
+            if (sim_active_path.empty()) {
+                ImGui::TextDisabled("Load an MJCF (.xml) to enable physics sim.");
+            } else {
+                const char* cur_label = sim_backend_label(sim_selected);
+                if (ImGui::BeginCombo("Backend", cur_label)) {
+                    if (ImGui::Selectable(sim_backend_label(SimBackendId::None),
+                                          sim_selected == SimBackendId::None)) {
+                        sim_selected = SimBackendId::None;
+                        stop_sim();
+                    }
+                    if (ImGui::Selectable(sim_backend_label(SimBackendId::MuJoCo),
+                                          sim_selected == SimBackendId::MuJoCo)) {
+                        sim_selected = SimBackendId::MuJoCo;
+                    }
+                    ImGui::EndCombo();
+                }
+
+                if (sim_selected != SimBackendId::None) {
+                    bool want_running = sim_running;
+                    if (ImGui::Checkbox("Simulate", &want_running)) {
+                        if (want_running) {
+                            if (!sim_backend) sim_backend = make_sim_backend(sim_selected);
+                            if (sim_backend) sim_backend->set_free_base(false);
+                            if (sim_backend && sim_backend->load(sim_active_path)) {
+                                sim_backend->set_gravity_enabled(sim_gravity_on);
+                                // Seed the sim at the articulation's current
+                                // pose, otherwise MuJoCo snaps back to qpos=0
+                                // and the user sees a pop on activation.
+                                if (urdf_artic_handle && !sim_joint_names.empty()) {
+                                    // Pull the MJCF's default qpos into the articulation so
+                                    // the UI sliders / PD targets start at a pose the robot
+                                    // can physically hold. Using UI zeros as intent makes
+                                    // quadrupeds fully-extend their legs and oscillate.
+                                    sim_backend->read_angles_by_name(sim_joint_names, sim_angle_buf);
+                                    int n = urdf_joint_count(urdf_artic_handle);
+                                    UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+                                    for (int i = 0; i < n && i < (int)sim_angle_buf.size(); ++i) {
+                                        if (std::isfinite(sim_angle_buf[i]))
+                                            ji[i].angle = sim_angle_buf[i];
+                                    }
+                                    std::vector<float> seed((size_t)n);
+                                    for (int i = 0; i < n; ++i) seed[i] = ji[i].angle;
+                                    sim_backend->write_ctrl_by_joint_name(sim_joint_names, seed);
+                                }
+                                sim_running = true;
+                            } else {
+                                sim_backend.reset();
+                                sim_running = false;
+                            }
+                        } else {
+                            sim_running = false;
+                            sim_body_names.clear();
+                            sim_body_mats.clear();
+                            if (urdf_artic_handle) urdf_clear_root_xform(urdf_artic_handle);
+                        }
+                    }
+                    if (sim_backend)
+                        ImGui::TextDisabled("%s", sim_backend->name());
+
+                    if (ImGui::Checkbox("Gravity", &sim_gravity_on) && sim_backend)
+                        sim_backend->set_gravity_enabled(sim_gravity_on);
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset") && sim_backend) {
+                        sim_backend->reset();
+                        // Pull qpos back into the articulation's intent so the
+                        // PD loop doesn't immediately snap the robot back to
+                        // whatever pose the user had dialed in before reset.
+                        if (urdf_artic_handle && !sim_joint_names.empty()) {
+                            sim_backend->read_angles_by_name(sim_joint_names, sim_angle_buf);
+                            int n = urdf_joint_count(urdf_artic_handle);
+                            UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+                            for (int i = 0; i < n && i < (int)sim_angle_buf.size(); ++i) {
+                                if (std::isfinite(sim_angle_buf[i]))
+                                    ji[i].angle = sim_angle_buf[i];
+                            }
+                            // Snap rendered geometry to the post-reset sim state.
+                            // Without this, a paused sim leaves triangles in the
+                            // pre-reset pose; a running sim's next step overlays
+                            // one frame of physics before the first repose.
+                            sim_backend->read_body_xforms(sim_body_names, sim_body_mats);
+                            if (urdf_repose_with_body_xforms(urdf_artic_handle,
+                                                              sim_body_names,
+                                                              sim_body_mats,
+                                                              mesh.all_prims)) {
+                                reupload_visible_prims(mesh);
+                                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                                ++mesh.scene_version;
+                                cam_changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            ImGui::End();
+
+            // Step physics, then render from MuJoCo's per-body world transforms.
+            // ji[i].angle is the user's intent (IK / sliders / playback) — it
+            // feeds actuator ctrl so MuJoCo drives toward the requested pose.
+            // We then *read back* MuJoCo's xpos/xmat for every body and snap
+            // each articulation link to it. This bypasses the renderer's own
+            // FK entirely, so the visual pose matches the sim exactly (no
+            // divergence from joint-pos/axis/quat reinterpretation).
+            if (sim_running && sim_backend && urdf_artic_handle
+                && !sim_joint_names.empty()) {
+                int n = urdf_joint_count(urdf_artic_handle);
+                UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+
+                std::vector<float> intent((size_t)n);
+                for (int i = 0; i < n; ++i) intent[i] = ji[i].angle;
+                sim_backend->write_ctrl_by_joint_name(sim_joint_names, intent);
+
+                float dt = frame_ms * 0.001f;
+                if (dt > 0.05f) dt = 0.05f;
+                sim_backend->step(dt);
+
+                // Mirror qpos into the UI so sliders track the simulated state.
+                // Repose does *not* use these values — it uses body xforms.
+                sim_backend->read_angles_by_name(sim_joint_names, sim_angle_buf);
+                for (int i = 0; i < n && i < (int)sim_angle_buf.size(); ++i) {
+                    float v = sim_angle_buf[i];
+                    if (std::isfinite(v)) ji[i].angle = v;
+                }
+
+                sim_backend->read_body_xforms(sim_body_names, sim_body_mats);
+                bool reposed = urdf_repose_with_body_xforms(
+                    urdf_artic_handle, sim_body_names, sim_body_mats, mesh.all_prims);
+
+                // Restore user intent so position-controlled actuators keep
+                // tracking the requested pose rather than collapsing to the
+                // instantaneous qpos (target==current → zero torque → drift).
+                for (int i = 0; i < n; ++i) ji[i].angle = intent[i];
+
+                if (reposed) {
+                    reupload_visible_prims(mesh);
+                    if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                        bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                    ++mesh.scene_version;
+                    cam_changed = true;
+                }
+            }
+        }
+
         // Robot demo: tick playback + draw panel
         {
             float dt = frame_ms * 0.001f;
-            bool demo_changed = robot_demo_tick(robot_demo, urdf_artic_handle, dt);
+            bool demo_changed = (!sim_running)
+                ? robot_demo_tick(robot_demo, urdf_artic_handle, dt)
+                : false;
             robot_demo_panel_draw(robot_demo, urdf_artic_handle);
             // Scrub also triggers a pose update
             demo_changed = demo_changed || robot_demo.scrub_changed;
@@ -2084,11 +2271,15 @@ int main() {
                 // Open URDF articulation handle for interactive joint control
                 if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
                 robot_demo = RobotDemoState{};
+                stop_sim();
+                sim_active_path.clear();
                 if (is_urdf_path(ctrl.gltf_path)) {
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                 } else if (is_mjcf_path(ctrl.gltf_path)) {
                     urdf_artic_handle = mjcf_articulation_open(ctrl.gltf_path, mesh.all_prims);
+                    sim_active_path = ctrl.gltf_path;
                 }
+                refresh_sim_joint_names();
             }
         }
 
@@ -2103,10 +2294,16 @@ int main() {
                     if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
                     urdf_artic_handle = urdf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                     robot_demo = RobotDemoState{};
+                    stop_sim();
+                    sim_active_path.clear();
+                    refresh_sim_joint_names();
                 } else if (is_mjcf_path(ctrl.gltf_path)) {
                     if (urdf_artic_handle) { urdf_articulation_close(urdf_artic_handle); urdf_artic_handle = nullptr; }
                     urdf_artic_handle = mjcf_articulation_open(ctrl.gltf_path, mesh.all_prims);
                     robot_demo = RobotDemoState{};
+                    stop_sim();
+                    sim_active_path = ctrl.gltf_path;
+                    refresh_sim_joint_names();
                 }
             }
         }
@@ -2430,6 +2627,72 @@ int main() {
                 ctrl.gizmo_mode = GizmoMode::Rotate;
             if (ImGui::IsKeyPressed(ImGuiKey_R, false))
                 ctrl.gizmo_mode = GizmoMode::Scale;
+        }
+
+        // ── 1..9 — toggle IK freeze on the Nth movable joint; 0 clears all
+        // Locked joints stay put while IK solves, so the user can dictate
+        // which part of the arm must hold its pose.
+        if (urdf_artic_handle && !io.WantCaptureKeyboard) {
+            if (ImGui::IsKeyPressed(ImGuiKey_0, false))
+                urdf_ik_clear_all_locks(urdf_artic_handle);
+            const ImGuiKey digit_keys[9] = {
+                ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4, ImGuiKey_5,
+                ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9
+            };
+            int n = urdf_joint_count(urdf_artic_handle);
+            UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+            // Count from the tip: 1 = last movable, 2 = second-to-last, …
+            std::vector<int> movable_idx;
+            movable_idx.reserve(n);
+            for (int i = n - 1; i >= 0; --i)
+                if (ji[i].type == 0 || ji[i].type == 2)
+                    movable_idx.push_back(i);
+            for (int d = 0; d < 9; ++d) {
+                if (!ImGui::IsKeyPressed(digit_keys[d], false)) continue;
+                if (d >= (int)movable_idx.size()) break;
+                int gi = movable_idx[d];
+                urdf_ik_set_locked(urdf_artic_handle, gi,
+                                   !urdf_ik_is_locked(urdf_artic_handle, gi));
+            }
+        }
+
+        // ── [ / ] — manually rotate the locked end-effector joint ─────
+        // IK leaves the user-chosen (or auto) locked joint alone. Hold
+        // Shift for fast, plain keys for fine control.
+        if (urdf_artic_handle && !io.WantCaptureKeyboard) {
+            bool k_prev = ImGui::IsKeyDown(ImGuiKey_LeftBracket);
+            bool k_next = ImGui::IsKeyDown(ImGuiKey_RightBracket);
+            if (k_prev || k_next) {
+                UrdfJointInfo* ji = urdf_joint_info(urdf_artic_handle);
+                int last = urdf_ik_lock_joint_effective(urdf_artic_handle);
+                if (last >= 0) {
+                    bool fast = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                                ImGui::IsKeyDown(ImGuiKey_RightShift);
+                    float rate = fast ? 2.5f : 0.6f; // rad/sec
+                    float dt = io.DeltaTime;
+                    float d = (k_next ? rate : -rate) * dt;
+                    if (k_prev && k_next) d = 0.f;
+                    float a = ji[last].angle + d;
+                    if (ji[last].type == 0) {
+                        if (a < ji[last].lower) a = ji[last].lower;
+                        if (a > ji[last].upper) a = ji[last].upper;
+                    } else {
+                        const float PI = 3.14159265f;
+                        while (a >  PI) a -= 2.f * PI;
+                        while (a < -PI) a += 2.f * PI;
+                    }
+                    if (a != ji[last].angle) {
+                        ji[last].angle = a;
+                        if (urdf_repose(urdf_artic_handle, mesh.all_prims)) {
+                            reupload_visible_prims(mesh);
+                            if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                                bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                            ++mesh.scene_version;
+                            cam_changed = true;
+                        }
+                    }
+                }
+            }
         }
 
         // ── F key: frame selected object (or entire scene if nothing selected) ──

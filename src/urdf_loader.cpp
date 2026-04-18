@@ -31,6 +31,17 @@
 
 namespace fs = std::filesystem;
 
+static Mat4 mat4_mul_rowmajor(const Mat4& a, const Mat4& b) {
+    Mat4 r;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.f;
+            for (int k = 0; k < 4; ++k) s += a.m[i][k] * b.m[k][j];
+            r.m[i][j] = s;
+        }
+    return r;
+}
+
 // ─────────────────────────────────────────────
 //  Minimal XML parser (read-only, no validation)
 //  Just enough to parse URDF, MJCF, and COLLADA files.
@@ -180,42 +191,40 @@ static std::string resolve_mesh_path(const std::string& filename,
 // DaeMaterial and RawMesh are defined in urdf_internal.h
 
 bool load_stl(const std::string& path, RawMesh& out) {
-    std::ifstream f(path, std::ios::binary);
+    // Slurp the whole file in one syscall. iostream doing 50-byte reads per
+    // triangle is catastrophically slow on Windows for meshes with 20k+ tris.
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
-
-    char header[80];
-    f.read(header, 80);
+    std::streamsize sz = f.tellg();
+    if (sz < 84) return false;
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf((size_t)sz);
+    if (!f.read(reinterpret_cast<char*>(buf.data()), sz)) return false;
 
     uint32_t num_tris = 0;
-    f.read(reinterpret_cast<char*>(&num_tris), 4);
+    std::memcpy(&num_tris, buf.data() + 80, 4);
     if (num_tris == 0 || num_tris > 10000000) return false;
+    if ((size_t)sz < 84 + (size_t)num_tris * 50) return false;
 
-    // Each STL triangle: 12 bytes normal + 3×12 bytes vertices + 2 bytes attr = 50 bytes
-    out.vertices.reserve(num_tris * 3);
-    out.normals.reserve(num_tris * 3);
-    out.indices.reserve(num_tris * 3);
+    out.vertices.resize(num_tris * 3);
+    out.normals.resize(num_tris * 3);
+    out.indices.resize(num_tris * 3);
 
-    for (uint32_t i = 0; i < num_tris; ++i) {
-        float data[12]; // normal(3) + v0(3) + v1(3) + v2(3)
-        f.read(reinterpret_cast<char*>(data), 48);
-        uint16_t attr;
-        f.read(reinterpret_cast<char*>(&attr), 2);
-
+    const uint8_t* p = buf.data() + 84;
+    for (uint32_t i = 0; i < num_tris; ++i, p += 50) {
+        float data[12];
+        std::memcpy(data, p, 48);
         float3 fn = make_float3(data[0], data[1], data[2]);
-        float3 v0 = make_float3(data[3], data[4], data[5]);
-        float3 v1 = make_float3(data[6], data[7], data[8]);
-        float3 v2 = make_float3(data[9], data[10], data[11]);
-
-        int base = (int)out.vertices.size();
-        out.vertices.push_back(v0);
-        out.vertices.push_back(v1);
-        out.vertices.push_back(v2);
-        out.normals.push_back(fn);
-        out.normals.push_back(fn);
-        out.normals.push_back(fn);
-        out.indices.push_back(base);
-        out.indices.push_back(base + 1);
-        out.indices.push_back(base + 2);
+        int base = (int)i * 3;
+        out.vertices[base + 0] = make_float3(data[3], data[4],  data[5]);
+        out.vertices[base + 1] = make_float3(data[6], data[7],  data[8]);
+        out.vertices[base + 2] = make_float3(data[9], data[10], data[11]);
+        out.normals[base + 0] = fn;
+        out.normals[base + 1] = fn;
+        out.normals[base + 2] = fn;
+        out.indices[base + 0] = base;
+        out.indices[base + 1] = base + 1;
+        out.indices[base + 2] = base + 2;
     }
     return true;
 }
@@ -695,15 +704,34 @@ static bool parse_urdf(const std::string& urdf_path,
 bool load_link_mesh(const std::string& mesh_path, RawMesh& raw) {
     if (mesh_path.empty() || !fs::exists(mesh_path)) return false;
 
+    // In-memory cache keyed by canonical path + file size. Same mesh is loaded
+    // multiple times: once by mjcf_load (builds triangles), again by
+    // urdf_articulation_finalize (builds mesh_caches for repose). Caching makes
+    // the second and third calls effectively free.
+    struct CacheKey { std::string path; uintmax_t size; };
+    static std::unordered_map<std::string, RawMesh> s_cache;
+    std::string canonical;
+    try { canonical = fs::weakly_canonical(mesh_path).string(); }
+    catch (...) { canonical = mesh_path; }
+    uintmax_t fsz = 0;
+    std::error_code ec;
+    fsz = fs::file_size(mesh_path, ec);
+    std::string key = canonical + "|" + std::to_string(fsz);
+
+    auto it = s_cache.find(key);
+    if (it != s_cache.end()) { raw = it->second; return true; }
+
     auto ext = fs::path(mesh_path).extension().string();
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
 
-    if (ext == ".stl") return load_stl(mesh_path, raw);
-    if (ext == ".dae") return load_dae(mesh_path, raw);
-    if (ext == ".obj") return load_obj(mesh_path, raw);
+    bool ok = false;
+    if      (ext == ".stl") ok = load_stl(mesh_path, raw);
+    else if (ext == ".dae") ok = load_dae(mesh_path, raw);
+    else if (ext == ".obj") ok = load_obj(mesh_path, raw);
+    else { std::cerr << "[urdf_loader] unsupported mesh format: " << ext << '\n'; return false; }
 
-    std::cerr << "[urdf_loader] unsupported mesh format: " << ext << '\n';
-    return false;
+    if (ok) s_cache[key] = raw;
+    return ok;
 }
 
 // ─────────────────────────────────────────────
@@ -1056,6 +1084,8 @@ void urdf_articulation_finalize(UrdfArticulation* h,
     h->children_map.clear();
     for (auto& j : h->joints)
         h->children_map[j.parent].push_back(&j);
+    if (h->root_body_link.empty())
+        h->root_body_link = h->root_link;
 
     // Axis correction (Z-up → Y-up)
     h->z_to_y = Mat4::identity();
@@ -1081,6 +1111,8 @@ void urdf_articulation_finalize(UrdfArticulation* h,
         h->joint_name_to_idx[j.name] = (int)h->joint_infos.size();
         h->joint_infos.push_back(ji);
     }
+    h->ik_locked_mask.assign(h->joint_infos.size(), 0);
+    h->ik_locked_rot.assign(h->joint_infos.size(), Mat4::identity());
 
     // Cache mesh data per link by re-loading meshes
     // Walk the kinematic chain and record which triangles belong to each link
@@ -1125,30 +1157,44 @@ void urdf_articulation_finalize(UrdfArticulation* h,
     cache_link(h->root_link);
     h->total_tris = tri_cursor;
 
-    // Find end-effector: deepest leaf link, preferring names without "finger"/"tip"
+    // Find end-effector. A gripper's fingers are leaves, but the wrist/hand
+    // above them is the real EE. Walk *all* links (not just leaves) and pick
+    // the deepest whose name doesn't contain finger/tip. Only fall back to
+    // leaves if the whole tree looks like fingers.
     {
-        std::string best_leaf;
+        auto is_finger_name = [](const std::string& n) {
+            return n.find("finger") != std::string::npos ||
+                   n.find("tip")    != std::string::npos;
+        };
+        std::string best;
         int best_depth = -1;
-        std::function<void(const std::string&, int)> find_ee;
-        find_ee = [&](const std::string& link_name, int depth) {
+        std::function<void(const std::string&, int)> walk;
+        walk = [&](const std::string& link_name, int depth) {
+            if (!is_finger_name(link_name) && depth > best_depth) {
+                best = link_name;
+                best_depth = depth;
+            }
             auto jit = h->children_map.find(link_name);
-            bool has_children = (jit != h->children_map.end() && !jit->second.empty());
-            if (!has_children) {
-                // Leaf link — prefer non-finger/tip links, or deepest overall
-                bool is_finger = (link_name.find("finger") != std::string::npos ||
-                                  link_name.find("tip") != std::string::npos);
-                if (depth > best_depth || (!is_finger && depth >= best_depth)) {
-                    best_leaf = link_name;
+            if (jit == h->children_map.end()) return;
+            for (auto* joint : jit->second) walk(joint->child, depth + 1);
+        };
+        walk(h->root_link, 0);
+        if (best.empty()) {
+            // Degenerate case: no non-finger link at all — take deepest leaf.
+            std::function<void(const std::string&, int)> leaf_walk;
+            leaf_walk = [&](const std::string& link_name, int depth) {
+                auto jit = h->children_map.find(link_name);
+                bool has_children = (jit != h->children_map.end() && !jit->second.empty());
+                if (!has_children && depth > best_depth) {
+                    best = link_name;
                     best_depth = depth;
                 }
-            }
-            if (has_children) {
-                for (auto* joint : jit->second)
-                    find_ee(joint->child, depth + 1);
-            }
-        };
-        find_ee(h->root_link, 0);
-        h->ee_link_name = best_leaf;
+                if (has_children)
+                    for (auto* joint : jit->second) leaf_walk(joint->child, depth + 1);
+            };
+            leaf_walk(h->root_link, 0);
+        }
+        h->ee_link_name = best;
     }
 
     // Compute initial ee position from the centroid of all mesh caches that
@@ -1254,14 +1300,18 @@ static bool ik_collect_chain(UrdfArticulation* h,
 
 // Run forward kinematics on the chain, computing world-space joint positions,
 // axes, and the final ee position. Uses current joint_infos angles directly.
+// Optional per-chain-entry xforms: out_xforms[i] = world transform *after*
+// joint i's rotation — i.e. the world transform of chain[i].jnt->child.
 static float3 ik_forward(UrdfArticulation* h,
                          const std::vector<IKChainEntry>& chain,
                          std::vector<float3>& joint_pos,
                          std::vector<float3>& joint_axis,
-                         Mat4* out_ee_xform = nullptr)
+                         Mat4* out_ee_xform = nullptr,
+                         std::vector<Mat4>* out_xforms = nullptr)
 {
     joint_pos.resize(chain.size());
     joint_axis.resize(chain.size());
+    if (out_xforms) out_xforms->resize(chain.size());
 
     Mat4 xform = h->z_to_y;
     UrdfJointInfo* joints = h->joint_infos.data();
@@ -1292,6 +1342,8 @@ static float3 ik_forward(UrdfArticulation* h,
                 xform = xform * T;
             }
         }
+
+        if (out_xforms) (*out_xforms)[i] = xform;
     }
 
     if (out_ee_xform) *out_ee_xform = xform;
@@ -1344,6 +1396,70 @@ int urdf_ik_chain_length(UrdfArticulation* h)
     std::vector<int> movable;
     ik_movable_indices(h, chain, movable);
     return (int)movable.size();
+}
+
+int urdf_ik_lock_joint(UrdfArticulation* h)
+{
+    return h ? h->ik_lock_joint : -1;
+}
+
+void urdf_set_ik_lock_joint(UrdfArticulation* h, int joint_idx)
+{
+    if (!h) return;
+    if (joint_idx < -1 || joint_idx >= (int)h->joint_infos.size()) return;
+    h->ik_lock_joint = joint_idx;
+}
+
+int urdf_ik_lock_joint_effective(UrdfArticulation* h)
+{
+    if (!h || h->joint_infos.empty()) return -1;
+    int n = (int)h->joint_infos.size();
+    if (h->ik_lock_joint >= 0 && h->ik_lock_joint < n) {
+        int t = h->joint_infos[h->ik_lock_joint].type;
+        if (t == 0 || t == 2) return h->ik_lock_joint;
+    }
+    // Auto: last movable (revolute/continuous) joint.
+    for (int i = n - 1; i >= 0; --i) {
+        int t = h->joint_infos[i].type;
+        if (t == 0 || t == 2) return i;
+    }
+    return -1;
+}
+
+bool urdf_ik_is_locked(UrdfArticulation* h, int joint_idx)
+{
+    if (!h || joint_idx < 0 || joint_idx >= (int)h->ik_locked_mask.size()) return false;
+    return h->ik_locked_mask[joint_idx] != 0;
+}
+
+void urdf_ik_set_locked(UrdfArticulation* h, int joint_idx, bool locked)
+{
+    if (!h || joint_idx < 0 || joint_idx >= (int)h->ik_locked_mask.size()) return;
+    h->ik_locked_mask[joint_idx] = locked ? 1 : 0;
+
+    if (!locked) return;
+
+    // Snapshot the child link's current world rotation — the solver will
+    // preserve this while IK rearranges the rest of the arm. Without this
+    // freeze, the joint would keep its *angle* fixed but the link could
+    // swing arbitrarily as ancestors rotate.
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain)) return;
+    std::vector<float3> jpos, jaxis;
+    std::vector<Mat4>  xforms;
+    ik_forward(h, chain, jpos, jaxis, nullptr, &xforms);
+    for (int ci = 0; ci < (int)chain.size(); ++ci) {
+        if (chain[ci].ji == joint_idx) {
+            h->ik_locked_rot[joint_idx] = xforms[ci];
+            break;
+        }
+    }
+}
+
+void urdf_ik_clear_all_locks(UrdfArticulation* h)
+{
+    if (!h) return;
+    std::fill(h->ik_locked_mask.begin(), h->ik_locked_mask.end(), 0);
 }
 
 float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx)
@@ -1403,43 +1519,343 @@ static void clamp_joint(UrdfJointInfo& info, float PI)
     }
 }
 
-bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
-                   int max_iters, float tolerance)
+// Gauss-Jordan in-place inversion of an N×N row-major matrix with partial
+// pivoting. Returns false if singular — in DLS we add λ²I so this shouldn't
+// happen, but we keep the guard.
+static bool invert_nxn(std::vector<float>& A, int N)
+{
+    std::vector<float> aug((size_t)N * 2 * N, 0.f);
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) aug[i*2*N + j] = A[i*N + j];
+        aug[i*2*N + N + i] = 1.f;
+    }
+    for (int p = 0; p < N; ++p) {
+        int pr = p;
+        float pv = fabsf(aug[p*2*N + p]);
+        for (int r = p+1; r < N; ++r) {
+            float v = fabsf(aug[r*2*N + p]);
+            if (v > pv) { pv = v; pr = r; }
+        }
+        if (pv < 1e-12f) return false;
+        if (pr != p) {
+            for (int j = 0; j < 2*N; ++j) std::swap(aug[p*2*N + j], aug[pr*2*N + j]);
+        }
+        float invp = 1.f / aug[p*2*N + p];
+        for (int j = 0; j < 2*N; ++j) aug[p*2*N + j] *= invp;
+        for (int r = 0; r < N; ++r) {
+            if (r == p) continue;
+            float f = aug[r*2*N + p];
+            if (f == 0.f) continue;
+            for (int j = 0; j < 2*N; ++j) aug[r*2*N + j] -= f * aug[p*2*N + j];
+        }
+    }
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            A[i*N + j] = aug[i*2*N + N + j];
+    return true;
+}
+
+// Extract world-frame angular error ω that rotates R_current → R_target.
+// For small drift, ω ≈ 0.5 * vee(ΔR - ΔRᵀ) where ΔR = R_target · R_currentᵀ.
+static void angular_error_world(const Mat4& R_target, const Mat4& R_current,
+                                 float& ox, float& oy, float& oz)
+{
+    float D[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            D[i][j] = R_target.m[i][0]*R_current.m[j][0]
+                    + R_target.m[i][1]*R_current.m[j][1]
+                    + R_target.m[i][2]*R_current.m[j][2];
+        }
+    ox = 0.5f * (D[2][1] - D[1][2]);
+    oy = 0.5f * (D[0][2] - D[2][0]);
+    oz = 0.5f * (D[1][0] - D[0][1]);
+}
+
+// Shared DLS core used by both urdf_solve_ik (target_ci < 0 → drive EE tip)
+// and urdf_solve_ik_joint (target_ci ≥ 0 → drive that joint's origin point).
+// Honors primary-lock (excluded from DOF) and per-joint orientation locks
+// (included in DOF, with angular-error rows added to the Jacobian so the
+// locked link's world rotation is preserved).
+static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
+                            int target_ci, int max_iters, float tolerance)
 {
     if (!h) return false;
-
     std::vector<IKChainEntry> chain;
     if (!ik_collect_chain(h, chain) || chain.empty()) return false;
 
     UrdfJointInfo* joints = h->joint_infos.data();
-    const float PI = 3.14159265f;
+    const float PI          = 3.14159265f;
+    const float lambda2     = 0.05f * 0.05f;
+    const float max_err_lin = 0.15f;   // m per step
+    const float max_err_ang = 0.20f;   // rad per step
+    const float max_dq      = 0.20f;   // per-joint step cap
+
+    int primary_lock = urdf_ik_lock_joint_effective(h);
+    int use_limit    = (target_ci < 0) ? (int)chain.size() : target_ci;
+
+    // Movable DOF: everything we're allowed to drive. Per-joint freezes
+    // remain in the set — they need to move to preserve orientation.
+    std::vector<int> use_ci;
+    use_ci.reserve(use_limit);
+    for (int ci = 0; ci < use_limit; ++ci) {
+        int ji = chain[ci].ji;
+        if (ji < 0) continue;
+        if (ji == primary_lock) continue;
+        int t = joints[ji].type;
+        if (t == 0 || t == 1 || t == 2) use_ci.push_back(ci);
+    }
+    const int N = (int)use_ci.size();
+    if (N == 0) return false;
+
+    // Orientation constraints — one per user-frozen joint that has at
+    // least one movable ancestor to drive its child link.
+    struct Cons { int ci; Mat4 R_target; };
+    std::vector<Cons> cons;
+    for (int ci = 0; ci < (int)chain.size(); ++ci) {
+        int ji = chain[ci].ji;
+        if (ji < 0) continue;
+        if (ji >= (int)h->ik_locked_mask.size()) continue;
+        if (!h->ik_locked_mask[ji]) continue;
+        if (ji == primary_lock) continue;
+        bool has_upstream_mover = false;
+        for (int k = 0; k < N; ++k)
+            if (use_ci[k] <= ci) { has_upstream_mover = true; break; }
+        if (!has_upstream_mover) continue;
+        cons.push_back({ ci, h->ik_locked_rot[ji] });
+    }
+    const int K = (int)cons.size();
+    const int M = 3 + 3 * K;
 
     std::vector<float3> jpos, jaxis;
+    std::vector<Mat4>   xforms;
+    std::vector<float>  J((size_t)M * N, 0.f);
+    std::vector<float>  e((size_t)M, 0.f);
+    std::vector<float>  A((size_t)M * M, 0.f);
+    std::vector<float>  y((size_t)M, 0.f);
+    std::vector<float>  dq((size_t)N, 0.f);
 
-    for (int iter = 0; iter < max_iters; iter++) {
-        float3 ee = ik_forward(h, chain, jpos, jaxis);
+    bool   reach_init = false;
+    float3 base_pos   = make_float3(0, 0, 0);
+    float  reach_safe = 0.f;        // hard cap: max reach minus margin
+    float  reach_max  = 0.f;        // full straight-line arm reach
+    const float reach_margin = 0.92f;
 
-        float3 diff = make_float3(target_pos.x - ee.x, target_pos.y - ee.y, target_pos.z - ee.z);
-        float dist = sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
-        if (dist < tolerance) return true;
+    for (int iter = 0; iter < max_iters; ++iter) {
+        float3 ee = ik_forward(h, chain, jpos, jaxis, nullptr,
+                                K > 0 ? &xforms : nullptr);
+        float3 point = (target_ci < 0) ? ee : jpos[target_ci];
 
-        // CCD: iterate joints from tip to base
-        for (int ci = (int)chain.size() - 1; ci >= 0; ci--) {
-            int ji = chain[ci].ji;
-            if (ji < 0) continue;
-            UrdfJointInfo& info = joints[ji];
-            if (info.type != 0 && info.type != 2) continue;
+        // Compute arm reach once. Segment lengths between successive joint
+        // positions are invariant under rotations (fixed link offsets), so
+        // the sum gives straight-line max reach regardless of pose.
+        if (!reach_init && !jpos.empty()) {
+            base_pos = jpos[0];
+            int reach_end = (target_ci < 0) ? (int)chain.size() - 1 : target_ci;
+            if (reach_end > (int)jpos.size() - 1) reach_end = (int)jpos.size() - 1;
+            float r = 0.f;
+            for (int i = 1; i <= reach_end; ++i) {
+                float dx = jpos[i].x - jpos[i-1].x;
+                float dy = jpos[i].y - jpos[i-1].y;
+                float dz = jpos[i].z - jpos[i-1].z;
+                r += sqrtf(dx*dx + dy*dy + dz*dz);
+            }
+            if (target_ci < 0 && reach_end >= 0) {
+                float dx = ee.x - jpos[reach_end].x;
+                float dy = ee.y - jpos[reach_end].y;
+                float dz = ee.z - jpos[reach_end].z;
+                r += sqrtf(dx*dx + dy*dy + dz*dz);
+            }
+            reach_max  = r;
+            reach_safe = r * reach_margin;
+            reach_init = true;
+        }
 
-            ee = ik_forward(h, chain, jpos, jaxis);
-            float a = ccd_angle_for_joint(jpos[ci], jaxis[ci], ee, target_pos, 0.5f);
-            info.angle += a;
+        // Clamp target within reach budget → arm can never be asked to
+        // fully straighten. Excess is projected back along base→target.
+        float3 tgt = target_pos;
+        if (reach_init && reach_safe > 0.f) {
+            float tx = tgt.x - base_pos.x;
+            float ty = tgt.y - base_pos.y;
+            float tz = tgt.z - base_pos.z;
+            float td = sqrtf(tx*tx + ty*ty + tz*tz);
+            if (td > reach_safe && td > 1e-6f) {
+                float s = reach_safe / td;
+                tgt.x = base_pos.x + tx * s;
+                tgt.y = base_pos.y + ty * s;
+                tgt.z = base_pos.z + tz * s;
+            }
+        }
+
+        float ex = tgt.x - point.x;
+        float ey = tgt.y - point.y;
+        float ez = tgt.z - point.z;
+        float err_p = sqrtf(ex*ex + ey*ey + ez*ez);
+
+        // Per-constraint angular errors (world frame).
+        std::vector<float> aerr((size_t)(3 * K), 0.f);
+        float max_ang = 0.f;
+        for (int c = 0; c < K; ++c) {
+            float ox, oy, oz;
+            angular_error_world(cons[c].R_target, xforms[cons[c].ci], ox, oy, oz);
+            aerr[3*c + 0] = ox;
+            aerr[3*c + 1] = oy;
+            aerr[3*c + 2] = oz;
+            float m = sqrtf(ox*ox + oy*oy + oz*oz);
+            if (m > max_ang) max_ang = m;
+        }
+
+        if (err_p < tolerance && max_ang < 0.01f) return true;
+
+        // Clamp per-task errors so a single iteration stays well-scaled.
+        if (err_p > max_err_lin) {
+            float s = max_err_lin / err_p;
+            ex *= s; ey *= s; ez *= s;
+        }
+        for (int c = 0; c < K; ++c) {
+            float mx = aerr[3*c+0], my = aerr[3*c+1], mz = aerr[3*c+2];
+            float m = sqrtf(mx*mx + my*my + mz*mz);
+            if (m > max_err_ang && m > 1e-9f) {
+                float s = max_err_ang / m;
+                aerr[3*c+0] *= s; aerr[3*c+1] *= s; aerr[3*c+2] *= s;
+            }
+        }
+
+        // Assemble full error stack.
+        e[0] = ex; e[1] = ey; e[2] = ez;
+        for (int c = 0; c < K; ++c) {
+            e[3 + 3*c + 0] = aerr[3*c + 0];
+            e[3 + 3*c + 1] = aerr[3*c + 1];
+            e[3 + 3*c + 2] = aerr[3*c + 2];
+        }
+
+        // Build the M×N Jacobian.
+        std::fill(J.begin(), J.end(), 0.f);
+        for (int k = 0; k < N; ++k) {
+            int ci = use_ci[k];
+            int t  = joints[chain[ci].ji].type;
+            float3 ax = jaxis[ci];
+            // Position rows (target point).
+            if (t == 1) {
+                J[0*N + k] = ax.x;
+                J[1*N + k] = ax.y;
+                J[2*N + k] = ax.z;
+            } else {
+                float rx = point.x - jpos[ci].x;
+                float ry = point.y - jpos[ci].y;
+                float rz = point.z - jpos[ci].z;
+                J[0*N + k] = ax.y*rz - ax.z*ry;
+                J[1*N + k] = ax.z*rx - ax.x*rz;
+                J[2*N + k] = ax.x*ry - ax.y*rx;
+            }
+            // Angular rows: joint k contributes to constraint c iff k ≤ c's
+            // chain index (it's the locked link itself or upstream). Prismatic
+            // contributes nothing angular.
+            for (int c = 0; c < K; ++c) {
+                if (ci > cons[c].ci) continue;
+                if (t == 1) continue;
+                int row = 3 + 3*c;
+                J[(row+0)*N + k] = ax.x;
+                J[(row+1)*N + k] = ax.y;
+                J[(row+2)*N + k] = ax.z;
+            }
+        }
+
+        // A = J Jᵀ + λ² I  (M×M).
+        std::fill(A.begin(), A.end(), 0.f);
+        for (int r = 0; r < M; ++r)
+            for (int c = 0; c < M; ++c) {
+                float s = 0.f;
+                for (int k = 0; k < N; ++k) s += J[r*N + k] * J[c*N + k];
+                A[r*M + c] = s;
+            }
+        for (int r = 0; r < M; ++r) A[r*M + r] += lambda2;
+
+        if (!invert_nxn(A, M)) break;
+
+        // y = A⁻¹ e  (M).
+        for (int r = 0; r < M; ++r) {
+            float s = 0.f;
+            for (int c = 0; c < M; ++c) s += A[r*M + c] * e[c];
+            y[r] = s;
+        }
+
+        // Δq_task = Jᵀ y  (N).
+        for (int k = 0; k < N; ++k) {
+            float s = 0.f;
+            for (int r = 0; r < M; ++r) s += J[r*N + k] * y[r];
+            dq[k] = s;
+        }
+
+        // Null-space bias toward joint center. Pushes revolute joints away
+        // from their limits so the arm folds (elbow bends) instead of going
+        // fully straight when the task doesn't need the last DOF — resolves
+        // the near-singularity stall where dragging IK back only rotates the
+        // base. Projected through (I − Jᵀ(JJᵀ+λ²I)⁻¹J) so it can't fight the
+        // primary task.
+        {
+            // Base gain 0.08; ramp up sharply as the arm approaches its
+            // reach limit so joints actively fold instead of straightening.
+            float extension = 0.f;
+            if (reach_init && reach_max > 1e-6f) {
+                float dx = point.x - base_pos.x;
+                float dy = point.y - base_pos.y;
+                float dz = point.z - base_pos.z;
+                extension = sqrtf(dx*dx + dy*dy + dz*dz) / reach_max;
+            }
+            float bias_gain = 0.08f + 0.60f * fmaxf(0.f, extension - 0.75f);
+            std::vector<float> qb((size_t)N, 0.f);
+            for (int k = 0; k < N; ++k) {
+                UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
+                if (info.type != 0) continue;   // revolute only
+                float lo = info.lower, hi = info.upper;
+                if (!(hi > lo)) continue;       // skip unlimited/degenerate
+                float center = 0.5f * (lo + hi);
+                qb[k] = bias_gain * (center - info.angle);
+            }
+            // J qb  (M)
+            std::vector<float> Jqb((size_t)M, 0.f);
+            for (int r = 0; r < M; ++r) {
+                float s = 0.f;
+                for (int k = 0; k < N; ++k) s += J[r*N + k] * qb[k];
+                Jqb[r] = s;
+            }
+            // A⁻¹ (J qb)  (M)
+            std::vector<float> AiJqb((size_t)M, 0.f);
+            for (int r = 0; r < M; ++r) {
+                float s = 0.f;
+                for (int c = 0; c < M; ++c) s += A[r*M + c] * Jqb[c];
+                AiJqb[r] = s;
+            }
+            // Δq += qb − Jᵀ A⁻¹ J qb
+            for (int k = 0; k < N; ++k) {
+                float s = 0.f;
+                for (int r = 0; r < M; ++r) s += J[r*N + k] * AiJqb[r];
+                dq[k] += qb[k] - s;
+            }
+        }
+
+        float max_abs = 0.f;
+        for (int k = 0; k < N; ++k) {
+            float a = fabsf(dq[k]);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = 1.f;
+        if (max_abs > max_dq && max_abs > 1e-9f) scale = max_dq / max_abs;
+
+        for (int k = 0; k < N; ++k) {
+            UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
+            info.angle += scale * dq[k];
             clamp_joint(info, PI);
         }
     }
+    return false;
+}
 
-    float3 ee = ik_forward(h, chain, jpos, jaxis);
-    float3 diff = make_float3(target_pos.x - ee.x, target_pos.y - ee.y, target_pos.z - ee.z);
-    return sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z) < tolerance;
+bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
+                   int max_iters, float tolerance)
+{
+    return urdf_solve_dls(h, target_pos, -1, max_iters, tolerance);
 }
 
 bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
@@ -1448,42 +1864,10 @@ bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
     if (!h) return false;
     std::vector<IKChainEntry> chain;
     if (!ik_collect_chain(h, chain) || chain.empty()) return false;
-
     std::vector<int> movable;
     ik_movable_indices(h, chain, movable);
     if (joint_idx < 1 || joint_idx >= (int)movable.size()) return false;
-
-    UrdfJointInfo* joints = h->joint_infos.data();
-    const float PI = 3.14159265f;
-    std::vector<float3> jpos, jaxis;
-
-    int target_ci = movable[joint_idx];
-
-    for (int iter = 0; iter < max_iters; iter++) {
-        ik_forward(h, chain, jpos, jaxis);
-        float3 cur = jpos[target_ci];
-
-        float3 diff = make_float3(target_pos.x - cur.x, target_pos.y - cur.y, target_pos.z - cur.z);
-        float dist = sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
-        if (dist < tolerance) return true;
-
-        // CCD on joints [0..joint_idx) only
-        for (int mi = joint_idx - 1; mi >= 0; mi--) {
-            int ci = movable[mi];
-            UrdfJointInfo& info = joints[chain[ci].ji];
-
-            ik_forward(h, chain, jpos, jaxis);
-            float a = ccd_angle_for_joint(jpos[ci], jaxis[ci],
-                                          jpos[target_ci], target_pos, 0.5f);
-            info.angle += a;
-            clamp_joint(info, PI);
-        }
-    }
-
-    ik_forward(h, chain, jpos, jaxis);
-    float3 cur = jpos[target_ci];
-    float3 diff = make_float3(target_pos.x - cur.x, target_pos.y - cur.y, target_pos.z - cur.z);
-    return sqrtf(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z) < tolerance;
+    return urdf_solve_dls(h, target_pos, movable[joint_idx], max_iters, tolerance);
 }
 
 bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
@@ -1506,6 +1890,9 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
 
     std::function<void(const std::string&, Mat4, bool)> repose_link;
     repose_link = [&](const std::string& link_name, Mat4 world_xform, bool under_ee) {
+        if (link_name == h->root_body_link)
+            world_xform = world_xform * h->root_xform;
+
         // Once we enter the ee subtree, all descendants contribute to the centroid.
         if (!under_ee && link_name == h->ee_link_name) under_ee = true;
 
@@ -1596,4 +1983,166 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
 void urdf_articulation_close(UrdfArticulation* h)
 {
     delete h;
+}
+
+void urdf_set_root_xform(UrdfArticulation* h, const float m16[16])
+{
+    if (!h || !m16) return;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            h->root_xform.m[r][c] = m16[r * 4 + c];
+}
+
+void urdf_clear_root_xform(UrdfArticulation* h)
+{
+    if (!h) return;
+    h->root_xform = Mat4::identity();
+}
+
+// Sim-driven repose. Each articulation link whose name matches a sim body is
+// snapped to z_to_y * body_world_mujoco, exactly matching MuJoCo's xpos/xmat.
+// Links not in the map (synthetic joint-frame links, fixed-joint geom wrappers,
+// the synthetic __world__ root) inherit via the joint chain from their parent —
+// but every geom that renders is the fixed child of a body that *is* in the
+// map, so its world transform = body_world * visual_origin = MuJoCo's geom
+// pose. The reimplemented FK is bypassed for any link that matters.
+bool urdf_repose_with_body_xforms(UrdfArticulation* h,
+                                   const std::vector<std::string>& body_names,
+                                   const std::vector<float>& body_mats_flat,
+                                   std::vector<Triangle>& triangles_out)
+{
+    if (!h || h->mesh_caches.empty()) return false;
+    if (body_names.empty() || body_mats_flat.size() != body_names.size() * 16) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr, "[urdf_repose_with_body_xforms] EMPTY INPUT — falling back to FK. names=%zu mats=%zu\n",
+                         body_names.size(), body_mats_flat.size());
+            warned = true;
+        }
+        return urdf_repose(h, triangles_out);
+    }
+
+    // Build name → Mat4 (Z-up) map from parallel vectors.
+    std::unordered_map<std::string, Mat4> body_world;
+    body_world.reserve(body_names.size());
+    for (size_t i = 0; i < body_names.size(); ++i) {
+        Mat4 m;
+        const float* src = body_mats_flat.data() + i * 16;
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                m.m[r][c] = src[r * 4 + c];
+        body_world.emplace(body_names[i], m);
+    }
+
+    {
+        static int printed = 0;
+        if (printed < 1) {
+            std::fprintf(stderr, "[snap] === SIM BODIES (%zu) ===\n", body_names.size());
+            for (size_t i = 0; i < body_names.size(); ++i) {
+                const float* M = body_mats_flat.data() + i * 16;
+                bool matched = h->links.count(body_names[i]) > 0;
+                std::fprintf(stderr, "[snap]  %s '%s' pos=(%.3f,%.3f,%.3f)\n",
+                             matched ? "MATCH" : "MISS ",
+                             body_names[i].c_str(), M[3], M[7], M[11]);
+            }
+            std::fprintf(stderr, "[snap] === ARTIC LINKS (%zu, showing first 20) ===\n", h->links.size());
+            int k = 0;
+            for (const auto& kv : h->links) {
+                if (k++ >= 20) break;
+                bool in_sim = body_world.count(kv.first) > 0;
+                std::fprintf(stderr, "[snap]  %s '%s'\n",
+                             in_sim ? "SIM  " : "chain", kv.first.c_str());
+            }
+            ++printed;
+        }
+    }
+
+    int cache_idx = 0;
+    float3 ee_centroid = make_float3(0, 0, 0);
+    int    ee_vert_count = 0;
+
+    std::function<void(const std::string&, Mat4, bool)> walk;
+    walk = [&](const std::string& link_name, Mat4 chain_world, bool under_ee) {
+        // Snap to sim-computed world if this link corresponds to a sim body.
+        // NOTE: Mat4::operator* miscomputes A*B as B*A for this specific call
+        // pattern under MSVC /O2 (root cause not identified — possibly an
+        // RVO/aliasing codegen bug). Call the free-function variant instead;
+        // it is immune.
+        Mat4 world_xform = chain_world;
+        auto sit = body_world.find(link_name);
+        bool snapped = sit != body_world.end();
+        if (snapped)
+            world_xform = mat4_mul_rowmajor(h->z_to_y, sit->second);
+
+        if (!under_ee && link_name == h->ee_link_name) under_ee = true;
+
+        if (cache_idx < (int)h->mesh_caches.size() &&
+            h->mesh_caches[cache_idx].link_name == link_name)
+        {
+            auto& mc = h->mesh_caches[cache_idx];
+            const Mat4& local_xform = h->links[link_name].visual_origin;
+            const Mat4& world = world_xform;
+
+            for (int ti = 0; ti < mc.tri_count; ++ti) {
+                int idx = mc.tri_start + ti;
+                if (idx >= (int)triangles_out.size()) break;
+
+                int i0 = mc.raw.indices[ti*3];
+                int i1 = mc.raw.indices[ti*3+1];
+                int i2 = mc.raw.indices[ti*3+2];
+
+                Triangle& tri = triangles_out[idx];
+                tri.v0 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i0]));
+                tri.v1 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i1]));
+                tri.v2 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i2]));
+
+                if (under_ee) {
+                    ee_centroid.x += tri.v0.x + tri.v1.x + tri.v2.x;
+                    ee_centroid.y += tri.v0.y + tri.v1.y + tri.v2.y;
+                    ee_centroid.z += tri.v0.z + tri.v1.z + tri.v2.z;
+                    ee_vert_count += 3;
+                }
+
+                if (i0 < (int)mc.raw.normals.size() && i1 < (int)mc.raw.normals.size() && i2 < (int)mc.raw.normals.size()) {
+                    tri.n0 = world.transform_normal(local_xform.transform_normal(mc.raw.normals[i0]));
+                    tri.n1 = world.transform_normal(local_xform.transform_normal(mc.raw.normals[i1]));
+                    tri.n2 = world.transform_normal(local_xform.transform_normal(mc.raw.normals[i2]));
+                } else {
+                    float3 e1 = tri.v1 - tri.v0;
+                    float3 e2 = tri.v2 - tri.v0;
+                    float3 fn = make_float3(e1.y*e2.z-e1.z*e2.y, e1.z*e2.x-e1.x*e2.z, e1.x*e2.y-e1.y*e2.x);
+                    float len = sqrtf(fn.x*fn.x + fn.y*fn.y + fn.z*fn.z);
+                    if (len > 1e-7f) { fn.x/=len; fn.y/=len; fn.z/=len; }
+                    tri.n0 = tri.n1 = tri.n2 = fn;
+                }
+            }
+            ++cache_idx;
+        }
+
+        auto jit = h->children_map.find(link_name);
+        if (jit == h->children_map.end()) return;
+
+        for (auto* joint : jit->second) {
+            // Only bother chaining when the child isn't a sim body — children
+            // that are bodies will be snapped anyway, so the composed chain
+            // value is unused. Still, compute it so non-body descendants
+            // (geom wrappers) inherit a reasonable parent world even if a
+            // body is missing from the sim map.
+            Mat4 child_chain = mat4_mul_rowmajor(world_xform, joint->origin);
+            // Joint angle is irrelevant here — if the child is a body, we
+            // snap; if not (geom/fixed), angle is 0 by construction.
+            walk(joint->child, child_chain, under_ee);
+        }
+    };
+
+    walk(h->root_link, h->z_to_y, false);
+
+    if (ee_vert_count > 0) {
+        float inv = 1.f / (float)ee_vert_count;
+        h->ee_world_pos = make_float3(ee_centroid.x * inv,
+                                      ee_centroid.y * inv,
+                                      ee_centroid.z * inv);
+    }
+
+    return true;
 }

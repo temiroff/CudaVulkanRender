@@ -6,10 +6,10 @@
 //
 // The NIM container is started with:
 //   docker run -it --gpus all -p 8000:8000 nvcr.io/nim/<model>
-// Typical models: microsoft/phi-3.5-vision-instruct
-//                 meta/llama-3.2-90b-vision-instruct
-//                 nvidia/nemotron-nano-12b-v2-vl
+// Typical models: nvidia/nemotron-nano-12b-v2-vl
 //                 nvidia/llama-3.1-nemotron-nano-vl-8b-v1
+//                 meta/llama-3.2-90b-vision-instruct
+// (microsoft/phi-3.5-vision-instruct was retired by NIM on 2026-04-15.)
 
 struct NimVlmConfig {
     // ── Endpoint ──────────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ struct NimVlmConfig {
     char  api_key[512] = "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";   // NVIDIA API key — leave empty for local Docker
 
     // ── Model ─────────────────────────────────────────────────────────────────
-    char  model[256]   = "microsoft/phi-3.5-vision-instruct";
+    char  model[256]   = "nvidia/nemotron-nano-12b-v2-vl";
     float temperature  = 0.05f;
     int   max_tokens   = 256;
 };

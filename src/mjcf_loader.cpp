@@ -837,6 +837,15 @@ struct MjcfFlatten {
     std::unordered_set<std::string> environment_links;
 };
 
+static bool body_tree_has_joint(const MjcfBody& body)
+{
+    if (!body.joints.empty()) return true;
+    for (const auto& child : body.children) {
+        if (body_tree_has_joint(child)) return true;
+    }
+    return false;
+}
+
 // Unique ID counter to disambiguate synthetic names (unnamed bodies, unnamed joints)
 static int mjcf_unique_id_counter = 0;
 
@@ -845,6 +854,15 @@ static std::string make_unique_body_name(const std::string& hint)
     int id = ++mjcf_unique_id_counter;
     std::string base = hint.empty() ? std::string("body") : hint;
     return base + "__mj" + std::to_string(id);
+}
+
+static Mat4 translate_xyz(float3 t)
+{
+    Mat4 T = Mat4::identity();
+    T.m[0][3] = t.x;
+    T.m[1][3] = t.y;
+    T.m[2][3] = t.z;
+    return T;
 }
 
 // Emit a URDFLink + fixed joint for a single visual geom. Handles both
@@ -909,7 +927,7 @@ static void attach_visual_geom(const MjcfGeom& g, size_t gi,
 // uniquification for empty names). Body-local transform becomes the parent joint
 // origin; its movable joints become URDFJoints with that origin; movable joints
 // beyond the first are chained via zero-origin links (composite joint bodies).
-static void flatten_body(const MjcfBody& body, const std::string& parent_link_name,
+static std::string flatten_body(const MjcfBody& body, const std::string& parent_link_name,
                           MjcfScene& scene, MjcfFlatten& flat, int& obj_counter,
                           std::vector<GpuMaterial>& materials_out,
                           const std::function<int(const std::string&, float4, bool)>& get_or_add_material)
@@ -931,13 +949,15 @@ static void flatten_body(const MjcfBody& body, const std::string& parent_link_na
     flat.links[body_link] = L;
 
     // Connect parent → body with a URDFJoint for each MJCF joint on this body.
-    // For bodies with no MJCF joints (fixed welded bodies), emit a single fixed joint.
-    // For bodies with multiple MJCF joints, we insert synthetic intermediate links:
-    //   parent_link → [J0] → link#0 → [J1] → link#1 → ... → body_link
-    // Each synthetic link has no geoms; only body_link carries the geoms.
+    // Bodies with no MJCF joints emit a single fixed joint.
+    //
+    // For articulated bodies, keep `body_link` in the authored MJCF body frame
+    // and insert synthetic joint-frame links around the actuated DOFs:
+    //   parent * body_xform * T(pos0) * R0 * T(pos1-pos0) * R1 * ... * T(-posN)
+    // This preserves MuJoCo's joint anchors exactly while leaving geoms and
+    // child-body transforms authored in the body frame unchanged.
     std::string prev_link = parent_link_name;
-    Mat4 pending_origin = body.local_xform;  // applied on the first emitted joint only
-    bool first = true;
+    Mat4 pending_origin = body.local_xform;
 
     auto emit_joint = [&](const std::string& child_link, const std::string& jname,
                           const std::string& jtype, float3 axis, float lo, float hi,
@@ -960,33 +980,34 @@ static void flatten_body(const MjcfBody& body, const std::string& parent_link_na
         // Fixed weld
         emit_joint(body_link, "", "fixed", make_float3(0, 0, 1), 0, 0, false, pending_origin);
     } else {
+        float3 prev_joint_pos = make_float3(0, 0, 0);
         for (size_t k = 0; k < body.joints.size(); ++k) {
             const auto& j = body.joints[k];
-            std::string child;
-            if (k + 1 == body.joints.size()) child = body_link;
-            else {
-                child = make_unique_body_name(body_link + "_j" + std::to_string(k));
-                URDFLink syn; syn.name = child; syn.visual_origin = Mat4::identity();
-                flat.links[child] = syn;
-            }
+            std::string child = make_unique_body_name(body_link + "_j" + std::to_string(k));
+            URDFLink syn; syn.name = child; syn.visual_origin = Mat4::identity();
+            flat.links[child] = syn;
 
             std::string jtype_urdf = (j.type == "slide") ? "prismatic" : "revolute";
             // MJCF 'hinge' with no range → continuous (URDF convention)
             if (j.type == "hinge" && !j.has_range && !j.limited)
                 jtype_urdf = "continuous";
 
-            // Use body's local transform for the first emitted joint, identity after
-            Mat4 origin = first ? pending_origin : Mat4::identity();
-            first = false;
-
-            // NOTE: MJCF joints may also have a <joint pos="..."/> offset from the body
-            // origin. For the targeted Menagerie robots (Panda, etc.) joint pos is ~0.
-            // We ignore joint pos here — supporting it requires composing into origin.
+            Mat4 origin = (k == 0)
+                ? (pending_origin * translate_xyz(j.pos))
+                : translate_xyz(make_float3(j.pos.x - prev_joint_pos.x,
+                                            j.pos.y - prev_joint_pos.y,
+                                            j.pos.z - prev_joint_pos.z));
 
             emit_joint(child, j.name, jtype_urdf, j.axis,
                        j.range_lo, j.range_hi, j.has_range, origin);
             prev_link = child;
+            prev_joint_pos = j.pos;
         }
+
+        emit_joint(body_link, "", "fixed", make_float3(0, 0, 1), 0, 0, false,
+                   translate_xyz(make_float3(-prev_joint_pos.x,
+                                             -prev_joint_pos.y,
+                                             -prev_joint_pos.z)));
     }
 
     // Attach each visual geom as a child fixed-joint link of body_link.
@@ -999,6 +1020,8 @@ static void flatten_body(const MjcfBody& body, const std::string& parent_link_na
     for (auto& sub : body.children) {
         flatten_body(sub, body_link, scene, flat, obj_counter, materials_out, get_or_add_material);
     }
+
+    return body_link;
 }
 
 // ─────────────────────────────────────────────
@@ -1314,9 +1337,14 @@ UrdfArticulation* mjcf_articulation_open(const std::string& path,
     auto noop_mat = [](const std::string&, float4, bool) -> int { return 0; };
 
     int obj_counter = 0;
+    std::string articulated_root_link;
+    std::string first_top_link;
     for (auto& top : scene.worldbody.children) {
-        flatten_body(top, flat.root_link, scene, flat, obj_counter,
-                     unused_materials, noop_mat);
+        std::string top_link = flatten_body(top, flat.root_link, scene, flat, obj_counter,
+                                            unused_materials, noop_mat);
+        if (first_top_link.empty()) first_top_link = top_link;
+        if (articulated_root_link.empty() && body_tree_has_joint(top))
+            articulated_root_link = top_link;
     }
     for (size_t gi = 0; gi < scene.worldbody.geoms.size(); ++gi) {
         attach_visual_geom(scene.worldbody.geoms[gi], gi, flat.root_link,
@@ -1327,6 +1355,7 @@ UrdfArticulation* mjcf_articulation_open(const std::string& path,
     h->links      = flat.links;
     h->joints     = flat.joints;
     h->root_link  = flat.root_link;
+    h->root_body_link = !articulated_root_link.empty() ? articulated_root_link : first_top_link;
 
     urdf_articulation_finalize(h, initial_tris);
     return h;

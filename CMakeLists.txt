@@ -138,6 +138,41 @@ FetchContent_Declare(tinyexr
 )
 FetchContent_Populate(tinyexr)
 
+# ── MuJoCo SDK (precompiled Windows x86_64 release) ─────────────────────────
+# Provides libmujoco for the Sim backend. MuJoCo is Apache-2.0. Versions:
+# https://github.com/google-deepmind/mujoco/releases
+set(MUJOCO_VERSION "3.1.6" CACHE STRING "MuJoCo release version to fetch")
+option(ENABLE_MUJOCO "Fetch MuJoCo SDK and build MuJoCo sim backend" ON)
+
+if(ENABLE_MUJOCO)
+    FetchContent_Declare(mujoco
+        URL https://github.com/google-deepmind/mujoco/releases/download/${MUJOCO_VERSION}/mujoco-${MUJOCO_VERSION}-windows-x86_64.zip
+    )
+    FetchContent_MakeAvailable(mujoco)
+
+    set(MUJOCO_INCLUDE_DIR "${mujoco_SOURCE_DIR}/include")
+    find_library(MUJOCO_LIBRARY
+        NAMES mujoco
+        HINTS "${mujoco_SOURCE_DIR}/lib" "${mujoco_SOURCE_DIR}/bin"
+        NO_DEFAULT_PATH
+    )
+    find_file(MUJOCO_DLL
+        NAMES mujoco.dll
+        HINTS "${mujoco_SOURCE_DIR}/bin" "${mujoco_SOURCE_DIR}/lib"
+        NO_DEFAULT_PATH
+    )
+
+    if(MUJOCO_LIBRARY AND EXISTS "${MUJOCO_INCLUDE_DIR}/mujoco/mujoco.h")
+        message(STATUS "MuJoCo ${MUJOCO_VERSION} found: ${MUJOCO_LIBRARY}")
+        set(MUJOCO_FOUND ON)
+    else()
+        message(WARNING "MuJoCo fetch succeeded but lib/headers missing — sim backend disabled")
+        set(MUJOCO_FOUND OFF)
+    endif()
+else()
+    set(MUJOCO_FOUND OFF)
+endif()
+
 # ImGui sources (docking branch ??? required for split panels)
 set(IMGUI_DIR external/imgui)
 set(IMGUI_SOURCES_OPENGL3
@@ -195,6 +230,8 @@ add_executable(pathtracer
     src/usd_loader.cpp
     src/urdf_loader.cpp
     src/mjcf_loader.cpp
+    src/sim/sim_backend.cpp
+    src/sim/sim_mujoco.cpp
     src/post_process.cpp
     src/nim_vlm.cpp
     src/nim_cosmos.cpp
@@ -342,6 +379,30 @@ if(CUPTI_FOUND)
     endif()
 
     message(STATUS "Building with CUPTI real hardware counters")
+endif()
+
+if(MUJOCO_FOUND)
+    target_compile_definitions(pathtracer PRIVATE MUJOCO_ENABLED)
+    target_include_directories(pathtracer PRIVATE "${MUJOCO_INCLUDE_DIR}")
+    target_link_libraries(pathtracer PRIVATE "${MUJOCO_LIBRARY}")
+    if(MUJOCO_DLL)
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${MUJOCO_DLL}" "$<TARGET_FILE_DIR:pathtracer>"
+            COMMENT "Copying mujoco.dll")
+    endif()
+    # MuJoCo loads plugin DLLs (actuators, sensors, elasticity, sdf) from a
+    # mujoco_plugin/ folder next to the main DLL. Without this, scenes that
+    # use any plugin feature will fail — ship the whole folder.
+    set(_mj_plugin_src "${mujoco_SOURCE_DIR}/bin/mujoco_plugin")
+    if(EXISTS "${_mj_plugin_src}")
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${_mj_plugin_src}"
+                "$<TARGET_FILE_DIR:pathtracer>/mujoco_plugin"
+            COMMENT "Copying MuJoCo plugin DLLs")
+    endif()
+    message(STATUS "Building with MuJoCo sim backend")
 endif()
 
 if(OIDN_FOUND)

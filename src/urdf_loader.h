@@ -58,6 +58,22 @@ float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx);
 // Get the number of movable joints in the IK chain.
 int urdf_ik_chain_length(UrdfArticulation* h);
 
+// Which joint IK leaves alone (so the user can set its angle manually).
+// -1 means "auto pick last movable joint". Index is into urdf_joint_info().
+int  urdf_ik_lock_joint(UrdfArticulation* h);
+void urdf_set_ik_lock_joint(UrdfArticulation* h, int joint_idx);
+
+// Resolve the effective locked joint index (converts -1 → last movable).
+// Returns -1 if nothing is movable.
+int  urdf_ik_lock_joint_effective(UrdfArticulation* h);
+
+// Per-joint multi-lock. Any joint marked locked is excluded from IK, so
+// the solver has to find a solution without moving it. The primary lock
+// (above) is implicitly locked as well. Joint index is into urdf_joint_info().
+bool urdf_ik_is_locked(UrdfArticulation* h, int joint_idx);
+void urdf_ik_set_locked(UrdfArticulation* h, int joint_idx, bool locked);
+void urdf_ik_clear_all_locks(UrdfArticulation* h);
+
 // Compute end-effector position via forward kinematics (from current joint angles).
 // Unlike urdf_end_effector_pos which returns a cached mesh centroid, this computes
 // the FK chain tip directly — consistent with what the IK solver uses internally.
@@ -71,6 +87,26 @@ void urdf_fk_ee_transform(UrdfArticulation* h, float* out_mat16);
 // Updates triangles_out in-place (must be same size as initial_tris).
 // Returns true if any geometry changed.
 bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out);
+
+// Override the root-link base transform (in articulation-native / Z-up space).
+// Use this to feed freejoint motion from a physics backend into rendering.
+// m16 is row-major 4x4. Pass the identity (or call urdf_clear_root_xform)
+// to return to default behavior.
+void urdf_set_root_xform(UrdfArticulation* h, const float m16[16]);
+void urdf_clear_root_xform(UrdfArticulation* h);
+
+// Re-evaluate geometry using sim-provided per-body world transforms (Z-up,
+// row-major 4x4 per body in body_mats_flat, names.size()*16 floats).
+// For any articulation link whose name matches a body name, the link's world
+// transform is snapped to z_to_y * body_world instead of being computed by
+// reimplemented FK. Links not in the map inherit via the joint chain from
+// their parent as usual (synthetic joint-frame links and geom-child links).
+// This keeps rendering exactly consistent with the sim — no divergence from
+// joint pos/axis/quat reinterpretation. Returns true if geometry changed.
+bool urdf_repose_with_body_xforms(UrdfArticulation* h,
+                                   const std::vector<std::string>& body_names,
+                                   const std::vector<float>& body_mats_flat,
+                                   std::vector<Triangle>& triangles_out);
 
 // Free all cached data.
 void urdf_articulation_close(UrdfArticulation* h);

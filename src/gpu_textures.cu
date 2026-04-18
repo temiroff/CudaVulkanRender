@@ -169,7 +169,8 @@ GpuTexture gpu_texture_upload_rgba8(const uint8_t* data, int width, int height,
     texDesc.normalizedCoords      = 1;
     texDesc.minMipmapLevelClamp   = 0.f;
     texDesc.maxMipmapLevelClamp   = (float)(mip_pixels.size() - 1);
-    texDesc.maxAnisotropy         = 1;
+    texDesc.maxAnisotropy         = 4; // mild aniso; 16 caused the filter's major axis to flicker
+                                       // between frames on huge floor UV ranges (near-circular ellipse)
 
     if (!CUDA_CHECK(cudaCreateTextureObject(&t.tex, &resDesc, &texDesc, nullptr), err_out)) {
         cudaFreeMipmappedArray(t.mip_array);

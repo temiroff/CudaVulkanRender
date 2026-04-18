@@ -471,16 +471,14 @@ bool control_panel_draw(ControlPanelState& s) {
         // ── Model dropdown ───────────────────────────────────────────────
         {
             static const char* nim_model_names[] = {
-                "Phi-3.5 Vision (Microsoft)",
-                "Llama 3.2 90B Vision (Meta)",
                 "Nemotron Nano 12B VL (NVIDIA)",
                 "Nemotron Nano VL 8B (NVIDIA)",
+                "Llama 3.2 90B Vision (Meta)",
             };
             static const char* nim_model_ids[] = {
-                "microsoft/phi-3.5-vision-instruct",
-                "meta/llama-3.2-90b-vision-instruct",
                 "nvidia/nemotron-nano-12b-v2-vl",
                 "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+                "meta/llama-3.2-90b-vision-instruct",
             };
             static const int nim_model_count = sizeof(nim_model_ids) / sizeof(nim_model_ids[0]);
 
