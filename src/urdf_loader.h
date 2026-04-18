@@ -92,6 +92,11 @@ float3 urdf_fk_ee_pos(UrdfArticulation* h);
 // out_mat: 16 floats in row-major order (m[row][col]).
 void urdf_fk_ee_transform(UrdfArticulation* h, float* out_mat16);
 
+// World-space transform of any joint (by index into urdf_joint_info array),
+// with the joint's current angle applied. Writes identity when the joint
+// isn't in the IK chain. Row-major 4x4.
+void urdf_joint_world_transform(UrdfArticulation* h, int joint_idx, float* out_mat16);
+
 // Re-evaluate geometry from current joint angles.
 // Updates triangles_out in-place (must be same size as initial_tris).
 // Returns true if any geometry changed.

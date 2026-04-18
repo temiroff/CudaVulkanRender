@@ -3675,6 +3675,87 @@ int main() {
                 draw_wrapped(line_tags, IM_COL32(120, 180, 255, 200));
             }
 
+            // ── Sensor camera gizmo (wireframe body + frustum) ────────
+            // A small flat box centred on the attachment origin, plus a
+            // pyramid showing FOV. Drawn only when "Show gizmo" is enabled.
+            if (sensor_state.show_gizmo && urdf_artic_handle) {
+                float3 s_origin, s_right, s_up, s_fwd;
+                if (sensor_get_world_frame(sensor_state, urdf_artic_handle,
+                                            s_origin, s_right, s_up, s_fwd)) {
+                    float aspect_g = (rt_w > 0 && rt_h > 0)
+                        ? (float)rt_w / (float)rt_h : 1.f;
+
+                    // Body: 4×3×2 cm flat box sitting *behind* the aperture,
+                    // so the lens (origin) is flush with the front face.
+                    const float BW = 0.04f, BH = 0.03f, BD = 0.02f;
+                    float3 body_ctr = make_float3(
+                        s_origin.x - s_fwd.x * (BD*0.5f),
+                        s_origin.y - s_fwd.y * (BD*0.5f),
+                        s_origin.z - s_fwd.z * (BD*0.5f));
+                    float3 body[8];
+                    for (int i = 0; i < 8; ++i) {
+                        float sx = (i & 1) ? BW*0.5f : -BW*0.5f;
+                        float sy = (i & 2) ? BH*0.5f : -BH*0.5f;
+                        float sz = (i & 4) ? BD*0.5f : -BD*0.5f;
+                        body[i] = make_float3(
+                            body_ctr.x + s_right.x*sx + s_up.x*sy + s_fwd.x*sz,
+                            body_ctr.y + s_right.y*sx + s_up.y*sy + s_fwd.y*sz,
+                            body_ctr.z + s_right.z*sx + s_up.z*sy + s_fwd.z*sz);
+                    }
+
+                    // Frustum: 8 cm long, half-size from FOV.
+                    const float F = 0.08f;
+                    float half_h = tanf(sensor_state.fov_deg * 0.5f * 3.14159265f / 180.f) * F;
+                    float half_w = half_h * ((float)sensor_state.width /
+                                              (float)std::max(1, sensor_state.height));
+                    float3 apex = s_origin;
+                    float3 corner[4];
+                    for (int i = 0; i < 4; ++i) {
+                        float sx = (i == 1 || i == 2) ?  half_w : -half_w;
+                        float sy = (i >= 2)           ?  half_h : -half_h;
+                        corner[i] = make_float3(
+                            apex.x + s_right.x*sx + s_up.x*sy + s_fwd.x*F,
+                            apex.y + s_right.y*sx + s_up.y*sy + s_fwd.y*F,
+                            apex.z + s_right.z*sx + s_up.z*sy + s_fwd.z*F);
+                    }
+
+                    auto proj = [&](float3 p, ImVec2& out) {
+                        return world_to_screen(cam, p, vp.origin, vp.size,
+                                               ctrl.vfov, aspect_g, out) > 0.f;
+                    };
+
+                    const ImU32 col_body = IM_COL32(120, 200, 255, 230);
+                    const ImU32 col_frus = IM_COL32(255, 220, 80,  230);
+
+                    // 12 edges of the box.
+                    static const int edges[12][2] = {
+                        {0,1},{2,3},{4,5},{6,7},
+                        {0,2},{1,3},{4,6},{5,7},
+                        {0,4},{1,5},{2,6},{3,7}
+                    };
+                    for (auto& e : edges) {
+                        ImVec2 a, b;
+                        if (proj(body[e[0]], a) && proj(body[e[1]], b))
+                            dl->AddLine(a, b, col_body, 1.5f);
+                    }
+
+                    // Frustum: apex to 4 corners + far rectangle.
+                    ImVec2 apx;
+                    if (proj(apex, apx)) {
+                        for (int i = 0; i < 4; ++i) {
+                            ImVec2 c;
+                            if (proj(corner[i], c))
+                                dl->AddLine(apx, c, col_frus, 1.2f);
+                        }
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        ImVec2 a, b;
+                        if (proj(corner[i], a) && proj(corner[(i+1)%4], b))
+                            dl->AddLine(a, b, col_frus, 1.2f);
+                    }
+                }
+            }
+
             dl->PopClipRect();
         }
 
@@ -4466,6 +4547,15 @@ int main() {
 
             // Sensor PiP (gripper camera) — rendered last so it sits on top of
             // the main viewport image, independent of the DLSS debug overlay.
+            // Lights are anchored to a canonical world frame (w=+Z, u=+X, v=+Y)
+            // instead of the viewport camera basis, so orbiting the main view
+            // doesn't change the sensor's shading.
+            float3 world_w = make_float3(0.f, 0.f, 1.f);
+            float3 world_u = make_float3(1.f, 0.f, 0.f);
+            float3 world_v = make_float3(0.f, 1.f, 0.f);
+            float3 sensor_key = normalize3(world_w + world_u * ctrl.light_key_u  + world_v * ctrl.light_key_v);
+            float3 sensor_fill= normalize3(world_w + world_u * ctrl.light_fill_u + world_v * ctrl.light_fill_v);
+            float3 sensor_rim = normalize3(world_w * -1.f + world_u * ctrl.light_rim_u + world_v * ctrl.light_rim_v);
             sensor_render_and_blit(sensor_state, urdf_artic_handle,
                                    interop.surface, rt_w, rt_h,
                                    mesh.d_prims, (int)mesh.prims.size(),
@@ -4473,7 +4563,7 @@ int main() {
                                    mesh.d_obj_colors, mesh.num_obj_colors,
                                    ctrl.color_mode,
                                    make_float3(ctrl.bg_color[0], ctrl.bg_color[1], ctrl.bg_color[2]),
-                                   light_key_dir, light_fill_dir, light_rim_dir);
+                                   sensor_key, sensor_fill, sensor_rim);
         }
 
         // Ensure all CUDA writes to interop.surface are complete before Vulkan reads it.

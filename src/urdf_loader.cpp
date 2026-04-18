@@ -1376,6 +1376,28 @@ void urdf_fk_ee_transform(UrdfArticulation* h, float* out_mat16)
             out_mat16[r * 4 + c] = ee_xform.m[r][c];
 }
 
+void urdf_joint_world_transform(UrdfArticulation* h, int joint_idx, float* out_mat16)
+{
+    if (!out_mat16) return;
+    for (int i = 0; i < 16; i++) out_mat16[i] = (i % 5 == 0) ? 1.f : 0.f;
+    if (!h || joint_idx < 0 || joint_idx >= (int)h->joint_infos.size()) return;
+
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty()) return;
+    std::vector<float3> jp, ja;
+    std::vector<Mat4>   xforms;
+    ik_forward(h, chain, jp, ja, nullptr, &xforms);
+
+    for (int ci = 0; ci < (int)chain.size(); ++ci) {
+        if (chain[ci].ji == joint_idx) {
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    out_mat16[r * 4 + c] = xforms[ci].m[r][c];
+            return;
+        }
+    }
+}
+
 // Helper: map movable joint indices from chain
 static void ik_movable_indices(UrdfArticulation* h,
                                const std::vector<IKChainEntry>& chain,
