@@ -103,6 +103,22 @@ struct MjcfMaterialDef {
     float  specular  = 0.0f;
     float  shininess = 0.5f;
     float  reflectance = 0.0f;
+    std::string texture_name;             // references <texture name="...">
+    float2      texrepeat = make_float2(1, 1);
+    bool        texuniform = false;
+};
+
+// Built-in procedural texture ("checker") or 2D image. We only generate the
+// "checker" builtin (most common in Menagerie scenes). Everything else is
+// stored but ignored for now.
+struct MjcfTextureDef {
+    std::string builtin;                  // "checker", "flat", "gradient", "none"
+    float3      rgb1    = make_float3(0.2f, 0.3f, 0.4f);
+    float3      rgb2    = make_float3(0.8f, 0.8f, 0.8f);
+    float3      markrgb = make_float3(0, 0, 0);
+    std::string mark;                     // "edge", "cross", "random", "none"
+    int         width   = 128;
+    int         height  = 128;
 };
 
 struct MjcfMeshDef {
@@ -155,6 +171,7 @@ struct MjcfScene {
     std::unordered_map<std::string, MjcfDefault>    defaults;
     std::unordered_map<std::string, MjcfMaterialDef> materials;
     std::unordered_map<std::string, MjcfMeshDef>    meshes;
+    std::unordered_map<std::string, MjcfTextureDef> textures;
     MjcfBody                                        worldbody;
 };
 
@@ -336,9 +353,40 @@ static void parse_asset(const XmlNode& asset, MjcfScene& scene)
             mm.reflectance = parse_float_attr(
                 resolve_element_attr(scene, child, cls, "reflectance", "0"), 0.0f);
 
+            mm.texture_name = resolve_element_attr(scene, child, cls, "texture", "");
+            std::string texrep = resolve_element_attr(scene, child, cls, "texrepeat", "");
+            if (!texrep.empty()) {
+                auto v = parse_floats_str(texrep);
+                if (v.size() >= 2) mm.texrepeat = make_float2(v[0], v[1]);
+                else if (v.size() == 1) mm.texrepeat = make_float2(v[0], v[0]);
+            }
+            mm.texuniform = (resolve_element_attr(scene, child, cls, "texuniform", "false") == "true");
+
             scene.materials[name] = mm;
+        } else if (child.tag == "texture") {
+            MjcfTextureDef td;
+            std::string name = child.attr("name");
+            if (name.empty()) continue;
+            td.builtin = child.attr("builtin", "none");
+            td.mark    = child.attr("mark",    "none");
+
+            auto parse_rgb = [](const std::string& s, float3 def) -> float3 {
+                auto v = parse_floats_str(s);
+                if (v.size() >= 3) return make_float3(v[0], v[1], v[2]);
+                return def;
+            };
+            td.rgb1    = parse_rgb(child.attr("rgb1",    ""), td.rgb1);
+            td.rgb2    = parse_rgb(child.attr("rgb2",    ""), td.rgb2);
+            td.markrgb = parse_rgb(child.attr("markrgb", ""), td.markrgb);
+
+            td.width  = (int)parse_float_attr(child.attr("width",  "128"), 128);
+            td.height = (int)parse_float_attr(child.attr("height", "128"), 128);
+            // Skybox textures are typically 3x taller — skip those for plane textures
+            if (child.attr("type") == "skybox") continue;
+
+            scene.textures[name] = td;
         }
-        // <texture>, <skin>, <hfield> — not handled for MVP
+        // <skin>, <hfield> — not handled
     }
 }
 
@@ -553,19 +601,213 @@ static bool parse_mjcf(const std::string& path, MjcfScene& scene)
 }
 
 // ─────────────────────────────────────────────
+//  Primitive geom mesh generators
+// ─────────────────────────────────────────────
+// MJCF primitive <geom> types: plane, box, sphere, cylinder, capsule, ellipsoid.
+// All are built in the geom's LOCAL frame (pre-transform); visual_origin applies
+// the geom's pos/quat on top.
+
+static void push_tri(RawMesh& m, int i0, int i1, int i2) {
+    m.indices.push_back(i0); m.indices.push_back(i1); m.indices.push_back(i2);
+}
+
+// MJCF plane: size = [hx hy grid]; hx/hy may be 0 (infinite). We render a large
+// finite quad centred on origin in the XY plane (normal +Z). texrepeat scales
+// per-unit so the output UVs tile correctly when the plane has a checker/image
+// material (MJCF 'texuniform' convention: N repeats per world meter).
+static void gen_plane_mesh(float3 size, float2 texrepeat, RawMesh& out) {
+    float hx = size.x > 0 ? size.x : 20.0f;
+    float hy = size.y > 0 ? size.y : 20.0f;
+    out.vertices = {
+        make_float3(-hx, -hy, 0), make_float3( hx, -hy, 0),
+        make_float3( hx,  hy, 0), make_float3(-hx,  hy, 0),
+    };
+    float3 n = make_float3(0, 0, 1);
+    out.normals = { n, n, n, n };
+    out.uvs = {
+        make_float2(-hx * texrepeat.x, -hy * texrepeat.y),
+        make_float2( hx * texrepeat.x, -hy * texrepeat.y),
+        make_float2( hx * texrepeat.x,  hy * texrepeat.y),
+        make_float2(-hx * texrepeat.x,  hy * texrepeat.y),
+    };
+    push_tri(out, 0, 1, 2);
+    push_tri(out, 0, 2, 3);
+}
+
+// MJCF box: size = half-extents [hx hy hz].
+static void gen_box_mesh(float3 s, RawMesh& out) {
+    float hx = s.x, hy = s.y, hz = s.z;
+    // 24 verts (per-face for flat normals)
+    struct F { float3 n; float3 v[4]; };
+    F faces[6] = {
+        { make_float3( 1, 0, 0), {{ hx,-hy,-hz},{ hx, hy,-hz},{ hx, hy, hz},{ hx,-hy, hz}} },
+        { make_float3(-1, 0, 0), {{-hx, hy,-hz},{-hx,-hy,-hz},{-hx,-hy, hz},{-hx, hy, hz}} },
+        { make_float3( 0, 1, 0), {{ hx, hy,-hz},{-hx, hy,-hz},{-hx, hy, hz},{ hx, hy, hz}} },
+        { make_float3( 0,-1, 0), {{-hx,-hy,-hz},{ hx,-hy,-hz},{ hx,-hy, hz},{-hx,-hy, hz}} },
+        { make_float3( 0, 0, 1), {{-hx,-hy, hz},{ hx,-hy, hz},{ hx, hy, hz},{-hx, hy, hz}} },
+        { make_float3( 0, 0,-1), {{-hx, hy,-hz},{ hx, hy,-hz},{ hx,-hy,-hz},{-hx,-hy,-hz}} },
+    };
+    for (auto& f : faces) {
+        int b = (int)out.vertices.size();
+        for (int i = 0; i < 4; ++i) { out.vertices.push_back(f.v[i]); out.normals.push_back(f.n); }
+        push_tri(out, b, b+1, b+2);
+        push_tri(out, b, b+2, b+3);
+    }
+}
+
+// Ellipsoid with radii (rx,ry,rz). Sphere = radii all equal.
+static void gen_ellipsoid_mesh(float rx, float ry, float rz, RawMesh& out,
+                                int rings = 16, int sectors = 24) {
+    const float PI = 3.14159265358979f;
+    int base = (int)out.vertices.size();
+    for (int r = 0; r <= rings; ++r) {
+        float v = (float)r / rings;
+        float theta = v * PI;                // 0..π
+        float sin_t = sinf(theta), cos_t = cosf(theta);
+        for (int s = 0; s <= sectors; ++s) {
+            float u = (float)s / sectors;
+            float phi = u * 2.0f * PI;
+            float sin_p = sinf(phi), cos_p = cosf(phi);
+            float3 p = make_float3(rx * sin_t * cos_p, ry * sin_t * sin_p, rz * cos_t);
+            float3 n = make_float3(sin_t * cos_p / rx, sin_t * sin_p / ry, cos_t / rz);
+            float nl = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+            if (nl > 1e-7f) { n.x/=nl; n.y/=nl; n.z/=nl; }
+            out.vertices.push_back(p);
+            out.normals.push_back(n);
+        }
+    }
+    int stride = sectors + 1;
+    for (int r = 0; r < rings; ++r) {
+        for (int s = 0; s < sectors; ++s) {
+            int i0 = base + r * stride + s;
+            int i1 = i0 + 1;
+            int i2 = i0 + stride;
+            int i3 = i2 + 1;
+            push_tri(out, i0, i2, i1);
+            push_tri(out, i1, i2, i3);
+        }
+    }
+}
+
+// Cylinder along local Z; size[0]=radius, size[1]=half-height.
+// caps_on_ends: true for cylinder, false for capsule body (hemispheres cap the ends).
+static void gen_cylinder_body(float radius, float half_h, RawMesh& out,
+                               int sectors, bool caps_on_ends) {
+    const float PI = 3.14159265358979f;
+    int base = (int)out.vertices.size();
+    // Side: top and bottom rings (duplicated so normals stay radial — flat shading-ish)
+    for (int s = 0; s <= sectors; ++s) {
+        float u = (float)s / sectors;
+        float phi = u * 2.0f * PI;
+        float cp = cosf(phi), sp = sinf(phi);
+        float3 n = make_float3(cp, sp, 0);
+        out.vertices.push_back(make_float3(radius * cp, radius * sp, -half_h));
+        out.normals.push_back(n);
+        out.vertices.push_back(make_float3(radius * cp, radius * sp,  half_h));
+        out.normals.push_back(n);
+    }
+    for (int s = 0; s < sectors; ++s) {
+        int i0 = base + s*2;
+        int i1 = i0 + 1;
+        int i2 = i0 + 2;
+        int i3 = i0 + 3;
+        push_tri(out, i0, i2, i1);
+        push_tri(out, i1, i2, i3);
+    }
+    if (!caps_on_ends) return;
+    // Top cap (fan around +Z)
+    int top_center = (int)out.vertices.size();
+    out.vertices.push_back(make_float3(0, 0, half_h));
+    out.normals.push_back(make_float3(0, 0, 1));
+    int top_ring = (int)out.vertices.size();
+    for (int s = 0; s <= sectors; ++s) {
+        float u = (float)s / sectors;
+        float phi = u * 2.0f * PI;
+        out.vertices.push_back(make_float3(radius * cosf(phi), radius * sinf(phi), half_h));
+        out.normals.push_back(make_float3(0, 0, 1));
+    }
+    for (int s = 0; s < sectors; ++s) push_tri(out, top_center, top_ring + s, top_ring + s + 1);
+    // Bottom cap
+    int bot_center = (int)out.vertices.size();
+    out.vertices.push_back(make_float3(0, 0, -half_h));
+    out.normals.push_back(make_float3(0, 0, -1));
+    int bot_ring = (int)out.vertices.size();
+    for (int s = 0; s <= sectors; ++s) {
+        float u = (float)s / sectors;
+        float phi = u * 2.0f * PI;
+        out.vertices.push_back(make_float3(radius * cosf(phi), radius * sinf(phi), -half_h));
+        out.normals.push_back(make_float3(0, 0, -1));
+    }
+    for (int s = 0; s < sectors; ++s) push_tri(out, bot_center, bot_ring + s + 1, bot_ring + s);
+}
+
+static void gen_cylinder_mesh(float radius, float half_h, RawMesh& out) {
+    gen_cylinder_body(radius, half_h, out, 24, /*caps*/ true);
+}
+
+// Capsule: cylinder along Z + hemispheres on each end, all of radius.
+static void gen_capsule_mesh(float radius, float half_h, RawMesh& out) {
+    gen_cylinder_body(radius, half_h, out, 24, /*caps*/ false);
+    // Top hemisphere centred at (0,0,+half_h)
+    const float PI = 3.14159265358979f;
+    int sectors = 24, rings = 8;
+    auto emit_hemi = [&](float cz, int sign /* +1 top, -1 bottom */) {
+        int base = (int)out.vertices.size();
+        for (int r = 0; r <= rings; ++r) {
+            float v = (float)r / rings;
+            float theta = v * (PI * 0.5f);          // 0..π/2
+            float sin_t = sinf(theta), cos_t = cosf(theta);
+            for (int s = 0; s <= sectors; ++s) {
+                float u = (float)s / sectors;
+                float phi = u * 2.0f * PI;
+                float cp = cosf(phi), sp = sinf(phi);
+                float3 p = make_float3(radius * sin_t * cp, radius * sin_t * sp,
+                                        cz + sign * radius * cos_t);
+                float3 n = make_float3(sin_t * cp, sin_t * sp, sign * cos_t);
+                out.vertices.push_back(p);
+                out.normals.push_back(n);
+            }
+        }
+        int stride = sectors + 1;
+        for (int r = 0; r < rings; ++r) {
+            for (int s = 0; s < sectors; ++s) {
+                int i0 = base + r * stride + s;
+                int i1 = i0 + 1;
+                int i2 = i0 + stride;
+                int i3 = i2 + 1;
+                if (sign > 0) { push_tri(out, i0, i2, i1); push_tri(out, i1, i2, i3); }
+                else          { push_tri(out, i0, i1, i2); push_tri(out, i1, i3, i2); }
+            }
+        }
+    };
+    emit_hemi( half_h, +1);
+    emit_hemi(-half_h, -1);
+}
+
+// Build a primitive RawMesh from a geom's type + size. Returns false for unknown types.
+// texrepeat affects plane UV scaling only (other primitives currently emit no UVs).
+static bool make_primitive_mesh(const std::string& type, float3 size, float2 texrepeat, RawMesh& out) {
+    if (type == "plane")        { gen_plane_mesh(size, texrepeat, out);                 return true; }
+    if (type == "box")          { gen_box_mesh(size, out);                              return true; }
+    if (type == "sphere")       { gen_ellipsoid_mesh(size.x, size.x, size.x, out);      return true; }
+    if (type == "ellipsoid")    { gen_ellipsoid_mesh(size.x, size.y, size.z, out);      return true; }
+    if (type == "cylinder")     { gen_cylinder_mesh(size.x, size.y, out);               return true; }
+    if (type == "capsule")      { gen_capsule_mesh(size.x, size.y, out);                return true; }
+    return false;
+}
+
+// ─────────────────────────────────────────────
 //  Visibility filter
 // ─────────────────────────────────────────────
-// A geom is "visual" if it's a mesh or primitive we can render AND it's not
-// marked as collision-only. Heuristic: group 2 is visual (Menagerie convention),
-// group 3 is collision. Also accept group 0 (default) as visual if the geom has
-// a material or mesh attached.
+// A geom is "visual" if it's a mesh or supported primitive AND it's not marked
+// as collision-only. Heuristic: group 3/4 = collision (Menagerie convention).
 
 static bool is_visual_geom(const MjcfGeom& g)
 {
-    if (g.type != "mesh") return false;          // MVP: only mesh-type visuals
-    if (g.mesh_name.empty()) return false;
     if (g.group == 3 || g.group == 4) return false;
-    return true;
+    if (g.type == "mesh") return !g.mesh_name.empty();
+    return (g.type == "plane" || g.type == "box" || g.type == "sphere" ||
+            g.type == "ellipsoid" || g.type == "cylinder" || g.type == "capsule");
 }
 
 // ─────────────────────────────────────────────
@@ -590,6 +832,9 @@ struct MjcfFlatten {
         int         gpu_mat_idx;
     };
     std::vector<GeomLinkMaterial> geom_materials;
+    // Geom links that represent world-level props (ground, walls, etc.) and
+    // should be excluded from the camera auto-fit AABB.
+    std::unordered_set<std::string> environment_links;
 };
 
 // Unique ID counter to disambiguate synthetic names (unnamed bodies, unnamed joints)
@@ -600,6 +845,64 @@ static std::string make_unique_body_name(const std::string& hint)
     int id = ++mjcf_unique_id_counter;
     std::string base = hint.empty() ? std::string("body") : hint;
     return base + "__mj" + std::to_string(id);
+}
+
+// Emit a URDFLink + fixed joint for a single visual geom. Handles both
+// mesh-type geoms (disk-loaded mesh) and primitive types (inline-generated mesh).
+static void attach_visual_geom(const MjcfGeom& g, size_t gi,
+                                const std::string& parent_body_link,
+                                MjcfScene& scene, MjcfFlatten& flat,
+                                const std::function<int(const std::string&, float4, bool)>& get_or_add_material)
+{
+    if (!is_visual_geom(g)) return;
+
+    std::string geom_link = make_unique_body_name(parent_body_link + "_g" + std::to_string(gi));
+    URDFLink GL;
+    GL.name          = geom_link;
+    GL.visual_origin = g.local_xform;
+
+    if (g.type == "mesh") {
+        auto mit = scene.meshes.find(g.mesh_name);
+        if (mit == scene.meshes.end()) return;
+        GL.visual_mesh_path = mit->second.file_abs;
+    } else {
+        // For plane UVs, fetch the material's texrepeat (default 1,1).
+        float2 texrepeat = make_float2(1, 1);
+        if (!g.material_name.empty()) {
+            auto mmit = scene.materials.find(g.material_name);
+            if (mmit != scene.materials.end()) texrepeat = mmit->second.texrepeat;
+        }
+        RawMesh prim;
+        if (!make_primitive_mesh(g.type, g.size, texrepeat, prim) || prim.vertices.empty()) return;
+        GL.inline_mesh = std::move(prim);
+    }
+
+    flat.links[geom_link] = std::move(GL);
+
+    // Geoms attached directly to the synthetic world link are environment props
+    // (ground plane, walls, static set-dressing). Flag them so camera auto-fit
+    // can skip their bounds.
+    if (parent_body_link == flat.root_link)
+        flat.environment_links.insert(geom_link);
+
+    URDFJoint FJ;
+    FJ.name   = geom_link + "_fixed";
+    FJ.parent = parent_body_link;
+    FJ.child  = geom_link;
+    FJ.type   = "fixed";
+    FJ.origin = Mat4::identity();
+    flat.joints.push_back(FJ);
+
+    // Material resolution (rgba override > geom.material > grey fallback)
+    float4 rgba = make_float4(0.72f, 0.72f, 0.74f, 1.0f);
+    bool have_override = false;
+    if (g.has_rgba) { rgba = g.rgba; have_override = true; }
+    else if (!g.material_name.empty()) {
+        auto mmit = scene.materials.find(g.material_name);
+        if (mmit != scene.materials.end()) { rgba = mmit->second.rgba; have_override = true; }
+    }
+    int midx = get_or_add_material(g.material_name, rgba, have_override);
+    flat.geom_materials.push_back({ geom_link, midx });
 }
 
 // Walks the body tree. Every body gets a URDFLink named by its body name (with
@@ -688,37 +991,8 @@ static void flatten_body(const MjcfBody& body, const std::string& parent_link_na
 
     // Attach each visual geom as a child fixed-joint link of body_link.
     for (size_t gi = 0; gi < body.geoms.size(); ++gi) {
-        const MjcfGeom& g = body.geoms[gi];
-        if (!is_visual_geom(g)) continue;
-
-        auto mit = scene.meshes.find(g.mesh_name);
-        if (mit == scene.meshes.end()) continue;
-
-        std::string geom_link = make_unique_body_name(body_link + "_g" + std::to_string(gi));
-        URDFLink GL;
-        GL.name             = geom_link;
-        GL.visual_mesh_path = mit->second.file_abs;
-        GL.visual_origin    = g.local_xform;
-        flat.links[geom_link] = GL;
-
-        URDFJoint FJ;
-        FJ.name   = geom_link + "_fixed";
-        FJ.parent = body_link;
-        FJ.child  = geom_link;
-        FJ.type   = "fixed";
-        FJ.origin = Mat4::identity();
-        flat.joints.push_back(FJ);
-
-        // Determine material (rgba override > geom.material > grey fallback)
-        float4 rgba = make_float4(0.72f, 0.72f, 0.74f, 1.0f);
-        bool have_override = false;
-        if (g.has_rgba) { rgba = g.rgba; have_override = true; }
-        else if (!g.material_name.empty()) {
-            auto mmit = scene.materials.find(g.material_name);
-            if (mmit != scene.materials.end()) { rgba = mmit->second.rgba; have_override = true; }
-        }
-        int midx = get_or_add_material(g.material_name, rgba, have_override);
-        flat.geom_materials.push_back({ geom_link, midx });
+        attach_visual_geom(body.geoms[gi], gi, body_link, scene, flat,
+                           get_or_add_material);
     }
 
     // Recurse into children
@@ -734,7 +1008,7 @@ static void flatten_body(const MjcfBody& body, const std::string& parent_link_na
 bool mjcf_load(const std::string&          path,
                std::vector<Triangle>&      triangles_out,
                std::vector<GpuMaterial>&   materials_out,
-               std::vector<TextureImage>&  /*textures_out*/,
+               std::vector<TextureImage>&  textures_out,
                std::vector<MeshObject>&    objects_out)
 {
     mjcf_unique_id_counter = 0;
@@ -746,6 +1020,69 @@ bool mjcf_load(const std::string&          path,
     // Material cache: MJCF material name → GpuMaterial index.
     std::unordered_map<std::string, int> mat_name_to_idx;
 
+    // Texture cache: MJCF texture name → textures_out index.
+    std::unordered_map<std::string, int> tex_name_to_idx;
+
+    // Bake a MjcfTextureDef into an RGBA8 TextureImage. Currently implements
+    // builtin="checker"; everything else falls back to a solid rgb1 fill.
+    auto bake_texture = [](const MjcfTextureDef& td) -> TextureImage {
+        TextureImage ti;
+        ti.width  = std::max(2, td.width);
+        ti.height = std::max(2, td.height);
+        ti.srgb   = true;
+        ti.pixels.assign((size_t)ti.width * ti.height * 4, 255);
+
+        auto to_u8 = [](float v) {
+            v = std::min(1.0f, std::max(0.0f, v));
+            return (uint8_t)(v * 255.0f + 0.5f);
+        };
+        uint8_t r1 = to_u8(td.rgb1.x), g1 = to_u8(td.rgb1.y), b1 = to_u8(td.rgb1.z);
+        uint8_t r2 = to_u8(td.rgb2.x), g2 = to_u8(td.rgb2.y), b2 = to_u8(td.rgb2.z);
+        uint8_t rm = to_u8(td.markrgb.x), gm = to_u8(td.markrgb.y), bm = to_u8(td.markrgb.z);
+
+        bool is_checker = (td.builtin == "checker");
+        bool has_edge   = (td.mark == "edge");
+        int  edge_px    = std::max(1, std::min(ti.width, ti.height) / 64);
+
+        for (int y = 0; y < ti.height; ++y) {
+            for (int x = 0; x < ti.width; ++x) {
+                size_t i = ((size_t)y * ti.width + x) * 4;
+                uint8_t r = r1, g = g1, b = b1;
+                if (is_checker) {
+                    int cx = (x * 2) / ti.width;        // 0 or 1
+                    int cy = (y * 2) / ti.height;       // 0 or 1
+                    bool swap = ((cx + cy) & 1) == 0;
+                    if (swap) { r = r2; g = g2; b = b2; }
+                }
+                if (has_edge) {
+                    bool on_edge =
+                        x < edge_px || x >= ti.width - edge_px ||
+                        y < edge_px || y >= ti.height - edge_px ||
+                        (ti.width  > edge_px*2 && std::abs(x - ti.width /2) < edge_px) ||
+                        (ti.height > edge_px*2 && std::abs(y - ti.height/2) < edge_px);
+                    if (on_edge) { r = rm; g = gm; b = bm; }
+                }
+                ti.pixels[i+0] = r;
+                ti.pixels[i+1] = g;
+                ti.pixels[i+2] = b;
+                ti.pixels[i+3] = 255;
+            }
+        }
+        return ti;
+    };
+
+    auto get_or_add_texture = [&](const std::string& tex_name) -> int {
+        if (tex_name.empty()) return -1;
+        auto it = tex_name_to_idx.find(tex_name);
+        if (it != tex_name_to_idx.end()) return it->second;
+        auto tit = scene.textures.find(tex_name);
+        if (tit == scene.textures.end()) return -1;
+        int idx = (int)textures_out.size();
+        textures_out.push_back(bake_texture(tit->second));
+        tex_name_to_idx[tex_name] = idx;
+        return idx;
+    };
+
     auto material_from_mjcf = [&](const MjcfMaterialDef& mm) -> GpuMaterial {
         GpuMaterial gm{};
         gm.base_color       = mm.rgba;
@@ -754,7 +1091,11 @@ bool mjcf_load(const std::string&          path,
         gm.metallic         = mm.specular > 0.5f ? 0.3f : 0.05f;
         gm.roughness        = std::max(0.1f, 1.0f - mm.shininess);
         gm.emissive_factor  = make_float4(0, 0, 0, 0);
-        gm.base_color_tex   = -1;
+        gm.base_color_tex   = get_or_add_texture(mm.texture_name);
+        if (gm.base_color_tex >= 0) {
+            // With a texture driving base color, let white multiply through.
+            gm.base_color = make_float4(1, 1, 1, 1);
+        }
         gm.metallic_rough_tex = -1;
         gm.normal_tex       = -1;
         gm.emissive_tex     = -1;
@@ -814,6 +1155,11 @@ bool mjcf_load(const std::string&          path,
         flatten_body(top, flat.root_link, scene, flat, obj_counter,
                      materials_out, get_or_add_material);
     }
+    // Worldbody's own <geom>s (e.g. ground plane) attach directly to __world__.
+    for (size_t gi = 0; gi < scene.worldbody.geoms.size(); ++gi) {
+        attach_visual_geom(scene.worldbody.geoms[gi], gi, flat.root_link,
+                           scene, flat, get_or_add_material);
+    }
 
     if (flat.links.size() <= 1) {
         std::cerr << "[mjcf_loader] no renderable bodies in " << path << '\n';
@@ -842,9 +1188,14 @@ bool mjcf_load(const std::string&          path,
         if (lit == flat.links.end()) return;
         const URDFLink& link = lit->second;
 
-        if (!link.visual_mesh_path.empty() && fs::exists(link.visual_mesh_path)) {
+        bool have_inline = !link.inline_mesh.vertices.empty();
+        bool have_file   = !link.visual_mesh_path.empty() && fs::exists(link.visual_mesh_path);
+        if (have_inline || have_file) {
             RawMesh raw;
-            if (load_link_mesh(link.visual_mesh_path, raw) && !raw.vertices.empty()) {
+            bool mesh_ok = have_inline
+                ? (raw = link.inline_mesh, !raw.vertices.empty())
+                : (load_link_mesh(link.visual_mesh_path, raw) && !raw.vertices.empty());
+            if (mesh_ok) {
                 int obj_id = obj_counter++;
                 int mat_idx = 0;
                 auto mit = geom_link_to_mat.find(link_name);
@@ -883,7 +1234,14 @@ bool mjcf_load(const std::string&          path,
                         tri.n0 = tri.n1 = tri.n2 = fn;
                     }
 
-                    tri.uv0 = tri.uv1 = tri.uv2 = make_float2(0, 0);
+                    if (i0 < (int)raw.uvs.size() && i1 < (int)raw.uvs.size() &&
+                        i2 < (int)raw.uvs.size()) {
+                        tri.uv0 = raw.uvs[i0];
+                        tri.uv1 = raw.uvs[i1];
+                        tri.uv2 = raw.uvs[i2];
+                    } else {
+                        tri.uv0 = tri.uv1 = tri.uv2 = make_float2(0, 0);
+                    }
                     tri.t0 = tri.t1 = tri.t2 = make_float4(0, 0, 0, 0);
                     tri.mat_idx = mat_idx;
                     tri.obj_id  = obj_id;
@@ -898,6 +1256,7 @@ bool mjcf_load(const std::string&          path,
                 MeshObject obj{};
                 obj.obj_id = obj_id;
                 obj.hidden = false;
+                obj.environment = flat.environment_links.count(link_name) > 0;
                 if (cnt > 0) {
                     float inv = 1.0f / (float)cnt;
                     obj.centroid = make_float3(centroid.x * inv, centroid.y * inv, centroid.z * inv);
@@ -958,6 +1317,10 @@ UrdfArticulation* mjcf_articulation_open(const std::string& path,
     for (auto& top : scene.worldbody.children) {
         flatten_body(top, flat.root_link, scene, flat, obj_counter,
                      unused_materials, noop_mat);
+    }
+    for (size_t gi = 0; gi < scene.worldbody.geoms.size(); ++gi) {
+        attach_visual_geom(scene.worldbody.geoms[gi], gi, flat.root_link,
+                           scene, flat, noop_mat);
     }
 
     // Populate UrdfArticulation's links, joints, root_link — finalize does the rest.

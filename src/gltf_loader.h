@@ -24,6 +24,7 @@ struct MeshObject {
     float3 centroid;        // world-space AABB centroid (updated on move)
     char   name[128];       // node name for display
     bool   hidden = false;  // excluded from render when true
+    bool   environment = false; // world-level prop (ground, walls) — skip camera auto-fit
 };
 
 // ─────────────────────────────────────────────

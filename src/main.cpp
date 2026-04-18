@@ -1037,16 +1037,34 @@ static bool load_gltf_into(const std::string& path, MeshState& ms,
     ctrl.num_mesh_tris = (int)ms.prims.size();
     ++ms.scene_version;  // signal OptiX RT to re-build hardware BVH
 
-    // Compute AABB directly from the raw triangle list (before BVH reorders them)
+    // Compute AABB directly from the raw triangle list (before BVH reorders them).
+    // Exclude triangles belonging to "environment" objects (ground planes, walls)
+    // so the auto-fit frames the actual model, not the world set-dressing.
     if (!tris.empty()) {
+        std::unordered_set<int> env_obj_ids;
+        for (const auto& o : ms.objects)
+            if (o.environment) env_obj_ids.insert(o.obj_id);
+
         float3 mn = make_float3( 1e30f,  1e30f,  1e30f);
         float3 mx = make_float3(-1e30f, -1e30f, -1e30f);
         for (const Triangle& tri : tris) {
+            if (env_obj_ids.count(tri.obj_id)) continue;
             float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
             for (auto& v : verts) {
                 if (v.x < mn.x) mn.x = v.x;  if (v.x > mx.x) mx.x = v.x;
                 if (v.y < mn.y) mn.y = v.y;  if (v.y > mx.y) mx.y = v.y;
                 if (v.z < mn.z) mn.z = v.z;  if (v.z > mx.z) mx.z = v.z;
+            }
+        }
+        // Safety fallback: if everything was env-only, fit to all tris instead.
+        if (mn.x > mx.x) {
+            for (const Triangle& tri : tris) {
+                float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
+                for (auto& v : verts) {
+                    if (v.x < mn.x) mn.x = v.x;  if (v.x > mx.x) mx.x = v.x;
+                    if (v.y < mn.y) mn.y = v.y;  if (v.y > mx.y) mx.y = v.y;
+                    if (v.z < mn.z) mn.z = v.z;  if (v.z > mx.z) mx.z = v.z;
+                }
             }
         }
 

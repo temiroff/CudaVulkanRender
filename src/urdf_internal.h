@@ -101,6 +101,7 @@ struct DaeMaterial {
 struct RawMesh {
     std::vector<float3> vertices;
     std::vector<float3> normals;
+    std::vector<float2> uvs;        // optional — aligned to vertices when present
     std::vector<int>    indices;
     std::vector<int>    mat_ids;
     std::vector<DaeMaterial> dae_materials;
@@ -111,6 +112,9 @@ struct URDFLink {
     std::string name;
     std::string visual_mesh_path;   // resolved path, empty = transform-only link
     Mat4        visual_origin;
+    // If non-empty, geometry is provided inline (MJCF primitives: plane/box/sphere/...).
+    // Takes precedence over visual_mesh_path — no disk load needed.
+    RawMesh     inline_mesh;
 };
 
 struct URDFJoint {

@@ -20,6 +20,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <filesystem>
 #include <cstring>
 #include <cmath>
@@ -1090,12 +1091,18 @@ void urdf_articulation_finalize(UrdfArticulation* h,
         if (it == h->links.end()) return;
         const URDFLink& link = it->second;
 
-        if (!link.visual_mesh_path.empty() && fs::exists(link.visual_mesh_path)) {
+        bool have_inline = !link.inline_mesh.vertices.empty();
+        bool have_file   = !link.visual_mesh_path.empty() && fs::exists(link.visual_mesh_path);
+        if (have_inline || have_file) {
             LinkMeshCache mc;
             mc.link_name = link_name;
             mc.tri_start = tri_cursor;
 
-            if (load_link_mesh(link.visual_mesh_path, mc.raw) && !mc.raw.vertices.empty()) {
+            bool loaded = have_inline
+                ? (mc.raw = link.inline_mesh, !mc.raw.vertices.empty())
+                : (load_link_mesh(link.visual_mesh_path, mc.raw) && !mc.raw.vertices.empty());
+
+            if (loaded) {
                 mc.tri_count = (int)mc.raw.indices.size() / 3;
                 mc.mat_ids = mc.raw.mat_ids;
                 mc.obj_id = tri_cursor > 0 ? initial_tris[tri_cursor].obj_id : 0;
@@ -1144,19 +1151,33 @@ void urdf_articulation_finalize(UrdfArticulation* h,
         h->ee_link_name = best_leaf;
     }
 
-    // Compute initial ee position from the last mesh cache's triangle centroid
-    if (!h->mesh_caches.empty()) {
-        auto& last_mc = h->mesh_caches.back();
+    // Compute initial ee position from the centroid of all mesh caches that
+    // are descendants of ee_link_name (including itself).
+    if (!h->mesh_caches.empty() && !h->ee_link_name.empty()) {
+        // Precompute the set of links in the ee subtree via BFS over children_map.
+        std::unordered_set<std::string> ee_subtree;
+        std::function<void(const std::string&)> walk;
+        walk = [&](const std::string& n) {
+            ee_subtree.insert(n);
+            auto it = h->children_map.find(n);
+            if (it == h->children_map.end()) return;
+            for (auto* j : it->second) walk(j->child);
+        };
+        walk(h->ee_link_name);
+
         float3 sum = make_float3(0, 0, 0);
         int count = 0;
-        for (int ti = 0; ti < last_mc.tri_count; ++ti) {
-            int idx = last_mc.tri_start + ti;
-            if (idx >= (int)initial_tris.size()) break;
-            const Triangle& t = initial_tris[idx];
-            sum.x += t.v0.x + t.v1.x + t.v2.x;
-            sum.y += t.v0.y + t.v1.y + t.v2.y;
-            sum.z += t.v0.z + t.v1.z + t.v2.z;
-            count += 3;
+        for (auto& mc : h->mesh_caches) {
+            if (!ee_subtree.count(mc.link_name)) continue;
+            for (int ti = 0; ti < mc.tri_count; ++ti) {
+                int idx = mc.tri_start + ti;
+                if (idx >= (int)initial_tris.size()) break;
+                const Triangle& t = initial_tris[idx];
+                sum.x += t.v0.x + t.v1.x + t.v2.x;
+                sum.y += t.v0.y + t.v1.y + t.v2.y;
+                sum.z += t.v0.z + t.v1.z + t.v2.z;
+                count += 3;
+            }
         }
         if (count > 0) {
             float inv = 1.f / (float)count;
@@ -1477,22 +1498,24 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
     // Walk kinematic chain, computing world transforms, and update triangles
     int cache_idx = 0;
 
-    // Track the last link's vertex centroid as end-effector position
-    float3 last_link_centroid = make_float3(0, 0, 0);
-    int    last_link_vert_count = 0;
+    // Accumulate end-effector centroid only for the designated ee_link_name.
+    // (Previously this tracked "last link visited", which broke when non-robot
+    //  links like a worldbody ground plane were added after the robot's tip.)
+    float3 ee_centroid = make_float3(0, 0, 0);
+    int    ee_vert_count = 0;
 
-    std::function<void(const std::string&, Mat4)> repose_link;
-    repose_link = [&](const std::string& link_name, Mat4 world_xform) {
+    std::function<void(const std::string&, Mat4, bool)> repose_link;
+    repose_link = [&](const std::string& link_name, Mat4 world_xform, bool under_ee) {
+        // Once we enter the ee subtree, all descendants contribute to the centroid.
+        if (!under_ee && link_name == h->ee_link_name) under_ee = true;
+
         if (cache_idx < (int)h->mesh_caches.size() &&
             h->mesh_caches[cache_idx].link_name == link_name)
         {
             auto& mc = h->mesh_caches[cache_idx];
             const Mat4& local_xform = h->links[link_name].visual_origin;
             const Mat4& world = world_xform;
-
-            // Reset centroid tracking for this link (overwrite with later links)
-            last_link_centroid = make_float3(0, 0, 0);
-            last_link_vert_count = 0;
+            bool accumulate_ee = under_ee;
 
             // Update triangles in-place
             for (int ti = 0; ti < mc.tri_count; ++ti) {
@@ -1508,11 +1531,12 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
                 tri.v1 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i1]));
                 tri.v2 = world.transform_point(local_xform.transform_point(mc.raw.vertices[i2]));
 
-                // Accumulate for ee centroid
-                last_link_centroid.x += tri.v0.x + tri.v1.x + tri.v2.x;
-                last_link_centroid.y += tri.v0.y + tri.v1.y + tri.v2.y;
-                last_link_centroid.z += tri.v0.z + tri.v1.z + tri.v2.z;
-                last_link_vert_count += 3;
+                if (accumulate_ee) {
+                    ee_centroid.x += tri.v0.x + tri.v1.x + tri.v2.x;
+                    ee_centroid.y += tri.v0.y + tri.v1.y + tri.v2.y;
+                    ee_centroid.z += tri.v0.z + tri.v1.z + tri.v2.z;
+                    ee_vert_count += 3;
+                }
 
                 if (i0 < (int)mc.raw.normals.size() && i1 < (int)mc.raw.normals.size() && i2 < (int)mc.raw.normals.size()) {
                     tri.n0 = world.transform_normal(local_xform.transform_normal(mc.raw.normals[i0]));
@@ -1551,19 +1575,19 @@ bool urdf_repose(UrdfArticulation* h, std::vector<Triangle>& triangles_out)
                     joint_xform = joint_xform * T;
                 }
 
-                repose_link(joint->child, joint_xform);
+                repose_link(joint->child, joint_xform, under_ee);
             }
         }
     };
 
-    repose_link(h->root_link, h->z_to_y);
+    repose_link(h->root_link, h->z_to_y, false);
 
-    // Cache ee position as centroid of the last link's mesh
-    if (last_link_vert_count > 0) {
-        float inv = 1.f / (float)last_link_vert_count;
-        h->ee_world_pos = make_float3(last_link_centroid.x * inv,
-                                      last_link_centroid.y * inv,
-                                      last_link_centroid.z * inv);
+    // Cache ee position as centroid of the designated ee link's mesh
+    if (ee_vert_count > 0) {
+        float inv = 1.f / (float)ee_vert_count;
+        h->ee_world_pos = make_float3(ee_centroid.x * inv,
+                                      ee_centroid.y * inv,
+                                      ee_centroid.z * inv);
     }
 
     return true;
