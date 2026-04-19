@@ -72,6 +72,27 @@ bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active,
             ImGui::SliderFloat("##grip_fwd", &gripper_state->grip_forward,
                                0.00f, 0.20f, "grip forward %.2f m");
         }
+
+        // Explicit attach/detach — always shown, even when finger joints
+        // aren't recognized, because attach-nearest falls back to the EE
+        // grip point. Bypasses the proximity threshold that Close uses.
+        {
+            float avail = ImGui::GetContentRegionAvail().x;
+            float bw    = (avail - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            bool holding = gripper_state->grasp.active;
+
+            if (holding) ImGui::BeginDisabled();
+            if (ImGui::Button("Attach", ImVec2(bw, 0.f)))
+                gripper_state->request_attach = true;
+            if (holding) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+
+            if (!holding) ImGui::BeginDisabled();
+            if (ImGui::Button("Detach", ImVec2(bw, 0.f)))
+                gripper_state->request_detach = true;
+            if (!holding) ImGui::EndDisabled();
+        }
     }
 
     // IK lock — which joint the solver leaves alone (controlled by

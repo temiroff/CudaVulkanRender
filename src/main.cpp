@@ -1981,6 +1981,49 @@ int main() {
             demo_changed = demo_changed || robot_demo.scrub_changed;
             robot_demo.scrub_changed = false;
 
+            // ── Explicit attach/detach buttons ───────────────────────────
+            // Consume UI intents. Attach bypasses the proximity threshold;
+            // Detach releases and schedules free-fall.
+            bool attach_changed = false;
+            if (robot_demo.request_attach) {
+                robot_demo.request_attach = false;
+                if (robot_demo_force_attach(robot_demo, urdf_artic_handle,
+                                            prims_sorted, mesh.objects, mesh.all_prims)) {
+                    attach_changed = true;
+                }
+            }
+            if (robot_demo.request_detach) {
+                robot_demo.request_detach = false;
+                robot_demo_force_detach(robot_demo);
+            }
+
+            // Track end-effector velocity so detached objects inherit a
+            // natural release velocity (throwing arc), not dead gravity.
+            robot_demo_track_ee_velocity(robot_demo, urdf_artic_handle, dt);
+
+            // ── Free-fall integrator ─────────────────────────────────────
+            // Runs every frame so detached objects keep falling even when
+            // no other pose change is happening. Ignored while sim backend
+            // owns the scene (MuJoCo handles physics itself then).
+            bool falling_moved = false;
+            if (!sim_running) {
+                falling_moved = robot_demo_update_falling(
+                    robot_demo, dt, prims_sorted, mesh.objects, mesh.all_prims);
+            }
+
+            if (attach_changed || falling_moved) {
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                rebuild_bvh(bvh_nodes, prims_sorted, &d_bvh, &d_prims,
+                            ctrl.selected_sphere,
+                            ctrl.selected_sphere >= 0
+                                ? prims_sorted[ctrl.selected_sphere].center
+                                : make_float3(0,0,0));
+                ++mesh.scene_version;
+                cam_changed = true;
+            }
+
             // Reset grasped object to original position on loop/restart
             if (robot_demo.needs_grasp_reset) {
                 robot_demo_reset_grasp(robot_demo, prims_sorted, mesh.objects, mesh.all_prims);

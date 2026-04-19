@@ -113,6 +113,26 @@ static bool interpolate_waypoints(const std::vector<RobotWaypoint>& wps,
 
 // ── Tick (playback) ──────────────────────────────────────────────────────────
 
+// Resolve the attach flag at the current playback time: snap to whichever
+// side of the segment we're closer to, matching how gripper_closed works.
+static bool sample_attached(const std::vector<RobotWaypoint>& wps, float t)
+{
+    if (wps.empty()) return false;
+    if (wps.size() == 1) return wps[0].attached;
+    float t0 = wps.front().time;
+    float t1 = wps.back().time;
+    if (t <= t0) return wps.front().attached;
+    if (t >= t1) return wps.back().attached;
+    for (int i = 0; i < (int)wps.size() - 1; i++) {
+        if (t >= wps[i].time && t <= wps[i+1].time) {
+            float len = wps[i+1].time - wps[i].time;
+            float u = (len > 1e-6f) ? (t - wps[i].time) / len : 0.f;
+            return (u < 0.5f) ? wps[i].attached : wps[i+1].attached;
+        }
+    }
+    return wps.back().attached;
+}
+
 bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
 {
     if (!state.playing || !handle || state.waypoints.size() < 2)
@@ -127,6 +147,7 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
             // Reset grasp on loop restart
             state.needs_grasp_reset = true;
             state.prev_gripper_closed = false;
+            state.prev_attached = false;
         } else {
             state.playback_time = end_time;
             state.playing = false;
@@ -147,6 +168,15 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
 
     // Track gripper state for grasp transitions
     state.gripper_closed = gripper_closed;
+
+    // Attach/detach keyframing — raise an intent whenever we cross a
+    // transition; main.cpp consumes it alongside the button-driven ones.
+    bool want_attached = sample_attached(state.waypoints, state.playback_time);
+    if (want_attached != state.prev_attached) {
+        if (want_attached) state.request_attach = true;
+        else               state.request_detach = true;
+        state.prev_attached = want_attached;
+    }
 
     return true;
 }
@@ -194,6 +224,101 @@ static float3 mat3_mul_vec(const float* m, float3 v) {
                        m[6]*v.x + m[7]*v.y + m[8]*v.z);
 }
 
+// Shared attach: find nearest object to any contact point and attach it.
+// If threshold is finite, only attach when distance is within it. Returns
+// true if an object was attached.
+static bool try_attach_nearest(RobotDemoState& state, UrdfArticulation* handle,
+                               std::vector<Sphere>& spheres,
+                               std::vector<MeshObject>& objects,
+                               std::vector<Triangle>& all_prims,
+                               float threshold)
+{
+    if (!handle || state.grasp.active) return false;
+
+    float3 ee = urdf_gripper_grip_point(handle, state.grip_forward);
+
+    std::vector<float3> contact_pts;
+    urdf_gripper_finger_worlds(handle, contact_pts);
+    contact_pts.push_back(ee);
+
+    auto min_dist_to_contact = [&](float3 p) {
+        float best = 1e30f;
+        for (const auto& c : contact_pts) {
+            float3 d = make_float3(p.x - c.x, p.y - c.y, p.z - c.z);
+            float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+            if (dist < best) best = dist;
+        }
+        return best;
+    };
+
+    float best_dist = threshold;
+    int   best_idx  = -1;
+    bool  best_is_mesh = false;
+
+    for (int i = 0; i < (int)spheres.size(); i++) {
+        if (spheres[i].radius > 50.f) continue;
+        float dist = min_dist_to_contact(spheres[i].center);
+        if (dist < best_dist) { best_dist = dist; best_idx = i; best_is_mesh = false; }
+    }
+
+    for (int i = 0; i < (int)objects.size(); i++) {
+        if (objects[i].hidden) continue;
+        float dist = min_dist_to_contact(objects[i].centroid);
+        if (dist < best_dist) { best_dist = dist; best_idx = i; best_is_mesh = true; }
+    }
+
+    if (best_idx < 0) return false;
+
+    state.grasp.active  = true;
+    state.grasp.is_mesh = best_is_mesh;
+    state.grasp.obj_idx = best_idx;
+
+    float ee_mat[16];
+    urdf_fk_ee_transform(handle, ee_mat);
+    float ee_rot[9];
+    mat3_from_mat4(ee_mat, ee_rot);
+    mat3_transpose(ee_rot, state.grasp.grab_inv_rot);
+
+    if (best_is_mesh) {
+        float3 c = objects[best_idx].centroid;
+        if (!state.grasp.has_original) {
+            state.grasp.original_pos = c;
+            state.grasp.has_original = true;
+        }
+        int target_id = objects[best_idx].obj_id;
+        state.grasp.local_verts.clear();
+        state.grasp.original_verts.clear();
+        for (auto& tri : all_prims) {
+            if (tri.obj_id != target_id) continue;
+            float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
+            for (auto& v : verts) {
+                state.grasp.original_verts.push_back(v);
+                float3 rel = make_float3(v.x - ee.x, v.y - ee.y, v.z - ee.z);
+                state.grasp.local_verts.push_back(mat3_mul_vec(state.grasp.grab_inv_rot, rel));
+            }
+        }
+        state.grasp.offset = make_float3(c.x - ee.x, c.y - ee.y, c.z - ee.z);
+    } else {
+        state.grasp.offset = make_float3(
+            spheres[best_idx].center.x - ee.x,
+            spheres[best_idx].center.y - ee.y,
+            spheres[best_idx].center.z - ee.z);
+        if (!state.grasp.has_original) {
+            state.grasp.original_pos = spheres[best_idx].center;
+            state.grasp.has_original = true;
+        }
+    }
+
+    // Newly attached object cancels any in-progress free-fall for it.
+    auto it = std::remove_if(state.falling.begin(), state.falling.end(),
+        [&](const FallingObject& f) {
+            return f.is_mesh == best_is_mesh && f.obj_idx == best_idx;
+        });
+    state.falling.erase(it, state.falling.end());
+
+    return true;
+}
+
 void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
                              std::vector<Sphere>& spheres,
                              std::vector<MeshObject>& objects,
@@ -201,10 +326,6 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
 {
     if (!handle) return;
 
-    // Grip reference: offset from the ee link origin toward the fingertips
-    // (local +Z). urdf_end_effector_pos returns the hand-link centroid which
-    // sits ~10 cm above the actual grip point for Panda-style grippers, so
-    // small objects between the fingers fell outside the proximity threshold.
     float3 ee = urdf_gripper_grip_point(handle, state.grip_forward);
 
     // Detect gripper transitions
@@ -213,95 +334,19 @@ void robot_demo_update_grasp(RobotDemoState& state, UrdfArticulation* handle,
     state.prev_gripper_closed = state.gripper_closed;
 
     if (just_closed && !state.grasp.active) {
-        // Build a set of candidate contact points: the grip reference plus
-        // every "finger" link world origin. Grasp distance uses the nearest
-        // candidate, so the grab zone covers the whole gripper, not a single
-        // tool-frame point.
-        std::vector<float3> contact_pts;
-        urdf_gripper_finger_worlds(handle, contact_pts);
-        contact_pts.push_back(ee);
-
-        auto min_dist_to_contact = [&](float3 p) {
-            float best = 1e30f;
-            for (const auto& c : contact_pts) {
-                float3 d = make_float3(p.x - c.x, p.y - c.y, p.z - c.z);
-                float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-                if (dist < best) best = dist;
-            }
-            return best;
-        };
-
-        float best_dist = state.grasp_threshold;
-        int   best_idx  = -1;
-        bool  best_is_mesh = false;
-
-        // Check spheres
-        for (int i = 0; i < (int)spheres.size(); i++) {
-            if (spheres[i].radius > 50.f) continue;
-            float dist = min_dist_to_contact(spheres[i].center);
-            if (dist < best_dist) {
-                best_dist = dist; best_idx = i; best_is_mesh = false;
-            }
-        }
-
-        // Check mesh objects by centroid
-        for (int i = 0; i < (int)objects.size(); i++) {
-            if (objects[i].hidden) continue;
-            float dist = min_dist_to_contact(objects[i].centroid);
-            if (dist < best_dist) {
-                best_dist = dist; best_idx = i; best_is_mesh = true;
-            }
-        }
-
-        if (best_idx >= 0) {
-            state.grasp.active  = true;
-            state.grasp.is_mesh = best_is_mesh;
-            state.grasp.obj_idx = best_idx;
-
-            // Get ee full transform at grab time
-            float ee_mat[16];
-            urdf_fk_ee_transform(handle, ee_mat);
-            float ee_rot[9];
-            mat3_from_mat4(ee_mat, ee_rot);
-            mat3_transpose(ee_rot, state.grasp.grab_inv_rot);  // inverse = transpose for rotation
-
-            if (best_is_mesh) {
-                float3 c = objects[best_idx].centroid;
-                if (!state.grasp.has_original) {
-                    state.grasp.original_pos = c;
-                    state.grasp.has_original = true;
-                }
-                // Store all vertices in ee-local space for rotation support,
-                // and save original world positions for reset
-                int target_id = objects[best_idx].obj_id;
-                state.grasp.local_verts.clear();
-                state.grasp.original_verts.clear();
-                for (auto& tri : all_prims) {
-                    if (tri.obj_id != target_id) continue;
-                    float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
-                    for (auto& v : verts) {
-                        // Save original world position
-                        state.grasp.original_verts.push_back(v);
-                        // Transform to ee-local space
-                        float3 rel = make_float3(v.x - ee.x, v.y - ee.y, v.z - ee.z);
-                        state.grasp.local_verts.push_back(mat3_mul_vec(state.grasp.grab_inv_rot, rel));
-                    }
-                }
-                state.grasp.offset = make_float3(c.x - ee.x, c.y - ee.y, c.z - ee.z);
-            } else {
-                state.grasp.offset = make_float3(
-                    spheres[best_idx].center.x - ee.x,
-                    spheres[best_idx].center.y - ee.y,
-                    spheres[best_idx].center.z - ee.z);
-                if (!state.grasp.has_original) {
-                    state.grasp.original_pos = spheres[best_idx].center;
-                    state.grasp.has_original = true;
-                }
-            }
-        }
+        try_attach_nearest(state, handle, spheres, objects, all_prims,
+                           state.grasp_threshold);
     }
 
     if (just_opened && state.grasp.active) {
+        // Classic "open the gripper" release — matches the record/playback
+        // behavior before explicit Attach/Detach existed. Drop as free-fall
+        // so the object obeys gravity after the arm lets go.
+        FallingObject fo;
+        fo.is_mesh  = state.grasp.is_mesh;
+        fo.obj_idx  = state.grasp.obj_idx;
+        fo.velocity = state.last_ee_vel;
+        state.falling.push_back(fo);
         state.grasp.active = false;
     }
 
@@ -362,6 +407,10 @@ void robot_demo_reset_grasp(RobotDemoState& state,
                             std::vector<MeshObject>& objects,
                             std::vector<Triangle>& all_prims)
 {
+    // Any in-flight bounces are cancelled on loop/reset — otherwise the
+    // object would keep physics-falling past the restart.
+    state.falling.clear();
+
     if (!state.grasp.has_original) return;
 
     if (!state.grasp.is_mesh) {
@@ -390,6 +439,174 @@ void robot_demo_reset_grasp(RobotDemoState& state,
     state.grasp.active = false;
 }
 
+// ── Explicit attach / detach buttons ─────────────────────────────────────────
+
+bool robot_demo_force_attach(RobotDemoState& state, UrdfArticulation* handle,
+                             std::vector<Sphere>& spheres,
+                             std::vector<MeshObject>& objects,
+                             std::vector<Triangle>& all_prims)
+{
+    // No threshold — grab whatever is closest to any contact point.
+    return try_attach_nearest(state, handle, spheres, objects, all_prims, 1e30f);
+}
+
+bool robot_demo_force_detach(RobotDemoState& state)
+{
+    if (!state.grasp.active || state.grasp.obj_idx < 0) return false;
+
+    FallingObject fo;
+    fo.is_mesh  = state.grasp.is_mesh;
+    fo.obj_idx  = state.grasp.obj_idx;
+    // Inherit the end-effector's velocity at the moment of release so the
+    // object "throws" naturally when the arm is moving.
+    fo.velocity = state.last_ee_vel;
+    fo.stopped  = false;
+    state.falling.push_back(fo);
+
+    state.grasp.active = false;
+    return true;
+}
+
+// Translate a mesh object by (dx, dy, dz): every triangle vertex + centroid.
+static void translate_mesh(int obj_idx,
+                           std::vector<MeshObject>& objects,
+                           std::vector<Triangle>& all_prims,
+                           float dx, float dy, float dz)
+{
+    if (obj_idx < 0 || obj_idx >= (int)objects.size()) return;
+    int target_id = objects[obj_idx].obj_id;
+    for (auto& tri : all_prims) {
+        if (tri.obj_id != target_id) continue;
+        tri.v0.x += dx; tri.v0.y += dy; tri.v0.z += dz;
+        tri.v1.x += dx; tri.v1.y += dy; tri.v1.z += dz;
+        tri.v2.x += dx; tri.v2.y += dy; tri.v2.z += dz;
+    }
+    objects[obj_idx].centroid.x += dx;
+    objects[obj_idx].centroid.y += dy;
+    objects[obj_idx].centroid.z += dz;
+}
+
+// Return the minimum world-y over the object's triangle vertices.
+static float mesh_min_y(int obj_idx,
+                        const std::vector<MeshObject>& objects,
+                        const std::vector<Triangle>& all_prims)
+{
+    if (obj_idx < 0 || obj_idx >= (int)objects.size()) return 0.f;
+    int target_id = objects[obj_idx].obj_id;
+    float min_y = 1e30f;
+    for (const auto& tri : all_prims) {
+        if (tri.obj_id != target_id) continue;
+        if (tri.v0.y < min_y) min_y = tri.v0.y;
+        if (tri.v1.y < min_y) min_y = tri.v1.y;
+        if (tri.v2.y < min_y) min_y = tri.v2.y;
+    }
+    return (min_y < 1e29f) ? min_y : 0.f;
+}
+
+bool robot_demo_update_falling(RobotDemoState& state, float dt,
+                               std::vector<Sphere>& spheres,
+                               std::vector<MeshObject>& objects,
+                               std::vector<Triangle>& all_prims)
+{
+    if (state.falling.empty() || dt <= 0.f) return false;
+
+    // Semi-implicit Euler with restitution bounce + friction.
+    // "Settled" threshold: once the bounce-back vertical speed would be
+    // smaller than this, treat it as rest to avoid infinite tiny bounces.
+    const float kSettleV = 0.30f;   // m/s
+
+    bool moved = false;
+    for (auto& fo : state.falling) {
+        if (fo.stopped) continue;
+
+        // Integrate velocity (gravity in -Y)
+        fo.velocity.y += state.gravity * dt;
+
+        float dx = fo.velocity.x * dt;
+        float dy = fo.velocity.y * dt;
+        float dz = fo.velocity.z * dt;
+
+        if (!fo.is_mesh) {
+            if (fo.obj_idx < 0 || fo.obj_idx >= (int)spheres.size()) { fo.stopped = true; continue; }
+            Sphere& s = spheres[fo.obj_idx];
+            float rest_y = state.ground_y + s.radius;
+            float new_cx = s.center.x + dx;
+            float new_cy = s.center.y + dy;
+            float new_cz = s.center.z + dz;
+
+            if (new_cy <= rest_y && fo.velocity.y < 0.f) {
+                // Ground contact — reflect with restitution, damp horizontal.
+                s.center.x = new_cx;
+                s.center.y = rest_y;
+                s.center.z = new_cz;
+
+                float bounce_v = -fo.velocity.y * state.restitution;
+                if (bounce_v < kSettleV) {
+                    // Settle: kill all velocity, rest on ground.
+                    fo.velocity = make_float3(0, 0, 0);
+                    fo.stopped = true;
+                } else {
+                    fo.velocity.y = bounce_v;
+                    float keep = 1.f - state.friction;
+                    fo.velocity.x *= keep;
+                    fo.velocity.z *= keep;
+                }
+            } else {
+                s.center.x = new_cx;
+                s.center.y = new_cy;
+                s.center.z = new_cz;
+            }
+            moved = true;
+        } else {
+            if (fo.obj_idx < 0 || fo.obj_idx >= (int)objects.size()) { fo.stopped = true; continue; }
+            float min_y = mesh_min_y(fo.obj_idx, objects, all_prims);
+            float new_min_y = min_y + dy;
+
+            if (new_min_y <= state.ground_y && fo.velocity.y < 0.f) {
+                // Clamp lowest vertex onto ground, then reflect velocity.
+                float adjust_y = state.ground_y - min_y;
+                translate_mesh(fo.obj_idx, objects, all_prims, dx, adjust_y, dz);
+
+                float bounce_v = -fo.velocity.y * state.restitution;
+                if (bounce_v < kSettleV) {
+                    fo.velocity = make_float3(0, 0, 0);
+                    fo.stopped = true;
+                } else {
+                    fo.velocity.y = bounce_v;
+                    float keep = 1.f - state.friction;
+                    fo.velocity.x *= keep;
+                    fo.velocity.z *= keep;
+                }
+            } else {
+                translate_mesh(fo.obj_idx, objects, all_prims, dx, dy, dz);
+            }
+            moved = true;
+        }
+    }
+
+    // Compact: drop stopped entries so the list doesn't grow forever.
+    auto it = std::remove_if(state.falling.begin(), state.falling.end(),
+        [](const FallingObject& f) { return f.stopped; });
+    state.falling.erase(it, state.falling.end());
+
+    return moved;
+}
+
+void robot_demo_track_ee_velocity(RobotDemoState& state,
+                                  UrdfArticulation* handle, float dt)
+{
+    if (!handle || dt <= 0.f) return;
+    float3 ee = urdf_gripper_grip_point(handle, state.grip_forward);
+    if (state.prev_ee_valid) {
+        state.last_ee_vel = make_float3(
+            (ee.x - state.prev_ee_pos.x) / dt,
+            (ee.y - state.prev_ee_pos.y) / dt,
+            (ee.z - state.prev_ee_pos.z) / dt);
+    }
+    state.prev_ee_pos   = ee;
+    state.prev_ee_valid = true;
+}
+
 // ── Save / Load JSON ─────────────────────────────────────────────────────────
 
 bool robot_demo_save(const RobotDemoState& state, const char* path)
@@ -401,6 +618,7 @@ bool robot_demo_save(const RobotDemoState& state, const char* path)
         w["time"] = wp.time;
         w["angles"] = wp.angles;
         w["gripper_closed"] = wp.gripper_closed;
+        w["attached"] = wp.attached;
         wps.push_back(w);
     }
     j["waypoints"] = wps;
@@ -426,6 +644,7 @@ bool robot_demo_load(RobotDemoState& state, const char* path)
         RobotWaypoint wp;
         wp.time = w.value("time", 0.f);
         wp.gripper_closed = w.value("gripper_closed", false);
+        wp.attached = w.value("attached", false);
         if (w.contains("angles") && w["angles"].is_array()) {
             for (auto& a : w["angles"])
                 wp.angles.push_back(a.get<float>());
@@ -475,6 +694,7 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
             wp.time = state.waypoints.empty() ? 0.f :
                       state.waypoints.back().time + 1.0f;
             wp.gripper_closed = state.gripper_closed;
+            wp.attached = state.grasp.active;
             wp.angles.resize(n_joints);
             for (int i = 0; i < n_joints; i++)
                 wp.angles[i] = joints[i].angle;
@@ -494,9 +714,14 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
             ImGui::DragFloat("##t", &wp.time, 0.05f, 0.f, 100.f, "%.1fs");
             ImGui::SameLine();
 
-            // Gripper indicator
+            // Gripper + attach indicators. [HOLD] = object attached at this
+            // waypoint; drives force_attach/detach during playback.
             ImGui::Text(wp.gripper_closed ? "[GRIP]" : "[OPEN]");
             ImGui::SameLine();
+            if (wp.attached) {
+                ImGui::TextColored(ImVec4(0.3f, 1.f, 0.3f, 1.f), "[HOLD]");
+                ImGui::SameLine();
+            }
 
             // Preview: clicking a waypoint loads its pose
             char label[32];
@@ -511,6 +736,7 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
             // Update: overwrite this waypoint with current pose
             if (ImGui::SmallButton("Upd")) {
                 wp.gripper_closed = state.gripper_closed;
+                wp.attached = state.grasp.active;
                 wp.angles.resize(n_joints);
                 for (int j = 0; j < n_joints; j++)
                     wp.angles[j] = joints[j].angle;
@@ -543,6 +769,7 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
                         state.needs_grasp_reset = true;
                     }
                     state.prev_gripper_closed = false;
+                    state.prev_attached = false;
                 }
             }
             ImGui::SameLine();
@@ -551,6 +778,7 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
                 state.playback_time = state.waypoints.front().time;
                 state.needs_grasp_reset = true;
                 state.prev_gripper_closed = false;
+                state.prev_attached = false;
             }
 
             // Timeline scrubber — dragging updates the robot pose immediately

@@ -1523,6 +1523,23 @@ float3 urdf_gripper_grip_point(UrdfArticulation* h, float forward_offset)
                        oz + zz * forward_offset);
 }
 
+// Case-insensitive substring match against a list of gripper-joint keywords.
+// URDF authors pick from a grab-bag of names (finger, gripper, jaw, knuckle,
+// driver, claw, hand, thumb), so we cover the common ones instead of just
+// "finger" — otherwise the Articulation panel hides its Close/Open block on
+// any gripper that deviates from the Panda naming convention.
+static bool name_is_gripperlike(const std::string& nm)
+{
+    std::string lower;
+    lower.reserve(nm.size());
+    for (char c : nm) lower += (char)tolower((unsigned char)c);
+    static const char* kw[] = {
+        "finger", "gripper", "jaw", "knuckle", "driver", "claw", "thumb",
+    };
+    for (const char* k : kw) if (lower.find(k) != std::string::npos) return true;
+    return false;
+}
+
 void urdf_gripper_finger_indices(UrdfArticulation* h, std::vector<int>& out)
 {
     out.clear();
@@ -1531,11 +1548,7 @@ void urdf_gripper_finger_indices(UrdfArticulation* h, std::vector<int>& out)
     for (int i = 0; i < n; ++i) {
         int t = h->joint_infos[i].type;
         if (t != 0 && t != 1 && t != 2) continue;   // driveable only
-        std::string nm = h->joint_infos[i].name;
-        std::string lower;
-        lower.reserve(nm.size());
-        for (char c : nm) lower += (char)tolower((unsigned char)c);
-        if (lower.find("finger") != std::string::npos) out.push_back(i);
+        if (name_is_gripperlike(h->joint_infos[i].name)) out.push_back(i);
     }
 }
 
@@ -1555,10 +1568,7 @@ void urdf_gripper_finger_worlds(UrdfArticulation* h, std::vector<float3>& out)
         if (link_name == h->root_body_link)
             world_xform = world_xform * h->root_xform;
 
-        std::string low;
-        low.reserve(link_name.size());
-        for (char c : link_name) low += (char)tolower((unsigned char)c);
-        if (low.find("finger") != std::string::npos)
+        if (name_is_gripperlike(link_name))
             out.push_back(world_xform.transform_point(make_float3(0, 0, 0)));
 
         auto jit = h->children_map.find(link_name);
