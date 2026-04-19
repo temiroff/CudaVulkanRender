@@ -232,6 +232,7 @@ add_executable(pathtracer
     src/mjcf_loader.cpp
     src/sim/sim_backend.cpp
     src/sim/sim_mujoco.cpp
+    src/sim/props_physics.cpp
     src/post_process.cpp
     src/nim_vlm.cpp
     src/nim_cosmos.cpp

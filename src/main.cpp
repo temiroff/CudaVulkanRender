@@ -20,6 +20,7 @@
 #include "urdf_loader.h"
 #include "mjcf_loader.h"
 #include "sim/sim_backend.h"
+#include "sim/props_physics.h"
 #include "restir.h"
 #include "rasterizer.h"
 #include "hdri.h"
@@ -1544,6 +1545,7 @@ int main() {
     // URDF articulation — persistent handle for interactive joint control
     UrdfArticulation*        urdf_artic_handle = nullptr;
     RobotDemoState           robot_demo;
+    PropsPhysics*            props_world = props_physics_create();
     SensorState              sensor_state;
 
     // Physics sim — owns authoritative state (qpos/qvel) when active. Joint
@@ -2008,7 +2010,7 @@ int main() {
             bool falling_moved = false;
             if (!sim_running) {
                 falling_moved = robot_demo_update_falling(
-                    robot_demo, dt, prims_sorted, mesh.objects, mesh.all_prims);
+                    robot_demo, props_world, dt, prims_sorted, mesh.objects, mesh.all_prims);
             }
 
             if (attach_changed || falling_moved) {
@@ -4754,6 +4756,7 @@ int main() {
     stats_shutdown(nvml);
     post_process_destroy(post);
     if (usd_anim_handle) { usd_anim_close(usd_anim_handle); usd_anim_handle = nullptr; }
+    props_physics_destroy(props_world);
     mesh.free_gpu();
     cudaFree(d_accum); cudaFree(d_display);
     cudaFree(d_depth); cudaFree(d_motion);

@@ -6,6 +6,8 @@
 #include <vector>
 #include <string>
 
+struct PropsPhysics;  // forward decl — real MuJoCo auxiliary world (sim/props_physics.h)
+
 // ── Waypoint: a snapshot of all joint angles + gripper state ─────────────────
 
 struct RobotWaypoint {
@@ -36,8 +38,15 @@ struct GraspState {
 struct FallingObject {
     bool   is_mesh = false;
     int    obj_idx = -1;
-    float3 velocity = {0, 0, 0};
-    bool   stopped  = false;
+    float3 velocity = {0, 0, 0};   // initial velocity (used at registration time)
+    bool   stopped  = false;       // simple integrator only; MuJoCo ignores
+
+    // MuJoCo binding. Populated when the prop is registered with the
+    // auxiliary physics world. -1 means "not yet registered" — the next
+    // update_falling tick will create the body.
+    int    mujoco_handle = -1;
+    float3 body_centroid = {0, 0, 0};  // rigid pivot; world pose from MuJoCo
+    std::vector<float3> body_local_verts;  // per-vertex offsets from body_centroid
 };
 
 // ── Robot Demo panel state ───────────────────────────────────────────────────
@@ -61,12 +70,17 @@ struct RobotDemoState {
     float grasp_threshold = 0.25f;  // proximity distance for auto-attach (m)
     float grip_forward    = 0.08f;  // offset from ee origin along hand +Z (m)
 
-    // Free-fall physics (applied to detached objects)
+    // Free-fall physics (applied to detached objects). When props_world is
+    // set, MuJoCo runs the rigid-body sim. Otherwise a simple translation-
+    // only integrator runs as a fallback. Main owns the PropsPhysics
+    // lifetime; the state just borrows the pointer.
+    PropsPhysics* props_world = nullptr;
     std::vector<FallingObject> falling;
-    float gravity    = -9.81f;   // along world +Y
-    float ground_y   = 0.f;      // floor height; falling objects rest on this plane
-    float restitution = 0.40f;   // bounce coefficient on ground hit (0=dead, 1=elastic)
-    float friction    = 0.30f;   // horizontal velocity damping on ground contact
+    float gravity    = -9.81f;   // along world +Y (used by fallback integrator only)
+    float ground_y   = 0.f;      // floor height; mirrored into MuJoCo on every rebuild
+    float restitution = 0.40f;   // fallback only
+    float friction    = 0.30f;   // fallback only
+    float prop_density = 400.f;  // kg/m^3 for mesh-AABB mass estimation
 
     // EE velocity tracking — detached objects inherit this so arm motion
     // produces a natural throw arc instead of a dead drop.
@@ -126,10 +140,12 @@ bool robot_demo_force_attach(RobotDemoState& state, UrdfArticulation* handle,
 // Returns true if something was detached.
 bool robot_demo_force_detach(RobotDemoState& state);
 
-// Advance free-fall simulation by dt seconds. Moves each falling object
-// under gravity, stopping when it reaches state.ground_y. Returns true if
-// any object's geometry moved (caller must re-upload/refit).
-bool robot_demo_update_falling(RobotDemoState& state, float dt,
+// Advance free-fall simulation by dt seconds. When props_world is non-null
+// and MuJoCo is compiled in, full 6-DoF rigid-body physics runs (gravity,
+// tumbling, restitution from contact). Otherwise falls back to a simple
+// translation-only integrator. Returns true if any object moved.
+bool robot_demo_update_falling(RobotDemoState& state,
+                               PropsPhysics* props_world, float dt,
                                std::vector<Sphere>& spheres,
                                std::vector<MeshObject>& objects,
                                std::vector<Triangle>& all_prims);

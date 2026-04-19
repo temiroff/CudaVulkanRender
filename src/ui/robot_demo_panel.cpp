@@ -1,4 +1,5 @@
 #include "robot_demo_panel.h"
+#include "../sim/props_physics.h"
 #include <imgui.h>
 #include <cmath>
 #include <fstream>
@@ -310,11 +311,16 @@ static bool try_attach_nearest(RobotDemoState& state, UrdfArticulation* handle,
     }
 
     // Newly attached object cancels any in-progress free-fall for it.
-    auto it = std::remove_if(state.falling.begin(), state.falling.end(),
-        [&](const FallingObject& f) {
-            return f.is_mesh == best_is_mesh && f.obj_idx == best_idx;
-        });
-    state.falling.erase(it, state.falling.end());
+    // Tell MuJoCo to drop the body so we don't double-simulate it.
+    for (auto it = state.falling.begin(); it != state.falling.end(); ) {
+        if (it->is_mesh == best_is_mesh && it->obj_idx == best_idx) {
+            if (state.props_world && it->mujoco_handle >= 0)
+                props_physics_remove(state.props_world, it->mujoco_handle);
+            it = state.falling.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     return true;
 }
@@ -409,6 +415,7 @@ void robot_demo_reset_grasp(RobotDemoState& state,
 {
     // Any in-flight bounces are cancelled on loop/reset — otherwise the
     // object would keep physics-falling past the restart.
+    if (state.props_world) props_physics_clear(state.props_world);
     state.falling.clear();
 
     if (!state.grasp.has_original) return;
@@ -503,25 +510,206 @@ static float mesh_min_y(int obj_idx,
     return (min_y < 1e29f) ? min_y : 0.f;
 }
 
-bool robot_demo_update_falling(RobotDemoState& state, float dt,
+// Rotate a vector by a unit quaternion (w, x, y, z).
+// Uses the cross-product form: v' = v + 2*q.w*(q.xyz × v) + 2*(q.xyz × (q.xyz × v)).
+static float3 quat_rotate(const float q[4], float3 v)
+{
+    float3 u = make_float3(q[1], q[2], q[3]);
+    float  w = q[0];
+    float3 uxv = make_float3(
+        u.y * v.z - u.z * v.y,
+        u.z * v.x - u.x * v.z,
+        u.x * v.y - u.y * v.x);
+    float3 uxuxv = make_float3(
+        u.y * uxv.z - u.z * uxv.y,
+        u.z * uxv.x - u.x * uxv.z,
+        u.x * uxv.y - u.y * uxv.x);
+    return make_float3(
+        v.x + 2.f * (w * uxv.x + uxuxv.x),
+        v.y + 2.f * (w * uxv.y + uxuxv.y),
+        v.z + 2.f * (w * uxv.z + uxuxv.z));
+}
+
+// Compute the AABB of a mesh object's triangles.
+static void mesh_aabb(int obj_idx,
+                      const std::vector<MeshObject>& objects,
+                      const std::vector<Triangle>& all_prims,
+                      float3& out_min, float3& out_max)
+{
+    out_min = make_float3( 1e30f,  1e30f,  1e30f);
+    out_max = make_float3(-1e30f, -1e30f, -1e30f);
+    if (obj_idx < 0 || obj_idx >= (int)objects.size()) return;
+    int target_id = objects[obj_idx].obj_id;
+    for (const auto& tri : all_prims) {
+        if (tri.obj_id != target_id) continue;
+        const float3 vs[3] = { tri.v0, tri.v1, tri.v2 };
+        for (const auto& v : vs) {
+            if (v.x < out_min.x) out_min.x = v.x;
+            if (v.y < out_min.y) out_min.y = v.y;
+            if (v.z < out_min.z) out_min.z = v.z;
+            if (v.x > out_max.x) out_max.x = v.x;
+            if (v.y > out_max.y) out_max.y = v.y;
+            if (v.z > out_max.z) out_max.z = v.z;
+        }
+    }
+}
+
+// Register a freshly-detached FallingObject with the MuJoCo auxiliary
+// world. Captures body-local vertex offsets so we can rigidly transform
+// the mesh as MuJoCo integrates the body's pose.
+static void register_prop(RobotDemoState& state, FallingObject& fo,
+                          std::vector<Sphere>& spheres,
+                          std::vector<MeshObject>& objects,
+                          std::vector<Triangle>& all_prims)
+{
+    if (!state.props_world || !props_physics_available()) return;
+    if (fo.mujoco_handle >= 0) return;  // already registered
+
+    props_physics_set_ground(state.props_world, state.ground_y);
+
+    if (!fo.is_mesh) {
+        if (fo.obj_idx < 0 || fo.obj_idx >= (int)spheres.size()) return;
+        const Sphere& s = spheres[fo.obj_idx];
+        float vol = (4.f / 3.f) * 3.14159265f * s.radius * s.radius * s.radius;
+        float mass = std::max(0.01f, vol * state.prop_density);
+        fo.body_centroid = s.center;
+        fo.mujoco_handle = props_physics_add_sphere(
+            state.props_world,
+            s.center.x, s.center.y, s.center.z,
+            s.radius,
+            fo.velocity.x, fo.velocity.y, fo.velocity.z,
+            mass);
+    } else {
+        if (fo.obj_idx < 0 || fo.obj_idx >= (int)objects.size()) return;
+        float3 aabb_min, aabb_max;
+        mesh_aabb(fo.obj_idx, objects, all_prims, aabb_min, aabb_max);
+        float sx = std::max(1e-4f, aabb_max.x - aabb_min.x);
+        float sy = std::max(1e-4f, aabb_max.y - aabb_min.y);
+        float sz = std::max(1e-4f, aabb_max.z - aabb_min.z);
+        // Centroid = AABB center. The body's world frame origin sits here;
+        // per-vertex offsets are stored relative to it so they ride along
+        // with MuJoCo's rigid transform.
+        float3 centroid = make_float3(
+            0.5f * (aabb_min.x + aabb_max.x),
+            0.5f * (aabb_min.y + aabb_max.y),
+            0.5f * (aabb_min.z + aabb_max.z));
+        fo.body_centroid = centroid;
+
+        int target_id = objects[fo.obj_idx].obj_id;
+        fo.body_local_verts.clear();
+        for (const auto& tri : all_prims) {
+            if (tri.obj_id != target_id) continue;
+            const float3 vs[3] = { tri.v0, tri.v1, tri.v2 };
+            for (const auto& v : vs) {
+                fo.body_local_verts.push_back(make_float3(
+                    v.x - centroid.x, v.y - centroid.y, v.z - centroid.z));
+            }
+        }
+
+        float mass = std::max(0.01f, sx * sy * sz * state.prop_density);
+        fo.mujoco_handle = props_physics_add_box(
+            state.props_world,
+            centroid.x, centroid.y, centroid.z,
+            1.f, 0.f, 0.f, 0.f,       // initial quat = identity
+            sx, sy, sz,
+            fo.velocity.x, fo.velocity.y, fo.velocity.z,
+            0.f, 0.f, 0.f,             // no initial angular velocity
+            mass);
+    }
+}
+
+// Apply MuJoCo's integrated pose to the corresponding mesh/sphere.
+static bool apply_mujoco_pose(RobotDemoState& state, FallingObject& fo,
+                              std::vector<Sphere>& spheres,
+                              std::vector<MeshObject>& objects,
+                              std::vector<Triangle>& all_prims)
+{
+    if (!state.props_world || fo.mujoco_handle < 0) return false;
+    float pos[3], quat[4];
+    if (!props_physics_get_pose(state.props_world, fo.mujoco_handle, pos, quat))
+        return false;
+
+    if (!fo.is_mesh) {
+        if (fo.obj_idx < 0 || fo.obj_idx >= (int)spheres.size()) return false;
+        spheres[fo.obj_idx].center = make_float3(pos[0], pos[1], pos[2]);
+        return true;
+    }
+
+    if (fo.obj_idx < 0 || fo.obj_idx >= (int)objects.size()) return false;
+    int target_id = objects[fo.obj_idx].obj_id;
+    int vi = 0;
+    float3 centroid_sum = make_float3(0, 0, 0);
+    int vert_count = 0;
+
+    for (auto& tri : all_prims) {
+        if (tri.obj_id != target_id) continue;
+        float3* tv[3] = { &tri.v0, &tri.v1, &tri.v2 };
+        for (int k = 0; k < 3; ++k) {
+            if (vi < (int)fo.body_local_verts.size()) {
+                float3 rot = quat_rotate(quat, fo.body_local_verts[vi]);
+                tv[k]->x = pos[0] + rot.x;
+                tv[k]->y = pos[1] + rot.y;
+                tv[k]->z = pos[2] + rot.z;
+                centroid_sum.x += tv[k]->x;
+                centroid_sum.y += tv[k]->y;
+                centroid_sum.z += tv[k]->z;
+                vert_count++;
+            }
+            vi++;
+        }
+    }
+    if (vert_count > 0) {
+        float inv = 1.f / (float)vert_count;
+        objects[fo.obj_idx].centroid = make_float3(
+            centroid_sum.x * inv, centroid_sum.y * inv, centroid_sum.z * inv);
+    }
+    return true;
+}
+
+bool robot_demo_update_falling(RobotDemoState& state,
+                               PropsPhysics* props_world, float dt,
                                std::vector<Sphere>& spheres,
                                std::vector<MeshObject>& objects,
                                std::vector<Triangle>& all_prims)
 {
+    // The first call that sees a non-null props_world latches it onto
+    // state so helpers (e.g. try_attach_nearest) can remove bodies on
+    // re-attach without being passed the pointer.
+    if (props_world && state.props_world != props_world)
+        state.props_world = props_world;
+
     if (state.falling.empty() || dt <= 0.f) return false;
 
-    // Semi-implicit Euler with restitution bounce + friction.
-    // "Settled" threshold: once the bounce-back vertical speed would be
-    // smaller than this, treat it as rest to avoid infinite tiny bounces.
-    const float kSettleV = 0.30f;   // m/s
+    const bool use_mujoco = (props_world != nullptr && props_physics_available());
 
+    // ── MuJoCo path ──────────────────────────────────────────────────────
+    if (use_mujoco) {
+        // Register any newly-queued falling objects (handle == -1). This
+        // also seeds their initial velocity from the EE throw.
+        for (auto& fo : state.falling) {
+            if (fo.mujoco_handle < 0)
+                register_prop(state, fo, spheres, objects, all_prims);
+        }
+
+        props_physics_set_ground(props_world, state.ground_y);
+        props_physics_step(props_world, dt);
+
+        bool moved = false;
+        for (auto& fo : state.falling) {
+            if (apply_mujoco_pose(state, fo, spheres, objects, all_prims))
+                moved = true;
+        }
+        return moved;
+    }
+
+    // ── Fallback integrator (no MuJoCo) ──────────────────────────────────
+    // Semi-implicit Euler with restitution + friction. Translation only.
+    const float kSettleV = 0.30f;
     bool moved = false;
     for (auto& fo : state.falling) {
         if (fo.stopped) continue;
 
-        // Integrate velocity (gravity in -Y)
         fo.velocity.y += state.gravity * dt;
-
         float dx = fo.velocity.x * dt;
         float dy = fo.velocity.y * dt;
         float dz = fo.velocity.z * dt;
@@ -530,65 +718,35 @@ bool robot_demo_update_falling(RobotDemoState& state, float dt,
             if (fo.obj_idx < 0 || fo.obj_idx >= (int)spheres.size()) { fo.stopped = true; continue; }
             Sphere& s = spheres[fo.obj_idx];
             float rest_y = state.ground_y + s.radius;
-            float new_cx = s.center.x + dx;
-            float new_cy = s.center.y + dy;
-            float new_cz = s.center.z + dz;
-
+            float new_cx = s.center.x + dx, new_cy = s.center.y + dy, new_cz = s.center.z + dz;
             if (new_cy <= rest_y && fo.velocity.y < 0.f) {
-                // Ground contact — reflect with restitution, damp horizontal.
-                s.center.x = new_cx;
-                s.center.y = rest_y;
-                s.center.z = new_cz;
-
-                float bounce_v = -fo.velocity.y * state.restitution;
-                if (bounce_v < kSettleV) {
-                    // Settle: kill all velocity, rest on ground.
-                    fo.velocity = make_float3(0, 0, 0);
-                    fo.stopped = true;
-                } else {
-                    fo.velocity.y = bounce_v;
-                    float keep = 1.f - state.friction;
-                    fo.velocity.x *= keep;
-                    fo.velocity.z *= keep;
-                }
+                s.center.x = new_cx; s.center.y = rest_y; s.center.z = new_cz;
+                float bv = -fo.velocity.y * state.restitution;
+                if (bv < kSettleV) { fo.velocity = make_float3(0,0,0); fo.stopped = true; }
+                else { fo.velocity.y = bv; float k = 1.f - state.friction; fo.velocity.x *= k; fo.velocity.z *= k; }
             } else {
-                s.center.x = new_cx;
-                s.center.y = new_cy;
-                s.center.z = new_cz;
+                s.center.x = new_cx; s.center.y = new_cy; s.center.z = new_cz;
             }
             moved = true;
         } else {
             if (fo.obj_idx < 0 || fo.obj_idx >= (int)objects.size()) { fo.stopped = true; continue; }
             float min_y = mesh_min_y(fo.obj_idx, objects, all_prims);
             float new_min_y = min_y + dy;
-
             if (new_min_y <= state.ground_y && fo.velocity.y < 0.f) {
-                // Clamp lowest vertex onto ground, then reflect velocity.
-                float adjust_y = state.ground_y - min_y;
-                translate_mesh(fo.obj_idx, objects, all_prims, dx, adjust_y, dz);
-
-                float bounce_v = -fo.velocity.y * state.restitution;
-                if (bounce_v < kSettleV) {
-                    fo.velocity = make_float3(0, 0, 0);
-                    fo.stopped = true;
-                } else {
-                    fo.velocity.y = bounce_v;
-                    float keep = 1.f - state.friction;
-                    fo.velocity.x *= keep;
-                    fo.velocity.z *= keep;
-                }
+                float adj = state.ground_y - min_y;
+                translate_mesh(fo.obj_idx, objects, all_prims, dx, adj, dz);
+                float bv = -fo.velocity.y * state.restitution;
+                if (bv < kSettleV) { fo.velocity = make_float3(0,0,0); fo.stopped = true; }
+                else { fo.velocity.y = bv; float k = 1.f - state.friction; fo.velocity.x *= k; fo.velocity.z *= k; }
             } else {
                 translate_mesh(fo.obj_idx, objects, all_prims, dx, dy, dz);
             }
             moved = true;
         }
     }
-
-    // Compact: drop stopped entries so the list doesn't grow forever.
     auto it = std::remove_if(state.falling.begin(), state.falling.end(),
         [](const FallingObject& f) { return f.stopped; });
     state.falling.erase(it, state.falling.end());
-
     return moved;
 }
 
