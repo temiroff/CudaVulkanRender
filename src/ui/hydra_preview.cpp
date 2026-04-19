@@ -864,18 +864,27 @@ bool hydra_preview_tick(HydraPreviewState& hp, const AnimPanelState& anim, int w
     eng.SetRenderViewport(GfVec4d(0, 0, width, height));
     eng.SetCameraState(make_view(hp), make_proj(hp, width, height));
 
-    // Apply the same axis correction as usd_loader.cpp: X→X, Y→−Z, Z→+Y for Z-up stages.
+    // Apply the same axis correction as usd_loader.cpp: X→X, Y→−Z, Z→+Y for Z-up
+    // stages, and bake metersPerUnit so cm-authored stages match the viewport's
+    // meters-space units.
     {
+        GfMatrix4d root(1.0);
         TfToken up_axis = UsdGeomGetStageUpAxis(stage);
         if (up_axis == UsdGeomTokens->z) {
-            eng.SetRootTransform(GfMatrix4d(
+            root = GfMatrix4d(
                 1,  0,  0, 0,
                 0,  0, -1, 0,
                 0,  1,  0, 0,
-                0,  0,  0, 1));
-        } else {
-            eng.SetRootTransform(GfMatrix4d(1.0));
+                0,  0,  0, 1);
         }
+        double mpu = UsdGeomGetStageMetersPerUnit(stage);
+        if (mpu <= 0.0) mpu = 1.0;
+        if (mpu != 1.0) {
+            GfMatrix4d scale_m(1.0);
+            scale_m.SetScale(GfVec3d(mpu, mpu, mpu));
+            root = root * scale_m;
+        }
+        eng.SetRootTransform(root);
     }
 
     // World-space lighting that follows the camera.
