@@ -966,6 +966,23 @@ void robot_demo_panel_draw(RobotDemoState& state, UrdfArticulation* handle)
                         jts[i].angle = angles[i];
                     state.gripper_closed = grip;
                     state.scrub_changed = true;
+
+                    // Mirror the play-tick attach/detach logic so scrubbing
+                    // across an `attached` transition fires the same attach
+                    // request as Play does. Without this, dragging into a
+                    // grasped region leaves the object behind.
+                    bool any_keyed_attach = false;
+                    for (const auto& w : state.waypoints) {
+                        if (w.attached) { any_keyed_attach = true; break; }
+                    }
+                    bool want_attached = any_keyed_attach
+                        ? sample_attached(state.waypoints, state.playback_time)
+                        : grip;
+                    if (want_attached != state.prev_attached) {
+                        if (want_attached) state.request_attach = true;
+                        else               state.request_detach = true;
+                        state.prev_attached = want_attached;
+                    }
                 }
             }
 
