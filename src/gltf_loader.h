@@ -25,6 +25,7 @@ struct MeshObject {
     char   name[128];       // node name for display
     bool   hidden = false;  // excluded from render when true
     bool   environment = false; // world-level prop (ground, walls) — skip camera auto-fit
+    bool   is_robot_part = false; // belongs to a URDF articulation — ignore for grasp
 };
 
 // ─────────────────────────────────────────────

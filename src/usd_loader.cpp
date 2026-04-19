@@ -1020,6 +1020,18 @@ bool usd_load(const std::string&          path,
         std::cout << "[usd_loader] Y-up stage — up_axis=" << up_axis << "  no correction\n";
     }
 
+    // metersPerUnit: stages authored in cm (Maya default) set this to 0.01.
+    // Bake it into the same correction matrix so every point lands in meters.
+    double mpu = UsdGeomGetStageMetersPerUnit(stage);
+    if (mpu <= 0.0) mpu = 1.0;
+    if (mpu != 1.0) {
+        GfMatrix4d scale_m(1.0);
+        scale_m.SetScale(GfVec3d(mpu, mpu, mpu));
+        axis_correction = axis_correction * scale_m;
+        std::cout << "[usd_loader] metersPerUnit=" << mpu
+                  << " applied (stage units -> meters)\n";
+    }
+
     UsdGeomXformCache xform_cache;
     std::unordered_map<std::string, int> tex_cache;   // path → texture index
     std::unordered_map<std::string, int> mat_cache;   // prim path → material index
@@ -1418,6 +1430,14 @@ UsdAnimHandle* usd_anim_open(const std::string& path,
             0,  0, -1, 0,
             0,  1,  0, 0,
             0,  0,  0, 1);
+    }
+
+    double mpu = UsdGeomGetStageMetersPerUnit(stage);
+    if (mpu <= 0.0) mpu = 1.0;
+    if (mpu != 1.0) {
+        GfMatrix4d scale_m(1.0);
+        scale_m.SetScale(GfVec3d(mpu, mpu, mpu));
+        h->axis_correction = h->axis_correction * scale_m;
     }
 
     h->has_time_samples = false;

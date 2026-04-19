@@ -1014,6 +1014,7 @@ bool urdf_load(const std::string&          path,
             MeshObject obj{};
             obj.obj_id = obj_id;
             obj.hidden = false;
+            obj.is_robot_part = true;
 
             // Compute centroid from transformed vertices
             float3 sum = make_float3(0, 0, 0);

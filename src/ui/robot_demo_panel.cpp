@@ -273,7 +273,7 @@ static bool try_attach_nearest(RobotDemoState& state, UrdfArticulation* handle,
     }
 
     for (int i = 0; i < (int)objects.size(); i++) {
-        if (objects[i].hidden) continue;
+        if (objects[i].hidden || objects[i].is_robot_part) continue;
         float dist = min_dist_to_contact(objects[i].centroid);
         if (dist < best_dist) { best_dist = dist; best_idx = i; best_is_mesh = true; }
     }
