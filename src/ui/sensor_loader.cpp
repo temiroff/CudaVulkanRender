@@ -207,6 +207,10 @@ bool sensor_load_from_usd(const std::string& path,
     state.offset[0]      = state.offset[1]      = state.offset[2]      = 0.f;
     state.rot_deg[0]     = state.rot_deg[1]     = state.rot_deg[2]     = 0.f;
     state.has_base_pose  = true;
+    // Enable the sensor + gizmo so the user immediately sees the result
+    // without having to tick two checkboxes after every load.
+    state.enabled        = true;
+    state.show_gizmo     = true;
     state.base_origin_local[0] = o_l.x; state.base_origin_local[1] = o_l.y; state.base_origin_local[2] = o_l.z;
     state.base_right_local [0] = r_l.x; state.base_right_local [1] = r_l.y; state.base_right_local [2] = r_l.z;
     state.base_up_local    [0] = u_l.x; state.base_up_local    [1] = u_l.y; state.base_up_local    [2] = u_l.z;

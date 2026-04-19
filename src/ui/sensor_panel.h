@@ -93,6 +93,10 @@ struct SensorState {
 
     // Follower for the sensor's imported USD geometry.
     SensorGeoFollow follow;
+
+    // Set by the "Remove sensor" button. main.cpp polls this, hides the
+    // sensor's imported geometry, rebuilds the visible BVH, and clears it.
+    bool  remove_requested = false;
 };
 
 // Draw the Sensors ImGui panel (enable/disable, fov, offset, corner).

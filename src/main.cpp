@@ -2464,6 +2464,34 @@ int main() {
             }
         }
 
+        // ── Sensor remove ─────────────────────────────────────────────
+        // Hide the sensor's imported geometry, drop the follower, and
+        // clear the USD baseline so the gizmo/camera disappear too.
+        if (sensor_state.remove_requested) {
+            sensor_state.remove_requested = false;
+            const int lo = sensor_state.follow.obj_id_start;
+            const int hi = sensor_state.follow.obj_id_end;
+            bool mesh_changed = false;
+            if (hi >= lo) {
+                for (auto& obj : mesh.objects) {
+                    if (obj.obj_id >= lo && obj.obj_id <= hi && !obj.hidden) {
+                        obj.hidden = true;
+                        mesh_changed = true;
+                    }
+                }
+            }
+            sensor_state.enabled        = false;
+            sensor_state.show_gizmo     = false;
+            sensor_state.has_base_pose  = false;
+            sensor_state.follow         = SensorGeoFollow{};
+            sensor_state.status[0]      = '\0';
+            if (mesh_changed) {
+                rebuild_visible_bvh(mesh);
+                ++mesh.scene_version;
+                cam_changed = true;
+            }
+        }
+
         // ── HDRI load / clear ─────────────────────────────────────────
         if (ctrl.load_hdri_requested) {
             ctrl.load_hdri_requested = false;
@@ -3801,26 +3829,33 @@ int main() {
                     float aspect_g = (rt_w > 0 && rt_h > 0)
                         ? (float)rt_w / (float)rt_h : 1.f;
 
-                    // Body: 4×3×2 cm flat box sitting *behind* the aperture,
+                    // Roll gizmo wireframe −90° around fwd to match the
+                    // rolled camera image in the mini view. Camera render
+                    // itself is rolled in sensor_camera_for_render.
+                    float3 g_right = make_float3(-s_up.x, -s_up.y, -s_up.z);
+                    float3 g_up    = s_right;
+                    float3 g_fwd   = s_fwd;
+
+                    // Body: 2×1.5×1 cm flat box sitting *behind* the aperture,
                     // so the lens (origin) is flush with the front face.
-                    const float BW = 0.04f, BH = 0.03f, BD = 0.02f;
+                    const float BW = 0.02f, BH = 0.015f, BD = 0.01f;
                     float3 body_ctr = make_float3(
-                        s_origin.x - s_fwd.x * (BD*0.5f),
-                        s_origin.y - s_fwd.y * (BD*0.5f),
-                        s_origin.z - s_fwd.z * (BD*0.5f));
+                        s_origin.x - g_fwd.x * (BD*0.5f),
+                        s_origin.y - g_fwd.y * (BD*0.5f),
+                        s_origin.z - g_fwd.z * (BD*0.5f));
                     float3 body[8];
                     for (int i = 0; i < 8; ++i) {
                         float sx = (i & 1) ? BW*0.5f : -BW*0.5f;
                         float sy = (i & 2) ? BH*0.5f : -BH*0.5f;
                         float sz = (i & 4) ? BD*0.5f : -BD*0.5f;
                         body[i] = make_float3(
-                            body_ctr.x + s_right.x*sx + s_up.x*sy + s_fwd.x*sz,
-                            body_ctr.y + s_right.y*sx + s_up.y*sy + s_fwd.y*sz,
-                            body_ctr.z + s_right.z*sx + s_up.z*sy + s_fwd.z*sz);
+                            body_ctr.x + g_right.x*sx + g_up.x*sy + g_fwd.x*sz,
+                            body_ctr.y + g_right.y*sx + g_up.y*sy + g_fwd.y*sz,
+                            body_ctr.z + g_right.z*sx + g_up.z*sy + g_fwd.z*sz);
                     }
 
-                    // Frustum: 8 cm long, half-size from FOV.
-                    const float F = 0.08f;
+                    // Frustum: 4 cm long, half-size from FOV.
+                    const float F = 0.04f;
                     float half_h = tanf(sensor_state.fov_deg * 0.5f * 3.14159265f / 180.f) * F;
                     float half_w = half_h * ((float)sensor_state.width /
                                               (float)std::max(1, sensor_state.height));
@@ -3830,9 +3865,9 @@ int main() {
                         float sx = (i == 1 || i == 2) ?  half_w : -half_w;
                         float sy = (i >= 2)           ?  half_h : -half_h;
                         corner[i] = make_float3(
-                            apex.x + s_right.x*sx + s_up.x*sy + s_fwd.x*F,
-                            apex.y + s_right.y*sx + s_up.y*sy + s_fwd.y*F,
-                            apex.z + s_right.z*sx + s_up.z*sy + s_fwd.z*F);
+                            apex.x + g_right.x*sx + g_up.x*sy + g_fwd.x*F,
+                            apex.y + g_right.y*sx + g_up.y*sy + g_fwd.y*F,
+                            apex.z + g_right.z*sx + g_up.z*sy + g_fwd.z*F);
                     }
 
                     auto proj = [&](float3 p, ImVec2& out) {

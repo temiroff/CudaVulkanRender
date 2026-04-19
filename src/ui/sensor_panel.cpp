@@ -263,11 +263,15 @@ static Camera sensor_camera_for_render(const SensorState& s,
 {
     float3 origin, right, up, fwd;
     sensor_get_world_frame(s, h, origin, right, up, fwd);
-    (void)right;
+
+    // Roll the sensor image −90° around its view direction, so the mini
+    // view matches the orientation users expect from the camera_attach
+    // authoring frame. For −90° around fwd, new_up = +right.
+    float3 rolled_up = right;
 
     float3 target = vadd(origin, fwd);
     float aspect = (h_px > 0) ? (float)w / (float)h_px : 1.f;
-    return Camera::make(origin, target, up, s.fov_deg, aspect,
+    return Camera::make(origin, target, rolled_up, s.fov_deg, aspect,
                         /*aperture=*/0.f, /*focus_dist=*/1.f);
 }
 
@@ -359,6 +363,17 @@ void sensor_panel_draw(SensorState& state, UrdfArticulation* handle,
         }
     }
 #endif
+
+    // "Remove sensor": only meaningful when a sensor is actually loaded.
+    const bool has_sensor = state.has_base_pose ||
+                            state.follow.active ||
+                            state.follow.obj_id_end >= state.follow.obj_id_start;
+    ImGui::BeginDisabled(!has_sensor);
+    if (ImGui::Button("Remove sensor", ImVec2(-1.f, 0.f))) {
+        state.remove_requested = true;
+    }
+    ImGui::EndDisabled();
+
     if (state.status[0]) {
         ImGui::TextWrapped("%s", state.status);
     }
