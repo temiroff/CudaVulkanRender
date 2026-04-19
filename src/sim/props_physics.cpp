@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -162,18 +163,20 @@ static void rebuild(PropsPhysics* p)
 
     std::string xml = build_mjcf(p);
 
-    mjVFS vfs;
-    mj_defaultVFS(&vfs);
-    int add_rc = mj_addBufferVFS(&vfs, "props.xml", xml.data(), (int)xml.size());
+    // mjVFS is ~20MB (see sim_mujoco.cpp) — must be heap-allocated or it
+    // blows the stack the first time rebuild() runs.
+    auto vfs = std::make_unique<mjVFS>();
+    mj_defaultVFS(vfs.get());
+    int add_rc = mj_addBufferVFS(vfs.get(), "props.xml", xml.data(), (int)xml.size());
     if (add_rc != 0) {
         std::fprintf(stderr, "[props_physics] mj_addBufferVFS failed (rc=%d)\n", add_rc);
-        mj_deleteVFS(&vfs);
+        mj_deleteVFS(vfs.get());
         return;
     }
 
     char err[1024] = {0};
-    p->model = mj_loadXML("props.xml", &vfs, err, (int)sizeof(err));
-    mj_deleteVFS(&vfs);
+    p->model = mj_loadXML("props.xml", vfs.get(), err, (int)sizeof(err));
+    mj_deleteVFS(vfs.get());
 
     if (!p->model) {
         std::fprintf(stderr, "[props_physics] mj_loadXML failed: %s\n", err);
