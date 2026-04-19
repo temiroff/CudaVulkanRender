@@ -255,6 +255,7 @@ add_executable(pathtracer
     src/ui/articulation_panel.cpp
     src/ui/robot_demo_panel.cpp
     src/ui/sensor_panel.cpp
+    src/ui/sensor_loader.cpp
     src/ui/sensor_blit.cu
     src/ui/hydra_preview.cpp
     ${IMGUI_SOURCES}

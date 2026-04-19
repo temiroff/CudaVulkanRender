@@ -44,6 +44,7 @@
 #include "ui/articulation_panel.h"
 #include "ui/robot_demo_panel.h"
 #include "ui/sensor_panel.h"
+#include "ui/sensor_loader.h"
 #include "ui/hydra_preview.h"
 
 #include <windows.h>
@@ -1782,6 +1783,7 @@ int main() {
             bool artic_changed = panel_changed &&
                                  urdf_repose(urdf_artic_handle, mesh.all_prims);
             if (artic_changed) {
+                sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
                 // Refit BVH AABBs from updated vertex positions (O(N), no rebuild)
                 if (mesh.d_bvh && !mesh.bvh_nodes.empty())
@@ -2001,10 +2003,23 @@ int main() {
                 ? robot_demo_tick(robot_demo, urdf_artic_handle, dt)
                 : false;
             robot_demo_panel_draw(robot_demo, urdf_artic_handle);
-            sensor_panel_draw(sensor_state, urdf_artic_handle);
+            sensor_panel_draw(sensor_state, urdf_artic_handle, ctrl);
             // Scrub also triggers a pose update
             demo_changed = demo_changed || robot_demo.scrub_changed;
             robot_demo.scrub_changed = false;
+
+            // Pick up sensor panel slider changes (offset / rotate / attach
+            // joint) by re-running the follower. It no-ops when M_cam hasn't
+            // moved, so this is cheap.
+            if (sensor_state.follow.active && urdf_artic_handle) {
+                if (sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims)) {
+                    reupload_visible_prims(mesh);
+                    if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                        bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                    ++mesh.scene_version;
+                    cam_changed = true;
+                }
+            }
 
             // ── Explicit attach/detach buttons ───────────────────────────
             // Consume UI intents. Attach bypasses the proximity threshold;
@@ -2068,6 +2083,9 @@ int main() {
 
             if (demo_changed && urdf_artic_handle) {
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
+                // Reposition any follower-attached sensor geometry so it
+                // rides with the joint after repose updated joint transforms.
+                sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
                 if (mesh.d_bvh && !mesh.bvh_nodes.empty())
                     bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
@@ -2397,6 +2415,7 @@ int main() {
         // ── Import into existing scene ────────────────────────────────
         if (ctrl.import_requested) {
             ctrl.import_requested = false;
+            int obj_count_before = (int)mesh.objects.size();
             if (import_into_scene(ctrl.gltf_path, mesh, ctrl)) {
                 cam_changed = true;
 
@@ -2415,6 +2434,32 @@ int main() {
                     stop_sim();
                     sim_active_path = ctrl.gltf_path;
                     refresh_sim_joint_names();
+                }
+
+                // If the sensor panel armed a geo-follower for this import,
+                // capture the obj_id range of the newly-added objects so the
+                // sensor body rides the joint going forward.
+                if (sensor_state.follow.armed && urdf_artic_handle) {
+                    int lo = INT_MAX, hi = INT_MIN;
+                    for (int i = obj_count_before; i < (int)mesh.objects.size(); ++i) {
+                        int id = mesh.objects[i].obj_id;
+                        if (id < lo) lo = id;
+                        if (id > hi) hi = id;
+                    }
+                    if (hi >= lo) {
+                        sensor_geo_capture(sensor_state, urdf_artic_handle,
+                                           lo, hi, mesh.all_prims);
+                        // Apply once immediately so the sensor body snaps
+                        // onto the joint even before the first repose tick.
+                        if (sensor_geo_update(sensor_state, urdf_artic_handle,
+                                              mesh.all_prims)) {
+                            reupload_visible_prims(mesh);
+                            if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                                bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                            ++mesh.scene_version;
+                        }
+                    }
+                    sensor_state.follow.armed = false;
                 }
             }
         }
@@ -2799,6 +2844,7 @@ int main() {
                     if (a != ji[kb].angle) {
                         ji[kb].angle = a;
                         if (urdf_repose(urdf_artic_handle, mesh.all_prims)) {
+                            sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                             reupload_visible_prims(mesh);
                             if (mesh.d_bvh && !mesh.bvh_nodes.empty())
                                 bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
@@ -3183,6 +3229,7 @@ int main() {
             if (grab_needs_solve && grab_dragging >= 1) {
                 urdf_solve_ik_joint(urdf_artic_handle, grab_dragging, grab_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
+                sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
                 if (mesh.d_bvh && !mesh.bvh_nodes.empty())
                     bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
@@ -3192,6 +3239,7 @@ int main() {
             } else if (ik_needs_solve) {
                 urdf_solve_ik(urdf_artic_handle, ik_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
+                sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
                 if (mesh.d_bvh && !mesh.bvh_nodes.empty())
                     bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);

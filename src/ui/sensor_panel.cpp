@@ -1,6 +1,33 @@
 #include "sensor_panel.h"
+#include "sensor_loader.h"
+#include "control_panel.h"
 #include <imgui.h>
 #include <cmath>
+#include <cstring>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+
+static bool sensor_open_usd_dialog(char* out_path, int max_len)
+{
+    OPENFILENAMEA ofn = {};
+    out_path[0] = '\0';
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = nullptr;
+    ofn.lpstrFilter = "USD (*.usd;*.usda;*.usdc)\0*.usd;*.usda;*.usdc\0All Files\0*.*\0";
+    ofn.lpstrFile   = out_path;
+    ofn.nMaxFile    = max_len;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn) != 0;
+}
+#endif
 
 // ── GPU render-target management ─────────────────────────────────────────────
 // Sensor output is a standalone CUDA array (not Vulkan-interop — it's never
@@ -145,35 +172,59 @@ bool sensor_get_world_frame(const SensorState& state_in, UrdfArticulation* handl
 {
     if (!handle) return false;
 
-    // Refresh the axis cache iff the attachment changed.
+    // Refresh the axis cache iff the attachment changed. Any attach change
+    // also invalidates a USD-baked baseline, since it was authored for a
+    // specific joint.
     SensorState& state = const_cast<SensorState&>(state_in);
-    if (state.axis_cached_for != state.attach_joint)
+    if (state.axis_cached_for != state.attach_joint) {
+        state.has_base_pose = false;
         sensor_calibrate_axes(state, handle);
+    }
 
-    // Attached joint's world transform. Its columns are the joint's local
-    // axes — they rotate with the joint, and the cached indices below pick
-    // which of them are "forward" and "up" for this attachment.
+    // Attached joint's world transform. Used either to pull joint axes
+    // (heuristic path) or to push the stored joint-local baseline into world.
     float m[16];
     if (state.attach_joint < 0) urdf_fk_ee_transform(handle, m);
     else                        urdf_joint_world_transform(handle, state.attach_joint, m);
 
-    float3 j_pos = xform_origin(m);
-    float3 axes[3] = {
-        vnorm(make_float3(m[0], m[4], m[8])),
-        vnorm(make_float3(m[1], m[5], m[9])),
-        vnorm(make_float3(m[2], m[6], m[10])),
-    };
+    float3 origin, right, up, fwd;
 
-    float3 fwd = vmul(axes[state.fwd_ax], state.fwd_sign);
-    float3 up  = vmul(axes[state.up_ax],  state.up_sign);
+    if (state.has_base_pose) {
+        // USD-authored baseline: the camera_attach prim's pose stored in the
+        // joint's local frame. Transform back to world through m so it rides
+        // with the joint exactly (the same way the sensor geometry does).
+        auto lpos = [&](const float L[3]) {
+            return make_float3(
+                m[0]*L[0] + m[1]*L[1] + m[2] *L[2] + m[3],
+                m[4]*L[0] + m[5]*L[1] + m[6] *L[2] + m[7],
+                m[8]*L[0] + m[9]*L[1] + m[10]*L[2] + m[11]);
+        };
+        auto ldir = [&](const float L[3]) {
+            return vnorm(make_float3(
+                m[0]*L[0] + m[1]*L[1] + m[2] *L[2],
+                m[4]*L[0] + m[5]*L[1] + m[6] *L[2],
+                m[8]*L[0] + m[9]*L[1] + m[10]*L[2]));
+        };
+        origin = lpos(state.base_origin_local);
+        right  = ldir(state.base_right_local);
+        up     = ldir(state.base_up_local);
+        fwd    = ldir(state.base_fwd_local);
+    } else {
+        // Heuristic path: arm-direction + world-up axis calibration.
+        float3 j_pos = xform_origin(m);
+        float3 axes[3] = {
+            vnorm(make_float3(m[0], m[4], m[8])),
+            vnorm(make_float3(m[1], m[5], m[9])),
+            vnorm(make_float3(m[2], m[6], m[10])),
+        };
+        fwd   = vmul(axes[state.fwd_ax], state.fwd_sign);
+        up    = vmul(axes[state.up_ax],  state.up_sign);
+        right = vnorm(vcross(up,  fwd));
+        up    = vnorm(vcross(fwd, right));
+        origin = j_pos;
+    }
 
-    // Orthonormalize — right = up × fwd, up = fwd × right. The result is
-    // still expressed in the joint's local axes (just re-labeled), so the
-    // whole basis rotates with the joint.
-    float3 right = vnorm(vcross(up,    fwd));
-    up           = vnorm(vcross(fwd,   right));
-
-    // Apply rotation offsets in the derived frame:
+    // Apply rotation offsets in the baseline frame:
     // yaw around up, then pitch around (yaw-rotated) right, then roll around forward.
     const float D2R = 3.14159265358979323846f / 180.f;
     float yaw   = state.rot_deg[0] * D2R;
@@ -189,8 +240,8 @@ bool sensor_get_world_frame(const SensorState& state_in, UrdfArticulation* handl
     right = rot_axis(right, fwd, roll);
     up    = rot_axis(up,    fwd, roll);
 
-    // Translation offset applied in the final frame, centred on the joint origin.
-    float3 camo = vadd(j_pos,
+    // Translation offset applied in the final frame, centred on baseline origin.
+    float3 camo = vadd(origin,
                    vadd(vmul(right, state.offset[0]),
                    vadd(vmul(up,    state.offset[1]),
                         vmul(fwd,   state.offset[2]))));
@@ -221,7 +272,8 @@ static Camera sensor_camera_for_render(const SensorState& s,
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────
-void sensor_panel_draw(SensorState& state, UrdfArticulation* handle)
+void sensor_panel_draw(SensorState& state, UrdfArticulation* handle,
+                       ControlPanelState& ctrl)
 {
     if (!ImGui::Begin("Sensors")) { ImGui::End(); return; }
 
@@ -267,8 +319,10 @@ void sensor_panel_draw(SensorState& state, UrdfArticulation* handle)
         state.rot_deg[0] = state.rot_deg[1] = state.rot_deg[2] = 0.f;
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Recalibrate"))
+    if (ImGui::SmallButton("Recalibrate")) {
         state.axis_cached_for = -999;   // force re-pick on next frame
+        state.has_base_pose   = false;  // drop USD baseline, fall back to heuristic
+    }
 
     const int sizes[][2] = { {160, 120}, {320, 240}, {480, 360}, {640, 480} };
     int cur = 1;
@@ -286,6 +340,28 @@ void sensor_panel_draw(SensorState& state, UrdfArticulation* handle)
     ImGui::SetNextItemWidth(-1.f);
     if (ImGui::Combo("Corner", &corner_idx, corners, 4))
         state.corner = (SensorCorner)corner_idx;
+
+    // ── Load sensor from USD ────────────────────────────────────────────────
+    // Naming convention: root prim "sensor_camera_<joint>" with a child prim
+    // "camera_attach" whose world transform is where the virtual camera goes.
+    ImGui::Separator();
+#ifdef _WIN32
+    if (ImGui::Button("Load sensor USD...", ImVec2(-1.f, 0.f))) {
+        char path[MAX_PATH] = {0};
+        if (sensor_open_usd_dialog(path, (int)sizeof(path))) {
+            if (sensor_load_from_usd(path, handle, state)) {
+                // Also import the sensor's geometry (camera body, mount, etc.)
+                // into the scene so it's visible attached to the joint.
+                std::strncpy(ctrl.gltf_path, path, sizeof(ctrl.gltf_path) - 1);
+                ctrl.gltf_path[sizeof(ctrl.gltf_path) - 1] = '\0';
+                ctrl.import_requested = true;
+            }
+        }
+    }
+#endif
+    if (state.status[0]) {
+        ImGui::TextWrapped("%s", state.status);
+    }
 
     ImGui::End();
 }

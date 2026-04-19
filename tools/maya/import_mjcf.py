@@ -196,6 +196,55 @@ def _get_collision_shader():
     return _SHADER_CACHE["__collision__"]
 
 
+def _add_joint_locators(body, grp, factor):
+    """Create a spaceLocator per `<joint>` inside this body, named after the
+    joint, positioned at the joint's `pos` and with its +Z oriented along the
+    joint `axis`.
+
+    Why: MJCF authors `<body name="X_link">` with `<joint name="X_joint">`
+    nested inside. The CUDA/Vulkan app (via MuJoCo) exposes `<joint name>`s in
+    its sensor-attach dropdown — but without this step, Maya only has `_link`
+    transforms in the Outliner, so an artist authoring `sensor_camera_X_joint`
+    has no matching node to parent `camera_attach` under. These locators close
+    that gap: parent `camera_attach` under a joint locator and the names line
+    up with whatever `urdf_joint_info(h)[i].name` returns app-side.
+    """
+    for j in body.findall("joint"):
+        jname = j.get("name")
+        if not jname:
+            continue
+        pos  = _parse_vec(j.get("pos"),  (0.0, 0.0, 0.0))
+        axis = _parse_vec(j.get("axis"), (0.0, 0.0, 1.0))
+
+        # Rotate +Z onto the joint axis (Rodrigues, quat form). MJCF's default
+        # axis is +Z so this is identity for most joints; only non-Z axes
+        # actually rotate the locator.
+        ax, ay, az = axis
+        n = math.sqrt(ax*ax + ay*ay + az*az)
+        if n > 1e-9:
+            ax, ay, az = ax/n, ay/n, az/n
+        # Angle between +Z and axis; rotation axis = +Z × axis.
+        d = max(-1.0, min(1.0, az))
+        ang = math.acos(d)
+        rx_axis, ry_axis, rz_axis = -ay, ax, 0.0  # (0,0,1) × (ax,ay,az)
+        ra_n = math.sqrt(rx_axis*rx_axis + ry_axis*ry_axis)
+        if ra_n < 1e-6:
+            # +Z aligned with ±axis: identity or 180° around X for -Z.
+            if az < 0:
+                qw, qx, qy, qz = 0.0, 1.0, 0.0, 0.0
+            else:
+                qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
+        else:
+            rx_axis /= ra_n; ry_axis /= ra_n
+            s = math.sin(ang * 0.5)
+            qw = math.cos(ang * 0.5)
+            qx, qy, qz = rx_axis*s, ry_axis*s, rz_axis*s
+
+        loc = cmds.spaceLocator(name=jname)[0]
+        loc = cmds.parent(loc, grp)[0]
+        _set_trs(loc, pos, (qw, qx, qy, qz), factor)
+
+
 def _primitive_from_geom(attrs, name, factor):
     """Build a Maya primitive for a non-mesh collision <geom>. `attrs` is a
     dict with MJCF defaults already merged in. Returns the transform name or
@@ -324,6 +373,10 @@ def import_mjcf(mjcf_path, root_name=None, add_floor=True, add_key_light=True,
         grp = cmds.group(empty=True, name=name)
         grp = cmds.parent(grp, parent)[0]
         _set_trs(grp, pos, quat, factor)
+
+        # Joint-named locators: one per `<joint>` child, as an anchor for
+        # sensor/camera attachments authored against the app's joint names.
+        _add_joint_locators(body, grp, factor)
 
         for i, g in enumerate(body.findall("geom")):
             attrs = _resolve_geom(g, geom_defaults)

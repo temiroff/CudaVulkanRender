@@ -9,6 +9,12 @@ so any extra parts authored in Maya line up 1:1 after export.
 ### What it builds
 - A transform for every `<body>`, parented to match the MJCF tree, with local
   `pos` and `quat` applied.
+- A `spaceLocator` for every `<joint>`, named after the joint and parented
+  under its owning body. Positioned at `joint.pos` with +Z aligned to
+  `joint.axis`. Use these as attach anchors when authoring `sensor_camera_*`
+  rigs — the CUDA/Vulkan app's sensor dropdown lists `<joint name>`s (not
+  `<body name>`s), so parenting `camera_attach` under the joint locator keeps
+  the names in sync on both ends of the pipeline.
 - Every `class="visual"` (or unclassed) mesh geom imported from disk (STL/OBJ
   via `<compiler meshdir>`), materials applied from `<asset>/<material rgba>`.
 - Every `class="collision"` geom (including primitives — `box` / `sphere` /

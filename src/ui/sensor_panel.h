@@ -4,6 +4,30 @@
 #include "../urdf_loader.h"
 #include "../rasterizer.h"
 #include <cuda_runtime.h>
+#include <vector>
+
+struct ControlPanelState;
+
+// ── Rigid-body follower for the sensor's USD geometry ────────────────────────
+// Captures triangle positions in the *attach joint's* local frame at load time
+// so the geo rides with the joint exactly like it was parented under it. Kept
+// independent of the sensor's offset/rotation sliders — those move only the
+// virtual camera (gizmo + rendering), never the physical geometry.
+struct SensorGeoFollow {
+    bool   armed        = false;   // panel requested capture; main loop snapshots after import
+    bool   active       = false;   // follower engaged; update each frame
+    int    obj_id_start = 0;       // inclusive obj_id range owned by this sensor
+    int    obj_id_end   = -1;
+    int    joint_idx    = -1;      // -1 = end-effector; else urdf joint index
+    std::vector<int>    tri_idx;   // indices into MeshState::all_prims
+    std::vector<float3> v_local;   // 3 per triangle (joint-local positions)
+    std::vector<float3> n_local;   // 3 per triangle (joint-local normals)
+
+    // Last applied joint world matrix (16 floats, row-major). Used to skip
+    // redundant per-frame updates when the joint hasn't actually moved.
+    float cached_mj[16] = {0};
+    bool  has_cached    = false;
+};
 
 // ── Gripper camera sensor ────────────────────────────────────────────────────
 // A small rasterized view attached to the articulation's end-effector, blitted
@@ -51,10 +75,30 @@ struct SensorState {
     int   up_ax           = 1;
     float fwd_sign        = 1.f;
     float up_sign         = 1.f;
+
+    // USD-authored baseline (from "Load sensor USD..."). When set, the gizmo's
+    // zero-offset pose is read directly from these joint-local vectors instead
+    // of the arm-direction heuristic — so the gizmo at offset=0 lands exactly
+    // on the `camera_attach` prim. Offset/rotation sliders apply *on top* of
+    // this baseline. Cleared by Recalibrate or attach_joint change.
+    bool  has_base_pose          = false;
+    float base_origin_local[3]   = {0.f, 0.f, 0.f};
+    float base_right_local[3]    = {1.f, 0.f, 0.f};
+    float base_up_local[3]       = {0.f, 1.f, 0.f};
+    float base_fwd_local[3]      = {0.f, 0.f, 1.f};
+
+    // Status line for the "Load sensor USD…" button. Persisted here so the
+    // message stays visible until the next load attempt.
+    char  status[256]     = {0};
+
+    // Follower for the sensor's imported USD geometry.
+    SensorGeoFollow follow;
 };
 
 // Draw the Sensors ImGui panel (enable/disable, fov, offset, corner).
-void sensor_panel_draw(SensorState& state, UrdfArticulation* handle);
+// `ctrl` is used by "Load sensor USD…" to request a scene import.
+void sensor_panel_draw(SensorState& state, UrdfArticulation* handle,
+                       ControlPanelState& ctrl);
 
 // Render the sensor into its private surface, then blit it with a white
 // border into a corner of `main_surface`. No-op if disabled or no handle.
