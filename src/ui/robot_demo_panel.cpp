@@ -172,7 +172,17 @@ bool robot_demo_tick(RobotDemoState& state, UrdfArticulation* handle, float dt)
 
     // Attach/detach keyframing — raise an intent whenever we cross a
     // transition; main.cpp consumes it alongside the button-driven ones.
-    bool want_attached = sample_attached(state.waypoints, state.playback_time);
+    // Backwards-compat: if the loaded trajectory never sets attached=true
+    // anywhere (saved before the flag existed, or user only used gripper
+    // close/open), fall back to treating gripper_closed as the attach
+    // signal so old recordings still pick objects up on replay.
+    bool any_keyed_attach = false;
+    for (const auto& w : state.waypoints) {
+        if (w.attached) { any_keyed_attach = true; break; }
+    }
+    bool want_attached = any_keyed_attach
+        ? sample_attached(state.waypoints, state.playback_time)
+        : gripper_closed;
     if (want_attached != state.prev_attached) {
         if (want_attached) state.request_attach = true;
         else               state.request_detach = true;

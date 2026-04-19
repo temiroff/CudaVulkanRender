@@ -1922,6 +1922,29 @@ int main() {
                     }
                 }
             }
+
+            // ── Props physics (auxiliary MuJoCo world for dropped objects) ─
+            // Separate from the robot sim — this is what simulates objects
+            // the gripper detaches. Always on; the Stop button clears any
+            // in-flight bodies and kills gravity (objects freeze in place).
+            ImGui::Separator();
+            ImGui::Text("Props Physics");
+            if (props_physics_available()) {
+                int n_falling = (int)robot_demo.falling.size();
+                if (n_falling > 0) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.f, 0.3f, 1.f),
+                                       "Running — %d body(s) falling", n_falling);
+                } else {
+                    ImGui::TextDisabled("Idle (no detached props)");
+                }
+                if (ImGui::Button("Stop Props Sim")) {
+                    if (props_world) props_physics_clear(props_world);
+                    robot_demo.falling.clear();
+                }
+            } else {
+                ImGui::TextDisabled("MuJoCo not available");
+            }
+
             ImGui::End();
 
             // Step physics, then render from MuJoCo's per-body world transforms.
@@ -2005,13 +2028,13 @@ int main() {
 
             // ── Free-fall integrator ─────────────────────────────────────
             // Runs every frame so detached objects keep falling even when
-            // no other pose change is happening. Ignored while sim backend
-            // owns the scene (MuJoCo handles physics itself then).
-            bool falling_moved = false;
-            if (!sim_running) {
-                falling_moved = robot_demo_update_falling(
-                    robot_demo, props_world, dt, prims_sorted, mesh.objects, mesh.all_prims);
-            }
+            // no other pose change is happening. Props live in their own
+            // MuJoCo world, independent of the robot sim backend — the
+            // two never share bodies — so this must run even when
+            // sim_running is true (otherwise dropped cubes freeze in
+            // mid-air as soon as the robot sim is started).
+            bool falling_moved = robot_demo_update_falling(
+                robot_demo, props_world, dt, prims_sorted, mesh.objects, mesh.all_prims);
 
             if (attach_changed || falling_moved) {
                 reupload_visible_prims(mesh);
