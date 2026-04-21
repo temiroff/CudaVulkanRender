@@ -3510,6 +3510,7 @@ int main() {
                 ik_solved = true;
             } else if (ik_needs_solve) {
                 urdf_set_ik_ground_y(urdf_artic_handle, robot_demo.ground_y);
+                urdf_set_ik_view_hint(urdf_artic_handle, make_float3(-cam.w.x, -cam.w.y, -cam.w.z));
                 urdf_solve_ik_pose(urdf_artic_handle, ik_target, ik_target_rot, 80, 0.005f);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
                 sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);

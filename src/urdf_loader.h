@@ -33,9 +33,30 @@ struct UrdfJointInfo {
     float angle;         // current value (radians or meters)
 };
 
+struct UrdfIkYawDebug {
+    bool  valid;
+    int   joint_idx;
+    int   chain_idx;
+    char  joint_name[64];
+    char  reason[96];
+    float axis_world[3];
+    float joint_world[3];
+    float ee_world[3];
+    float target_world[3];
+    float reach_max;
+    float radial_gate;
+    float extension_gate;
+    float target_gate;
+    float yaw_err;
+    float yaw_gain;
+    float yaw_step;
+    float drive_dot;
+};
+
 // Get the list of articulated joints (excludes fixed joints).
 int  urdf_joint_count(const UrdfArticulation* h);
 UrdfJointInfo* urdf_joint_info(UrdfArticulation* h);  // array of joint_count
+bool urdf_ik_yaw_debug(UrdfArticulation* h, UrdfIkYawDebug* out);
 
 // Get the world-space position of the end-effector (deepest leaf link origin).
 float3 urdf_end_effector_pos(UrdfArticulation* h);
@@ -79,6 +100,9 @@ int urdf_ik_chain_length(UrdfArticulation* h);
 // Set a floor Y height so the IK solver adds null-space repulsion when any
 // joint position would go below it. Pass -FLT_MAX (default) to disable.
 void urdf_set_ik_ground_y(UrdfArticulation* h, float ground_y);
+// Optional viewport hint for interactive IK. view_dir is camera forward in
+// world space. Looking down from above makes side drags prefer base yaw.
+void urdf_set_ik_view_hint(UrdfArticulation* h, float3 view_dir);
 
 const char* urdf_get_ee_link_name(const UrdfArticulation* h);
 void        urdf_set_ee_link_name(UrdfArticulation* h, const char* link_name);

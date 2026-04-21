@@ -1269,6 +1269,13 @@ UrdfJointInfo* urdf_joint_info(UrdfArticulation* h) {
     return h && !h->joint_infos.empty() ? h->joint_infos.data() : nullptr;
 }
 
+bool urdf_ik_yaw_debug(UrdfArticulation* h, UrdfIkYawDebug* out)
+{
+    if (!h || !out) return false;
+    *out = h->ik_yaw_debug;
+    return out->valid;
+}
+
 float3 urdf_end_effector_pos(UrdfArticulation* h)
 {
     // Returns the cached ee position computed during the last urdf_repose() call.
@@ -1473,6 +1480,18 @@ int urdf_ik_lock_joint(UrdfArticulation* h)
 void urdf_set_ik_ground_y(UrdfArticulation* h, float ground_y)
 {
     if (h) h->ik_ground_y = ground_y;
+}
+
+void urdf_set_ik_view_hint(UrdfArticulation* h, float3 view_dir)
+{
+    if (!h) return;
+    float len = sqrtf(view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z);
+    if (len <= 1e-6f) {
+        h->ik_view_topdown = 0.f;
+        return;
+    }
+    float down = fmaxf(0.f, -view_dir.y / len);
+    h->ik_view_topdown = fmaxf(0.f, fminf(1.f, (down - 0.45f) / 0.40f));
 }
 
 const char* urdf_get_ee_link_name(const UrdfArticulation* h)
@@ -1803,8 +1822,16 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                             const Mat4* ee_rot_target = nullptr)
 {
     if (!h) return false;
+    h->ik_yaw_debug = {};
+    h->ik_yaw_debug.valid = true;
+    h->ik_yaw_debug.joint_idx = -1;
+    h->ik_yaw_debug.chain_idx = -1;
+    snprintf(h->ik_yaw_debug.reason, sizeof(h->ik_yaw_debug.reason), "not evaluated");
     std::vector<IKChainEntry> chain;
-    if (!ik_collect_chain(h, chain) || chain.empty()) return false;
+    if (!ik_collect_chain(h, chain) || chain.empty()) {
+        snprintf(h->ik_yaw_debug.reason, sizeof(h->ik_yaw_debug.reason), "empty IK chain");
+        return false;
+    }
 
     UrdfJointInfo* joints = h->joint_infos.data();
     const float PI          = 3.14159265f;
@@ -1837,23 +1864,28 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
     const int N = (int)use_ci.size();
     if (N == 0) return false;
 
-    // Weighted DLS: per-joint stiffness w[k] (higher = harder to move). The
-    // first two driven revolute joints on a serial arm (base twist, shoulder
-    // pitch on Panda/UR/Kinova) swing through the largest arcs in world space
-    // and dominate the unweighted least-squares solution. Up-weighting them
-    // pushes IK to prefer moving the elbow/wrist instead. Implemented by
-    // scaling Jacobian columns by 1/sqrt(w) so the existing DLS math works
-    // unchanged; final Δq is rescaled on step application.
+    // Weighted DLS. Keep the base neutral so side drags can yaw naturally, but
+    // make short-lever flex joints cheaper so position IK still folds wrists
+    // and elbows instead of solving only with shoulder joints.
     std::vector<float> inv_sqrt_w(N, 1.f);
-    {
-        int rev_seen = 0;
-        for (int k = 0; k < N; ++k) {
-            int ji = chain[use_ci[k]].ji;
-            if (joints[ji].type != 0) continue;   // revolute only
-            if (rev_seen == 0)      inv_sqrt_w[k] = 1.f / sqrtf(5.0f);
-            else if (rev_seen == 1) inv_sqrt_w[k] = 1.f / sqrtf(2.5f);
-            ++rev_seen;
-        }
+    for (int k = 0; k < N; ++k) {
+        int ji = chain[use_ci[k]].ji;
+        if (ji < 0) continue;
+        if (joints[ji].type != 0 && joints[ji].type != 2) continue;
+        std::string name = joints[ji].name;
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (name.find("wrist_flex") != std::string::npos ||
+            (name.find("wrist") != std::string::npos &&
+             name.find("flex")  != std::string::npos))
+            inv_sqrt_w[k] = sqrtf(4.0f);
+        else if (name.find("elbow") != std::string::npos ||
+                 name.find("forearm") != std::string::npos)
+            inv_sqrt_w[k] = sqrtf(2.0f);
+        else if (name.find("lift") != std::string::npos ||
+                 (name.find("shoulder") != std::string::npos &&
+                  name.find("pan") == std::string::npos))
+            inv_sqrt_w[k] = 1.f / sqrtf(1.8f);
     }
 
     // Orientation constraints — one per user-frozen joint that has at
@@ -1883,6 +1915,7 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
     std::vector<float>  A((size_t)M * M, 0.f);
     std::vector<float>  y((size_t)M, 0.f);
     std::vector<float>  dq((size_t)N, 0.f);
+    std::vector<float>  qdirect_real((size_t)N, 0.f);
 
     bool   reach_init = false;
     float3 base_pos   = make_float3(0, 0, 0);
@@ -1943,6 +1976,13 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
         float ey = tgt.y - point.y;
         float ez = tgt.z - point.z;
         float err_p = sqrtf(ex*ex + ey*ey + ez*ez);
+        float ee_rot_weight = 1.f;
+        if (have_ee_rot) {
+            // Viewport handle rotation is a preference, not a hard task. When
+            // the handle is far from the current EE position, favor reaching
+            // and base yaw; restore orientation preservation as it gets close.
+            ee_rot_weight = 0.12f + 0.88f * fmaxf(0.f, fminf(1.f, (0.16f - err_p) / 0.12f));
+        }
 
         // Per-constraint angular errors (world frame).
         std::vector<float> aerr((size_t)(3 * K), 0.f);
@@ -1999,9 +2039,9 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             e[3 + 3*c + 2] = aerr[3*c + 2];
         }
         if (have_ee_rot) {
-            e[ee_rot_row + 0] = ee_aerr[0];
-            e[ee_rot_row + 1] = ee_aerr[1];
-            e[ee_rot_row + 2] = ee_aerr[2];
+            e[ee_rot_row + 0] = ee_rot_weight * ee_aerr[0];
+            e[ee_rot_row + 1] = ee_rot_weight * ee_aerr[1];
+            e[ee_rot_row + 2] = ee_rot_weight * ee_aerr[2];
         }
 
         // Build the M×N Jacobian.
@@ -2038,9 +2078,9 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             // the chain is upstream of the EE (target_ci < 0 ⇒ use_limit spans
             // the whole chain), so the angular contribution is the world axis.
             if (have_ee_rot && t != 1) {
-                J[(ee_rot_row+0)*N + k] = ax.x;
-                J[(ee_rot_row+1)*N + k] = ax.y;
-                J[(ee_rot_row+2)*N + k] = ax.z;
+                J[(ee_rot_row+0)*N + k] = ee_rot_weight * ax.x;
+                J[(ee_rot_row+1)*N + k] = ee_rot_weight * ax.y;
+                J[(ee_rot_row+2)*N + k] = ee_rot_weight * ax.z;
             }
         }
 
@@ -2078,20 +2118,40 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             for (int r = 0; r < M; ++r) s += J[r*N + k] * y[r];
             dq[k] = s;
         }
+        std::fill(qdirect_real.begin(), qdirect_real.end(), 0.f);
 
-        // Mild null-space bias toward joint center. Keep this only while the
-        // arm is comfortably inside its workspace; near full extension the
-        // user is explicitly asking to reach the boundary, so do not fold the
-        // joints away from their limits.
+        // Mild null-space bias toward joint center. The important detail is
+        // that the gain is based on the target's requested extension, not the
+        // current arm extension: when the arm is straight and the user drags
+        // back inward, this immediately reintroduces a fold direction so the
+        // solver can escape the singular straight-line pose.
         {
-            float extension = 0.f;
+            float target_extension = 0.f;
             if (reach_init && reach_max > 1e-6f) {
-                float dx = point.x - base_pos.x;
-                float dy = point.y - base_pos.y;
-                float dz = point.z - base_pos.z;
-                extension = sqrtf(dx*dx + dy*dy + dz*dz) / reach_max;
+                float dx = tgt.x - base_pos.x;
+                float dy = tgt.y - base_pos.y;
+                float dz = tgt.z - base_pos.z;
+                target_extension = sqrtf(dx*dx + dy*dy + dz*dz) / reach_max;
             }
-            float bias_gain = 0.04f * fmaxf(0.f, 1.f - extension / 0.85f);
+            float side_yaw_gate = 0.f;
+            if (reach_init && reach_max > 1e-6f && target_ci < 0) {
+                float cx = point.x - base_pos.x;
+                float cz = point.z - base_pos.z;
+                float tx = tgt.x - base_pos.x;
+                float tz = tgt.z - base_pos.z;
+                float clen = sqrtf(cx*cx + cz*cz);
+                float tlen = sqrtf(tx*tx + tz*tz);
+                if (clen > 1e-5f && tlen > 1e-5f) {
+                    float cross_y = cx * tz - cz * tx;
+                    float dot_xz = cx * tx + cz * tz;
+                    float yaw_err = fabsf(atan2f(cross_y, dot_xz));
+                    float radial_gate = fmaxf(0.f, fminf(1.f, (tlen / reach_max - 0.18f) / 0.32f));
+                    float radial_delta = fabsf(tlen - clen) / reach_max;
+                    float same_radius_gate = fmaxf(0.f, 1.f - radial_delta / (0.20f + 0.20f * h->ik_view_topdown));
+                    side_yaw_gate = fminf(1.f, yaw_err / 0.35f) * radial_gate * same_radius_gate;
+                }
+            }
+            float bias_gain = 0.08f * fmaxf(0.f, 1.f - target_extension / 0.98f);
             std::vector<float> qb((size_t)N, 0.f);
             for (int k = 0; k < N; ++k) {
                 UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
@@ -2099,9 +2159,115 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                 float lo = info.lower, hi = info.upper;
                 if (!(hi > lo)) continue;       // skip unlimited/degenerate
                 float center = 0.5f * (lo + hi);
+                float range = hi - lo;
+                std::string name = info.name;
+                std::transform(name.begin(), name.end(), name.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                bool is_wrist_flex =
+                    name.find("wrist_flex") != std::string::npos ||
+                    (name.find("wrist") != std::string::npos &&
+                     name.find("flex")  != std::string::npos);
+                bool is_other_flex =
+                    !is_wrist_flex && name.find("flex") != std::string::npos;
+                float preferred = center;
+                if (is_wrist_flex) {
+                    // SO101-style wrists have symmetric limits around zero,
+                    // so "center" means perfectly straight. Prefer a modest
+                    // bend when the task has spare DOF; it fades out at full reach.
+                    preferred = center + 0.28f * range;
+                } else if (is_other_flex) {
+                    preferred = center + 0.18f * range;
+                }
+                float dist_to_limit = fminf(info.angle - lo, hi - info.angle);
+                float limit_escape = (range > 1e-6f)
+                    ? fmaxf(0.f, 1.f - dist_to_limit / (0.10f * range))
+                    : 0.f;
                 // qb is in weighted space (q̃b = W^(1/2)·qb_joint), so divide
                 // the joint-space bias by inv_sqrt_w[k] = 1/√w.
-                qb[k] = bias_gain * (center - info.angle) / inv_sqrt_w[k];
+                float flex_gain = (is_wrist_flex ? 0.22f : (is_other_flex ? 0.10f : 0.f)) *
+                                  fmaxf(0.f, 1.f - target_extension / 0.995f);
+                if (is_wrist_flex || is_other_flex)
+                    flex_gain += side_yaw_gate * (is_wrist_flex ? 0.22f : 0.14f);
+                qb[k] = ((bias_gain + flex_gain) * (preferred - info.angle) +
+                         0.04f * limit_escape * (center - info.angle)) /
+                        inv_sqrt_w[k];
+            }
+
+            // Side-drag recovery. A small base-yaw seed helps the arm start
+            // turning toward sideways targets, but it fades near the base so
+            // crossing through/behind the root does not cause a flip.
+            if (reach_init && reach_max > 1e-6f && target_ci < 0 && N > 0) {
+                float cx = point.x - base_pos.x;
+                float cz = point.z - base_pos.z;
+                float tx = tgt.x - base_pos.x;
+                float tz = tgt.z - base_pos.z;
+                float clen = sqrtf(cx*cx + cz*cz);
+                float tlen = sqrtf(tx*tx + tz*tz);
+                float extension_now = sqrtf(cx*cx + (point.y - base_pos.y) * (point.y - base_pos.y) + cz*cz) / reach_max;
+                float target_extension = sqrtf(tx*tx + (tgt.y - base_pos.y) * (tgt.y - base_pos.y) + tz*tz) / reach_max;
+                float radial_gate = fmaxf(0.f, fminf(1.f, (tlen / reach_max - 0.18f) / 0.32f));
+                UrdfIkYawDebug& yd = h->ik_yaw_debug;
+                yd.ee_world[0] = point.x; yd.ee_world[1] = point.y; yd.ee_world[2] = point.z;
+                yd.target_world[0] = tgt.x; yd.target_world[1] = tgt.y; yd.target_world[2] = tgt.z;
+                yd.reach_max = reach_max;
+                yd.radial_gate = radial_gate;
+                yd.extension_gate = fmaxf(0.f, fminf(1.f, extension_now));
+                yd.target_gate = fmaxf(0.f, fminf(1.f, target_extension));
+                snprintf(yd.reason, sizeof(yd.reason), "searching");
+                if (clen > 1e-5f && tlen > 1e-5f && radial_gate > 0.f) {
+                    float cross_y = cx * tz - cz * tx;
+                    float dot_xz = cx * tx + cz * tz;
+                    float yaw_err = atan2f(cross_y, dot_xz);
+                    yd.yaw_err = yaw_err;
+                    if (fabsf(yaw_err) > 0.005f) {
+                        for (int k = 0; k < N; ++k) {
+                            int ji = chain[use_ci[k]].ji;
+                            if (joints[ji].type != 0 && joints[ji].type != 2) continue;
+                            float3 ax = jaxis[use_ci[k]];
+                            float rx = point.x - jpos[use_ci[k]].x;
+                            float ry = point.y - jpos[use_ci[k]].y;
+                            float rz = point.z - jpos[use_ci[k]].z;
+                            float vx = ax.y*rz - ax.z*ry;
+                            float vz = ax.x*ry - ax.y*rx;
+                            float ex_h = tx - cx;
+                            float ez_h = tz - cz;
+                            float vlen = sqrtf(vx*vx + vz*vz);
+                            float elen = sqrtf(ex_h*ex_h + ez_h*ez_h);
+                            if (vlen < 1e-6f || elen < 1e-6f) continue;
+                            float drive_sign = (vx*ex_h + vz*ez_h) >= 0.f ? 1.f : -1.f;
+                            float extension_gate = fmaxf(0.f, fminf(1.f, extension_now));
+                            float target_gate = fmaxf(0.f, fminf(1.f, target_extension));
+                            float topdown_boost = 1.f + 1.25f * h->ik_view_topdown;
+                            float yaw_gain = (0.08f + 0.22f * extension_gate) * target_gate * radial_gate * topdown_boost;
+                            float yaw_step = yaw_gain * fabsf(yaw_err) * drive_sign;
+                            yd.joint_idx = ji;
+                            yd.chain_idx = use_ci[k];
+                            snprintf(yd.joint_name, sizeof(yd.joint_name), "%s", joints[ji].name);
+                            snprintf(yd.reason, sizeof(yd.reason), "driving");
+                            yd.axis_world[0] = ax.x; yd.axis_world[1] = ax.y; yd.axis_world[2] = ax.z;
+                            yd.joint_world[0] = jpos[use_ci[k]].x;
+                            yd.joint_world[1] = jpos[use_ci[k]].y;
+                            yd.joint_world[2] = jpos[use_ci[k]].z;
+                            yd.yaw_gain = yaw_gain;
+                            yd.yaw_step = yaw_step;
+                            yd.drive_dot = vx*ex_h + vz*ez_h;
+                            qb[k] += yaw_step / inv_sqrt_w[k];
+                            qdirect_real[k] += 0.45f * yaw_step;
+                            break;
+                        }
+                        if (yd.joint_idx < 0)
+                            snprintf(yd.reason, sizeof(yd.reason), "no horizontal joint leverage");
+                    } else {
+                        snprintf(yd.reason, sizeof(yd.reason), "yaw error small");
+                    }
+                } else if (radial_gate <= 0.f) {
+                    snprintf(yd.reason, sizeof(yd.reason), "near base gated");
+                } else {
+                    snprintf(yd.reason, sizeof(yd.reason), "zero horizontal length");
+                }
+            } else {
+                snprintf(h->ik_yaw_debug.reason, sizeof(h->ik_yaw_debug.reason),
+                         target_ci < 0 ? "reach unavailable" : "joint-dot IK target");
             }
             // J qb  (M)
             std::vector<float> Jqb((size_t)M, 0.f);
@@ -2190,6 +2356,10 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
         for (int k = 0; k < N; ++k) {
             UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
             info.angle += scale * dq[k] * inv_sqrt_w[k];
+            // Pose IK can leave little true null space on 5-DOF arms. Apply
+            // the measured base-yaw seed after the DLS scale cap as a small
+            // real joint-space hint, so it cannot be scaled down to zero.
+            info.angle += qdirect_real[k];
             clamp_joint(info, PI);
         }
     }

@@ -249,6 +249,29 @@ bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active,
         }
     }
 
+    {
+        UrdfIkYawDebug yd{};
+        urdf_ik_yaw_debug(handle, &yd);
+        if (ImGui::CollapsingHeader("IK yaw debug")) {
+            ImGui::Text("State: %s", yd.reason[0] ? yd.reason : "none");
+            ImGui::Text("Joint: %s  idx=%d chain=%d",
+                        yd.joint_name[0] ? yd.joint_name : "-",
+                        yd.joint_idx, yd.chain_idx);
+            ImGui::Text("Axis world: %.3f  %.3f  %.3f",
+                        yd.axis_world[0], yd.axis_world[1], yd.axis_world[2]);
+            ImGui::Text("Joint pos:  %.3f  %.3f  %.3f",
+                        yd.joint_world[0], yd.joint_world[1], yd.joint_world[2]);
+            ImGui::Text("EE pos:     %.3f  %.3f  %.3f",
+                        yd.ee_world[0], yd.ee_world[1], yd.ee_world[2]);
+            ImGui::Text("Target:     %.3f  %.3f  %.3f",
+                        yd.target_world[0], yd.target_world[1], yd.target_world[2]);
+            ImGui::Text("Gates: radial %.2f  ext %.2f  target %.2f",
+                        yd.radial_gate, yd.extension_gate, yd.target_gate);
+            ImGui::Text("Yaw err %.3f  gain %.3f  step %.4f  dot %.4f",
+                        yd.yaw_err, yd.yaw_gain, yd.yaw_step, yd.drive_dot);
+        }
+    }
+
     // Keyboard joint — which joint [ / ] drives. "Follow IK lock" keeps the
     // legacy behavior; picking a specific joint decouples keyboard control
     // from the IK-lock choice so the user can nudge any joint by hand.

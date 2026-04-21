@@ -170,6 +170,7 @@ struct UrdfArticulation {
     // Optional floor height for IK ground repulsion. Set via
     // urdf_set_ik_ground_y(); default -FLT_MAX = disabled.
     float                                     ik_ground_y  = -1e30f;
+    float                                     ik_view_topdown = 0.f;
 
     // Primary locked joint — excluded from IK. -1 = auto (last movable).
     // Index into joint_infos.
@@ -185,6 +186,8 @@ struct UrdfArticulation {
     // the moment the lock was enabled — it's the orientation target.
     std::vector<uint8_t>                      ik_locked_mask;
     std::vector<Mat4>                         ik_locked_rot;
+
+    UrdfIkYawDebug                            ik_yaw_debug{};
 
     int                                       total_tris = 0;
 };
