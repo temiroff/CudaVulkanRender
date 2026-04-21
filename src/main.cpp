@@ -295,6 +295,138 @@ static int pick_mesh_object(const std::vector<Triangle>& tris,
     return -1;
 }
 
+struct MeshFaceHit {
+    bool   hit     = false;
+    int    obj_idx = -1;
+    int    tri_idx = -1;
+    float  t       = 1e20f;
+    float  u       = 0.f;
+    float  v       = 0.f;
+    int    normal_sign = 1;
+    float3 p       = {0, 0, 0};
+    float3 n       = {0, 1, 0};
+};
+
+static MeshFaceHit pick_mesh_face(const std::vector<Triangle>& tris,
+                                  const std::vector<MeshObject>& objects,
+                                  float3 origin, float3 dir)
+{
+    MeshFaceHit best;
+
+    for (int ti = 0; ti < (int)tris.size(); ++ti) {
+        const Triangle& tri = tris[ti];
+        float3 e1 = { tri.v1.x - tri.v0.x, tri.v1.y - tri.v0.y, tri.v1.z - tri.v0.z };
+        float3 e2 = { tri.v2.x - tri.v0.x, tri.v2.y - tri.v0.y, tri.v2.z - tri.v0.z };
+        float3 h  = cross(dir, e2);
+        float  a  = dot(e1, h);
+        if (fabsf(a) < 1e-8f) continue;
+        float  f  = 1.f / a;
+        float3 s  = { origin.x - tri.v0.x, origin.y - tri.v0.y, origin.z - tri.v0.z };
+        float  u  = f * dot(s, h);
+        if (u < 0.f || u > 1.f) continue;
+        float3 q  = cross(s, e1);
+        float  v  = f * dot(dir, q);
+        if (v < 0.f || u + v > 1.f) continue;
+        float  t  = f * dot(e2, q);
+        if (t < 1e-3f || t >= best.t) continue;
+
+        int obj_idx = -1;
+        for (int i = 0; i < (int)objects.size(); ++i) {
+            if (objects[i].obj_id == tri.obj_id) {
+                obj_idx = i;
+                break;
+            }
+        }
+        if (obj_idx < 0 || objects[obj_idx].hidden) continue;
+
+        float3 n = normalize(cross(e1, e2));
+        int normal_sign = 1;
+        if (dot(n, dir) > 0.f) {
+            n = make_float3(-n.x, -n.y, -n.z);
+            normal_sign = -1;
+        }
+
+        best.hit     = true;
+        best.obj_idx = obj_idx;
+        best.tri_idx = ti;
+        best.t       = t;
+        best.u       = u;
+        best.v       = v;
+        best.normal_sign = normal_sign;
+        best.p       = make_float3(origin.x + dir.x * t,
+                                   origin.y + dir.y * t,
+                                   origin.z + dir.z * t);
+        best.n       = n;
+    }
+
+    return best;
+}
+
+static bool tracked_face_from_triangle(const std::vector<Triangle>& tris,
+                                       int tri_idx, float u, float v,
+                                       int normal_sign,
+                                       float3& p, float3& n)
+{
+    if (tri_idx < 0 || tri_idx >= (int)tris.size()) return false;
+    const Triangle& tri = tris[tri_idx];
+    float w = 1.f - u - v;
+    p = make_float3(w * tri.v0.x + u * tri.v1.x + v * tri.v2.x,
+                    w * tri.v0.y + u * tri.v1.y + v * tri.v2.y,
+                    w * tri.v0.z + u * tri.v1.z + v * tri.v2.z);
+    n = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+    if (normal_sign < 0)
+        n = make_float3(-n.x, -n.y, -n.z);
+    return true;
+}
+
+static void update_robot_demo_face_picks(RobotDemoState& state,
+                                         UrdfArticulation* handle,
+                                         const std::vector<Triangle>& tris)
+{
+    if (!handle) return;
+
+    if (state.grip_face_set && state.grip_face_tri_idx >= 0) {
+        float3 p, n;
+        if (tracked_face_from_triangle(tris, state.grip_face_tri_idx,
+                                       state.grip_face_bary[0],
+                                       state.grip_face_bary[1],
+                                       state.grip_face_normal_sign, p, n))
+        {
+            float m[16];
+            urdf_fk_ee_transform(handle, m);
+            float3 ee = make_float3(m[3], m[7], m[11]);
+            float3 rel = make_float3(p.x - ee.x, p.y - ee.y, p.z - ee.z);
+            state.grip_local[0] = m[0]*rel.x + m[4]*rel.y + m[8]*rel.z;
+            state.grip_local[1] = m[1]*rel.x + m[5]*rel.y + m[9]*rel.z;
+            state.grip_local[2] = m[2]*rel.x + m[6]*rel.y + m[10]*rel.z;
+            state.grip_face_normal_local[0] = m[0]*n.x + m[4]*n.y + m[8]*n.z;
+            state.grip_face_normal_local[1] = m[1]*n.x + m[5]*n.y + m[9]*n.z;
+            state.grip_face_normal_local[2] = m[2]*n.x + m[6]*n.y + m[10]*n.z;
+        }
+    }
+
+    if (state.pick_face_set && state.pick_face_tri_idx >= 0) {
+        float3 p, n;
+        if (tracked_face_from_triangle(tris, state.pick_face_tri_idx,
+                                       state.pick_face_bary[0],
+                                       state.pick_face_bary[1],
+                                       state.pick_face_normal_sign, p, n))
+        {
+            state.pick_face_world_pos[0] = p.x;
+            state.pick_face_world_pos[1] = p.y;
+            state.pick_face_world_pos[2] = p.z;
+            state.pick_face_world_normal[0] = n.x;
+            state.pick_face_world_normal[1] = n.y;
+            state.pick_face_world_normal[2] = n.z;
+        }
+    }
+}
+
+static bool mesh_object_is_movable(const MeshObject& obj)
+{
+    return !obj.hidden && !obj.is_robot_part && !obj.environment;
+}
+
 // Ray-cast to find the exact world-space surface hit point.
 // Tests mesh triangles first (if any), then spheres. Returns true on hit.
 static bool pick_surface_point(
@@ -2027,14 +2159,40 @@ int main() {
             bool attach_changed = false;
             if (robot_demo.request_attach) {
                 robot_demo.request_attach = false;
-                if (robot_demo_force_attach(robot_demo, urdf_artic_handle,
-                                            prims_sorted, mesh.objects, mesh.all_prims)) {
-                    attach_changed = true;
+                // Planned snap-attach wins over the generic nearest-search:
+                // Pick & Place set planned_pick_* so the specific cube is
+                // teleported to the EE origin, avoiding a visible gap when
+                // IK tolerance / orientation fallback leaves the EE slightly
+                // off the cube at attach time.
+                bool ok = false;
+                if (robot_demo.planned_pick_valid) {
+                    ok = robot_demo_snap_attach(
+                        robot_demo, urdf_artic_handle,
+                        prims_sorted, mesh.objects, mesh.all_prims,
+                        robot_demo.planned_pick_obj_idx,
+                        robot_demo.planned_pick_is_mesh);
+                    robot_demo.planned_pick_valid = false;  // single-shot
                 }
+                if (!ok) {
+                    ok = robot_demo_force_attach(
+                        robot_demo, urdf_artic_handle,
+                        prims_sorted, mesh.objects, mesh.all_prims);
+                }
+                if (ok) attach_changed = true;
             }
             if (robot_demo.request_detach) {
                 robot_demo.request_detach = false;
                 robot_demo_force_detach(robot_demo);
+            }
+
+            // Pick & Place — plan a full pregrasp→grasp→lift→place→release
+            // trajectory on the nearest graspable prop. Approach direction
+            // and drop zone are both chosen automatically by IK feasibility.
+            if (robot_demo.request_pick_and_place) {
+                robot_demo.request_pick_and_place = false;
+                update_robot_demo_face_picks(robot_demo, urdf_artic_handle, mesh.all_prims);
+                robot_demo_pick_and_place(robot_demo, urdf_artic_handle,
+                                          prims_sorted, mesh.objects, mesh.all_prims);
             }
 
             // Track end-effector velocity so detached objects inherit a
@@ -3053,15 +3211,21 @@ int main() {
         }
 
         // ── IK gizmo: XYZ move gizmo at end-effector for IK dragging ─
+        // Only active in Orbit/Select modes. In Move mode the object move
+        // gizmo owns the mouse — otherwise the IK EE-gizmo and joint grab
+        // circles (drawn every frame at each joint) eat clicks that were
+        // meant for object-translate handles, and the user sees handles
+        // but can't actually drag objects.
         bool ik_gizmo_consuming = false;
         if (robot_demo.ik_enabled && robot_demo.recording && urdf_artic_handle &&
-            !robot_demo.playing)
+            !robot_demo.playing && ctrl.interact_mode != InteractMode::Move)
         {
             float3 ee = urdf_end_effector_pos(urdf_artic_handle);
             float ik_aspect = (rt_w > 0 && rt_h > 0) ? (float)rt_w / (float)rt_h : 1.f;
 
             // Persistent IK target — accumulates gizmo deltas instead of using ee pos.
             static float3 ik_target = {0, 0, 0};
+            static float  ik_target_rot[16] = {};
             static bool   ik_target_init = false;
             static int    ik_drag_axis = 0;
             bool ik_needs_solve = false;
@@ -3071,6 +3235,7 @@ int main() {
             // Sync target to FK ee when not dragging (matches what IK solver sees)
             if (ik_drag_axis == 0) {
                 ik_target = urdf_fk_ee_pos(urdf_artic_handle);
+                urdf_fk_ee_transform(urdf_artic_handle, ik_target_rot);
                 ik_target_init = true;
             }
 
@@ -3182,27 +3347,62 @@ int main() {
                     ik_target.x += world_delta.x;
                     ik_target.y += world_delta.y;
                     ik_target.z += world_delta.z;
+                    // Hard floor clamp — prevent the gizmo dragging the EE
+                    // below the scene ground plane.
+                    if (ik_target.y < robot_demo.ground_y)
+                        ik_target.y = robot_demo.ground_y;
 
                     ik_needs_solve = true;
                 }
             }
 
-            // ── Chain grab points (one per movable joint, except first/last) ─
-            static int grab_dragging = -1;  // which joint index is being dragged
+            // ── Chain joint dots — every movable joint ───────────────────
+            // Left-drag      : IK-pull this joint origin toward the cursor.
+            // Ctrl+left-drag : rotate that joint directly.
+            // Hover       : tooltip shows joint name, current angle, limits.
+            static int grab_dragging_joint = -1;
+            static int grab_dragging_chain = -1;
             static float3 grab_target = {0,0,0};
             bool grab_needs_solve = false;
+            bool direct_joint_changed = false;
 
-            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) grab_dragging = -1;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                grab_dragging_joint = -1;
+                grab_dragging_chain = -1;
+            }
 
             int chain_len = urdf_ik_chain_length(urdf_artic_handle);
+            int joint_count = urdf_joint_count(urdf_artic_handle);
+            UrdfJointInfo* all_joints = urdf_joint_info(urdf_artic_handle);
+            std::vector<int> joint_to_chain((size_t)joint_count, -1);
+            for (int ci = 0; ci < chain_len; ++ci) {
+                UrdfJointInfo* cinfo = urdf_chain_joint_info(urdf_artic_handle, ci);
+                if (!cinfo) continue;
+                int ji = (int)(cinfo - all_joints);
+                if (ji >= 0 && ji < joint_count) joint_to_chain[(size_t)ji] = ci;
+            }
 
-            if (chain_len >= 3 && ik_drag_axis == 0) {
+            if (joint_count >= 1 && ik_drag_axis == 0) {
                 ImDrawList* dl = ImGui::GetForegroundDrawList();
                 ImVec2 mouse = ImGui::GetIO().MousePos;
+                bool ctrl_down = ImGui::GetIO().KeyCtrl;
 
-                // Draw grab points for joints 1 .. chain_len-2
-                for (int ji = 1; ji < chain_len - 1; ji++) {
-                    float3 jpos = urdf_joint_pos(urdf_artic_handle, ji);
+                int drivable_seen = 0;
+                int drivable_total = 0;
+                for (int ji = 0; ji < joint_count; ++ji) {
+                    int jt = all_joints[ji].type;
+                    if (jt == 0 || jt == 1 || jt == 2) ++drivable_total;
+                }
+
+                for (int ji = 0; ji < joint_count; ji++) {
+                    UrdfJointInfo* jinfo = &all_joints[ji];
+                    int jt = jinfo->type;
+                    if (jt != 0 && jt != 1 && jt != 2) continue;
+
+                    float jm[16];
+                    urdf_joint_world_transform(urdf_artic_handle, ji, jm);
+                    float3 jpos = make_float3(jm[3], jm[7], jm[11]);
+                    int chain_idx = joint_to_chain[(size_t)ji];
                     ImVec2 js;
                     float jd = world_to_screen(cam, jpos, vp.origin, vp.size,
                                                ctrl.vfov, ik_aspect, js);
@@ -3210,52 +3410,96 @@ int main() {
 
                     const float R = 6.f;
                     float dx = mouse.x - js.x, dy = mouse.y - js.y;
-                    bool hov = (dx*dx + dy*dy) <= (R + 5.f) * (R + 5.f);
-                    bool active = (grab_dragging == ji);
+                    bool hov = (dx*dx + dy*dy) <= (R + 8.f) * (R + 8.f);
+                    bool active = (grab_dragging_joint == ji);
 
-                    if (hov && grab_dragging < 0 && !ik_gizmo_consuming &&
+                    // Click to start IK-drag on this joint
+                    if (hov && grab_dragging_joint < 0 && !ik_gizmo_consuming &&
                         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                        grab_dragging = ji;
-                        grab_target = jpos;
+                        grab_dragging_joint = ji;
+                        grab_dragging_chain = chain_idx;
+                        grab_target         = jpos;
                         s_ik_gizmo_active = true;
                     }
                     if (active) ik_gizmo_consuming = true;
 
-                    // Color gradient along chain: blue at base → cyan at tip
-                    float t = (float)ji / (float)(chain_len - 1);
-                    int r = (int)(80 + 50 * t), g = (int)(150 + 80 * t), b = 230;
+                    // Ctrl+drag over joint = direct angle rotate. Plain drag
+                    // keeps the IK-pull behavior for posing intermediate links.
+                    // Color gradient along drivable joints: blue at base → cyan at tip
+                    float t = (float)drivable_seen / fmaxf(1.f, (float)(drivable_total - 1));
+                    int cr = (int)(80 + 50*t), cg = (int)(150 + 80*t), cb = 230;
                     ImU32 col = active ? IM_COL32(100, 240, 255, 255)
-                              : hov   ? IM_COL32(120, 220, 255, 240)
-                                      : IM_COL32(r, g, b, 180);
+                              : hov   ? IM_COL32(180, 230, 255, 255)
+                              : chain_idx < 0 ? IM_COL32(90, 120, 180, 150)
+                                               : IM_COL32(cr, cg, cb, 190);
+                    ++drivable_seen;
 
-                    dl->AddCircleFilled(js, R, col, 10);
-                    dl->AddCircle(js, R, IM_COL32(255, 255, 255, 140), 10, 1.f);
+                    dl->AddCircleFilled(js, R, col, 12);
+                    dl->AddCircle(js, R + 1.f, IM_COL32(255, 255, 255, 160), 12, 1.2f);
 
-                    // Drag
+                    // Tooltip: joint name, angle in degrees, limits
+                    if (hov && jinfo) {
+                        float deg = jinfo->angle * 180.f / 3.14159265f;
+                        float lo  = jinfo->lower * 180.f / 3.14159265f;
+                        float hi  = jinfo->upper * 180.f / 3.14159265f;
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted(jinfo->name);
+                        ImGui::Separator();
+                        ImGui::Text("Angle : %.1f°", deg);
+                        if (jinfo->upper > jinfo->lower)
+                            ImGui::Text("Limits: %.1f° — %.1f°", lo, hi);
+                        else
+                            ImGui::TextDisabled("No limits");
+                        if (chain_idx >= 0)
+                            ImGui::TextDisabled("Drag to IK-pull  |  Ctrl+drag to rotate");
+                        else
+                            ImGui::TextDisabled("Outside IK chain  |  Ctrl+drag to rotate");
+                        ImGui::EndTooltip();
+                    }
+
+                    // Joint dot drag.
                     if (active) {
                         ImVec2 delta = ImGui::GetIO().MouseDelta;
                         if (delta.x != 0.f || delta.y != 0.f) {
-                            float half_h = tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
-                            float wpp = jd * 2.f * half_h / vp.size.y;
-                            grab_target.x += (cam.u.x * delta.x - cam.v.x * delta.y) * wpp;
-                            grab_target.y += (cam.u.y * delta.x - cam.v.y * delta.y) * wpp;
-                            grab_target.z += (cam.u.z * delta.x - cam.v.z * delta.y) * wpp;
-                            grab_needs_solve = true;
+                            if (ctrl_down || chain_idx < 0) {
+                                const float drag_step = 0.01f; // rad/px, or m/px for prismatic
+                                jinfo->angle += (delta.x - delta.y) * drag_step;
+                                if (jinfo->upper > jinfo->lower)
+                                    jinfo->angle = fmaxf(jinfo->lower,
+                                                         fminf(jinfo->upper, jinfo->angle));
+                                direct_joint_changed = true;
+                            } else {
+                                float half_h = tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
+                                float wpp = jd * 2.f * half_h / vp.size.y;
+                                grab_target.x += (cam.u.x * delta.x - cam.v.x * delta.y) * wpp;
+                                grab_target.y += (cam.u.y * delta.x - cam.v.y * delta.y) * wpp;
+                                grab_target.z += (cam.u.z * delta.x - cam.v.z * delta.y) * wpp;
+                                grab_needs_solve = true;
+                            }
                         }
-
-                        // Target line
-                        ImVec2 ts;
-                        if (world_to_screen(cam, grab_target, vp.origin, vp.size,
-                                            ctrl.vfov, ik_aspect, ts) > 0.f)
-                            dl->AddLine(js, ts, IM_COL32(100, 240, 255, 100), 1.f);
+                        if (!ctrl_down && chain_idx >= 0) {
+                            ImVec2 ts;
+                            if (world_to_screen(cam, grab_target, vp.origin, vp.size,
+                                                ctrl.vfov, ik_aspect, ts) > 0.f)
+                                dl->AddLine(js, ts, IM_COL32(100, 240, 255, 120), 1.5f);
+                        }
                     }
                 }
             }
 
             // Solve: grab point takes priority over ee gizmo
             bool ik_solved = false;
-            if (grab_needs_solve && grab_dragging >= 1) {
-                urdf_solve_ik_joint(urdf_artic_handle, grab_dragging, grab_target);
+            if (direct_joint_changed) {
+                urdf_repose(urdf_artic_handle, mesh.all_prims);
+                sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
+                reupload_visible_prims(mesh);
+                if (mesh.d_bvh && !mesh.bvh_nodes.empty())
+                    bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
+                ++mesh.scene_version;
+                cam_changed = true;
+                ik_solved = true;
+            } else if (grab_needs_solve && grab_dragging_chain >= 0) {
+                urdf_solve_ik_joint(urdf_artic_handle, grab_dragging_chain, grab_target);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
                 sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
@@ -3265,7 +3509,8 @@ int main() {
                 cam_changed = true;
                 ik_solved = true;
             } else if (ik_needs_solve) {
-                urdf_solve_ik(urdf_artic_handle, ik_target);
+                urdf_set_ik_ground_y(urdf_artic_handle, robot_demo.ground_y);
+                urdf_solve_ik_pose(urdf_artic_handle, ik_target, ik_target_rot, 80, 0.005f);
                 urdf_repose(urdf_artic_handle, mesh.all_prims);
                 sensor_geo_update(sensor_state, urdf_artic_handle, mesh.all_prims);
                 reupload_visible_prims(mesh);
@@ -3293,6 +3538,109 @@ int main() {
                     if (mesh.d_bvh && !mesh.bvh_nodes.empty())
                         bvh_refit_triangles(mesh.bvh_nodes, mesh.prims, mesh.d_bvh);
                     ++mesh.scene_version;
+                }
+            }
+        }
+
+        update_robot_demo_face_picks(robot_demo, urdf_artic_handle, mesh.all_prims);
+
+        // Face-pick markers stay visible independently of the centroid debug
+        // line: green = selected finger contact, red = selected object face.
+        if ((robot_demo.face_pick_mode || robot_demo.grip_face_set || robot_demo.pick_face_set) &&
+            urdf_artic_handle)
+        {
+            float fp_aspect = (rt_w > 0 && rt_h > 0)
+                ? (float)rt_w / (float)rt_h : 1.f;
+            ImDrawList* dl_fp = ImGui::GetForegroundDrawList();
+            if (robot_demo.grip_face_set) {
+                float m[16];
+                urdf_fk_ee_transform(urdf_artic_handle, m);
+                float3 g = {
+                    m[3] + m[0]*robot_demo.grip_local[0] +
+                           m[1]*robot_demo.grip_local[1] +
+                           m[2]*robot_demo.grip_local[2],
+                    m[7] + m[4]*robot_demo.grip_local[0] +
+                           m[5]*robot_demo.grip_local[1] +
+                           m[6]*robot_demo.grip_local[2],
+                    m[11] + m[8]*robot_demo.grip_local[0] +
+                            m[9]*robot_demo.grip_local[1] +
+                            m[10]*robot_demo.grip_local[2] };
+                ImVec2 gs;
+                if (world_to_screen(cam, g, vp.origin, vp.size, ctrl.vfov, fp_aspect, gs) > 0.f) {
+                    dl_fp->AddCircleFilled(gs, 7.f, IM_COL32(80, 255, 90, 240), 16);
+                    dl_fp->AddCircle(gs, 7.f, IM_COL32(255, 255, 255, 180), 16, 1.5f);
+                }
+            }
+            if (robot_demo.pick_face_set) {
+                float3 p = make_float3(robot_demo.pick_face_world_pos[0],
+                                       robot_demo.pick_face_world_pos[1],
+                                       robot_demo.pick_face_world_pos[2]);
+                ImVec2 ps;
+                if (world_to_screen(cam, p, vp.origin, vp.size, ctrl.vfov, fp_aspect, ps) > 0.f) {
+                    dl_fp->AddCircleFilled(ps, 7.f, IM_COL32(255, 70, 70, 240), 16);
+                    dl_fp->AddCircle(ps, 7.f, IM_COL32(255, 255, 255, 180), 16, 1.5f);
+                }
+            }
+        }
+
+        // Pick & Place debug overlay — draw a line from the gripper grip
+        // anchor to the nearest pickup* mesh centroid so the user can
+        // verify the final grasp point before pressing Pick & Place. This
+        // block is intentionally outside the IK-drag gate above so the
+        // overlay shows regardless of playback / recording / interact mode.
+        if (robot_demo.show_pick_debug_line && urdf_artic_handle) {
+            float dbg_aspect = (rt_w > 0 && rt_h > 0)
+                ? (float)rt_w / (float)rt_h : 1.f;
+            float3 a_w, b_w;
+            if (robot_demo_pick_target_preview(robot_demo, urdf_artic_handle,
+                                               mesh.objects, mesh.all_prims,
+                                               a_w, b_w))
+            {
+                ImVec2 as, bs;
+                float ad = world_to_screen(cam, a_w, vp.origin, vp.size,
+                                           ctrl.vfov, dbg_aspect, as);
+                float bd = world_to_screen(cam, b_w, vp.origin, vp.size,
+                                           ctrl.vfov, dbg_aspect, bs);
+                if (ad > 0.f && bd > 0.f) {
+                    ImDrawList* dl_dbg = ImGui::GetForegroundDrawList();
+                    dl_dbg->AddLine(as, bs, IM_COL32(255, 220, 60, 220), 2.0f);
+
+                    // Green dot is draggable — click+drag to reposition the
+                    // grip anchor; offset is stored in EE-local so it follows.
+                    static bool grip_dragging = false;
+                    const float GRIP_R = 7.f;
+                    ImVec2 mouse = ImGui::GetIO().MousePos;
+                    float gdx = mouse.x - as.x, gdy = mouse.y - as.y;
+                    bool hov = (gdx*gdx + gdy*gdy) <= GRIP_R*GRIP_R;
+                    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                        grip_dragging = false;
+                    if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                        grip_dragging = true;
+                    if (grip_dragging) {
+                        ImVec2 delta = ImGui::GetIO().MouseDelta;
+                        if (delta.x != 0.f || delta.y != 0.f) {
+                            // Convert screen delta to world then to EE-local.
+                            float half_h = tanf(ctrl.vfov * 0.5f * 3.14159265f / 180.f);
+                            float wpp = ad * 2.f * half_h / vp.size.y;
+                            float3 dw = {
+                                (cam.u.x*delta.x - cam.v.x*delta.y) * wpp,
+                                (cam.u.y*delta.x - cam.v.y*delta.y) * wpp,
+                                (cam.u.z*delta.x - cam.v.z*delta.y) * wpp };
+                            // Rotate world delta into EE-local (R^T * dw).
+                            float m[16];
+                            urdf_fk_ee_transform(urdf_artic_handle, m);
+                            // R^T columns = rows of R (row-major).
+                            robot_demo.grip_local[0] += m[0]*dw.x + m[4]*dw.y + m[8]*dw.z;
+                            robot_demo.grip_local[1] += m[1]*dw.x + m[5]*dw.y + m[9]*dw.z;
+                            robot_demo.grip_local[2] += m[2]*dw.x + m[6]*dw.y + m[10]*dw.z;
+                        }
+                    }
+                    ImU32 gcol = grip_dragging ? IM_COL32(255, 255,  60, 255)
+                               : hov          ? IM_COL32(180, 255, 120, 255)
+                                              : IM_COL32(100, 255, 100, 230);
+                    dl_dbg->AddCircleFilled(as, GRIP_R, gcol);
+                    dl_dbg->AddCircle(as, GRIP_R, IM_COL32(255,255,255,160), 12, 1.5f);
+                    dl_dbg->AddCircleFilled(bs, 4.f, IM_COL32(255, 120, 120, 230));
                 }
             }
         }
@@ -3328,6 +3676,21 @@ int main() {
                 ctrl.orbit_pivot[2] = prims_sorted[ctrl.selected_sphere].center.z;
                 cam_changed = true;
             }
+        }
+
+        if (ctrl.selected_mesh_obj >= 0 &&
+            ctrl.selected_mesh_obj < (int)mesh.objects.size() &&
+            !mesh_object_is_movable(mesh.objects[ctrl.selected_mesh_obj]))
+        {
+            ctrl.selected_mesh_obj = -1;
+            multi_sel.clear();
+        }
+
+        if (ctrl.selected_mesh_obj >= 0 &&
+            ctrl.selected_mesh_obj < (int)mesh.objects.size() &&
+            multi_sel.empty())
+        {
+            multi_sel.insert(ctrl.selected_mesh_obj);
         }
 
         // ── Mesh object gizmo (W=translate, E=rotate, R=scale) ────────
@@ -3378,6 +3741,7 @@ int main() {
                 for (int idx : multi_sel) {
                     if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
                     MeshObject& obj = mesh.objects[idx];
+                    if (!mesh_object_is_movable(obj)) continue;
                     int oid = obj.obj_id;
                     auto translate_tri = [&](Triangle& tri) {
                         if (tri.obj_id != oid) return;
@@ -3418,6 +3782,7 @@ int main() {
                 for (int idx : multi_sel) {
                     if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
                     MeshObject& obj = mesh.objects[idx];
+                    if (!mesh_object_is_movable(obj)) continue;
                     int oid = obj.obj_id;
                     auto rotate_tri = [&](Triangle& tri) {
                         if (tri.obj_id != oid) return;
@@ -3451,6 +3816,7 @@ int main() {
                 for (int idx : multi_sel) {
                     if (idx < 0 || idx >= (int)mesh.objects.size()) continue;
                     MeshObject& obj = mesh.objects[idx];
+                    if (!mesh_object_is_movable(obj)) continue;
                     int oid = obj.obj_id;
                     auto scale_tri = [&](Triangle& tri) {
                         if (tri.obj_id != oid) return;
@@ -3928,6 +4294,53 @@ int main() {
             vp.lmb_dragging = false;
         }
 
+        // Face-pick grasp setup: click a robot finger face for the green
+        // grip normal, then click a movable prop face for the red target.
+        if (vp.lmb_clicked && robot_demo.face_pick_mode && urdf_artic_handle) {
+            float u = vp.mouse_uv.x;
+            float v = 1.f - vp.mouse_uv.y;
+            float3 ray_dir = normalize(
+                cam.lower_left + u*cam.horizontal + v*cam.vertical - cam.origin);
+
+            MeshFaceHit fh = pick_mesh_face(mesh.all_prims, mesh.objects,
+                                            cam.origin, ray_dir);
+            if (fh.hit && fh.obj_idx >= 0 && fh.obj_idx < (int)mesh.objects.size()) {
+                const MeshObject& obj = mesh.objects[fh.obj_idx];
+                if (obj.is_robot_part) {
+                    float m[16];
+                    urdf_fk_ee_transform(urdf_artic_handle, m);
+                    float3 ee = make_float3(m[3], m[7], m[11]);
+                    float3 rel = make_float3(fh.p.x - ee.x, fh.p.y - ee.y, fh.p.z - ee.z);
+                    robot_demo.grip_local[0] = m[0]*rel.x + m[4]*rel.y + m[8]*rel.z;
+                    robot_demo.grip_local[1] = m[1]*rel.x + m[5]*rel.y + m[9]*rel.z;
+                    robot_demo.grip_local[2] = m[2]*rel.x + m[6]*rel.y + m[10]*rel.z;
+
+                    robot_demo.grip_face_normal_local[0] = m[0]*fh.n.x + m[4]*fh.n.y + m[8]*fh.n.z;
+                    robot_demo.grip_face_normal_local[1] = m[1]*fh.n.x + m[5]*fh.n.y + m[9]*fh.n.z;
+                    robot_demo.grip_face_normal_local[2] = m[2]*fh.n.x + m[6]*fh.n.y + m[10]*fh.n.z;
+                    robot_demo.grip_face_tri_idx = fh.tri_idx;
+                    robot_demo.grip_face_bary[0] = fh.u;
+                    robot_demo.grip_face_bary[1] = fh.v;
+                    robot_demo.grip_face_normal_sign = fh.normal_sign;
+                    robot_demo.grip_face_set = true;
+                } else if (mesh_object_is_movable(obj)) {
+                    robot_demo.pick_face_world_pos[0] = fh.p.x;
+                    robot_demo.pick_face_world_pos[1] = fh.p.y;
+                    robot_demo.pick_face_world_pos[2] = fh.p.z;
+                    robot_demo.pick_face_world_normal[0] = fh.n.x;
+                    robot_demo.pick_face_world_normal[1] = fh.n.y;
+                    robot_demo.pick_face_world_normal[2] = fh.n.z;
+                    robot_demo.pick_face_obj_idx = fh.obj_idx;
+                    robot_demo.pick_face_tri_idx = fh.tri_idx;
+                    robot_demo.pick_face_bary[0] = fh.u;
+                    robot_demo.pick_face_bary[1] = fh.v;
+                    robot_demo.pick_face_normal_sign = fh.normal_sign;
+                    robot_demo.pick_face_set = true;
+                }
+            }
+            vp.lmb_clicked = false;
+        }
+
         // ── SELECT: LMB click (all modes) ────────────────────────────
         if (vp.lmb_clicked) {
             float u = vp.mouse_uv.x;
@@ -3938,13 +4351,17 @@ int main() {
             // Prefer mesh objects when a mesh is loaded, else pick spheres
             // Selection never touches camera or orbit pivot — no cam_changed here
             if (!mesh.prims.empty()) {
-                // Skip hidden objects in viewport picking
-                std::unordered_set<int> hidden_ids;
-                for (auto& obj : mesh.objects)
-                    if (obj.hidden) hidden_ids.insert(obj.obj_id);
+                // Viewport object transforms are for movable props only.
+                // Robot links are continuously regenerated by articulation FK,
+                // and environment meshes are not intended to be dragged.
+                std::unordered_set<int> excluded_ids;
+                for (auto& obj : mesh.objects) {
+                    if (!mesh_object_is_movable(obj))
+                        excluded_ids.insert(obj.obj_id);
+                }
                 std::vector<Triangle> pickable;
                 for (auto& t : mesh.all_prims)
-                    if (!hidden_ids.count(t.obj_id)) pickable.push_back(t);
+                    if (!excluded_ids.count(t.obj_id)) pickable.push_back(t);
 
                 ctrl.selected_mesh_obj = pick_mesh_object(pickable, mesh.objects, cam.origin, ray_dir);
                 ctrl.selected_sphere   = -1;

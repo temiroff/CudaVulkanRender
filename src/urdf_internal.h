@@ -167,6 +167,10 @@ struct UrdfArticulation {
     std::string                               ee_link_name;
     float3                                    ee_world_pos = {0, 0, 0};
 
+    // Optional floor height for IK ground repulsion. Set via
+    // urdf_set_ik_ground_y(); default -FLT_MAX = disabled.
+    float                                     ik_ground_y  = -1e30f;
+
     // Primary locked joint — excluded from IK. -1 = auto (last movable).
     // Index into joint_infos.
     int                                       ik_lock_joint = -1;

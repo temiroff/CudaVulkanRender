@@ -1280,6 +1280,11 @@ bool mjcf_load(const std::string&          path,
                 obj.obj_id = obj_id;
                 obj.hidden = false;
                 obj.environment = flat.environment_links.count(link_name) > 0;
+                // Every non-environment link in an imported MJCF belongs to
+                // the robot articulation — mark it so grasp logic skips it.
+                // (Matches urdf_loader behavior; without this, the gripper's
+                // own mesh shows up as the "nearest graspable" object.)
+                obj.is_robot_part = !obj.environment;
                 if (cnt > 0) {
                     float inv = 1.0f / (float)cnt;
                     obj.centroid = make_float3(centroid.x * inv, centroid.y * inv, centroid.z * inv);

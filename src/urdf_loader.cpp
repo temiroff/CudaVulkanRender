@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <filesystem>
 #include <cstring>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -1158,20 +1159,29 @@ void urdf_articulation_finalize(UrdfArticulation* h,
     cache_link(h->root_link);
     h->total_tris = tri_cursor;
 
-    // Find end-effector. A gripper's fingers are leaves, but the wrist/hand
-    // above them is the real EE. Walk *all* links (not just leaves) and pick
-    // the deepest whose name doesn't contain finger/tip. Only fall back to
-    // leaves if the whole tree looks like fingers.
+    // Find end-effector. A gripper's fingers/jaws are leaves, but the wrist or
+    // hand above them is the real pose target. Walk all links (not just leaves)
+    // and pick the deepest link that is not part of the gripper mechanism.
+    // This matters for SO-101: otherwise the EE becomes moving_jaw, so pose IK
+    // drives a jaw pivot instead of rolling the wrist into a grasp frame.
     {
-        auto is_finger_name = [](const std::string& n) {
-            return n.find("finger") != std::string::npos ||
-                   n.find("tip")    != std::string::npos;
+        auto is_gripper_link_name = [](const std::string& n) {
+            std::string lower;
+            lower.reserve(n.size());
+            for (char c : n) lower += (char)std::tolower((unsigned char)c);
+            return lower.find("finger")  != std::string::npos ||
+                   lower.find("tip")     != std::string::npos ||
+                   lower.find("jaw")     != std::string::npos ||
+                   lower.find("gripper") != std::string::npos ||
+                   lower.find("claw")    != std::string::npos ||
+                   lower.find("thumb")   != std::string::npos ||
+                   lower.find("knuckle") != std::string::npos;
         };
         std::string best;
         int best_depth = -1;
         std::function<void(const std::string&, int)> walk;
         walk = [&](const std::string& link_name, int depth) {
-            if (!is_finger_name(link_name) && depth > best_depth) {
+            if (!is_gripper_link_name(link_name) && depth > best_depth) {
                 best = link_name;
                 best_depth = depth;
             }
@@ -1383,20 +1393,51 @@ void urdf_joint_world_transform(UrdfArticulation* h, int joint_idx, float* out_m
     for (int i = 0; i < 16; i++) out_mat16[i] = (i % 5 == 0) ? 1.f : 0.f;
     if (!h || joint_idx < 0 || joint_idx >= (int)h->joint_infos.size()) return;
 
-    std::vector<IKChainEntry> chain;
-    if (!ik_collect_chain(h, chain) || chain.empty()) return;
-    std::vector<float3> jp, ja;
-    std::vector<Mat4>   xforms;
-    ik_forward(h, chain, jp, ja, nullptr, &xforms);
+    std::unordered_map<std::string, float> angles;
+    for (auto& ji : h->joint_infos) angles[ji.name] = ji.angle;
 
-    for (int ci = 0; ci < (int)chain.size(); ++ci) {
-        if (chain[ci].ji == joint_idx) {
-            for (int r = 0; r < 4; r++)
-                for (int c = 0; c < 4; c++)
-                    out_mat16[r * 4 + c] = xforms[ci].m[r][c];
-            return;
-        }
-    }
+    bool found = false;
+    std::function<void(const std::string&, Mat4)> walk =
+        [&](const std::string& link_name, Mat4 world_xform) {
+            if (found) return;
+            if (!h->root_body_link.empty() && link_name == h->root_body_link)
+                world_xform = world_xform * h->root_xform;
+
+            auto jit = h->children_map.find(link_name);
+            if (jit == h->children_map.end()) return;
+
+            for (const URDFJoint* joint : jit->second) {
+                Mat4 jx = world_xform * joint->origin;
+                auto idx_it = h->joint_name_to_idx.find(joint->name);
+                int ji = (idx_it == h->joint_name_to_idx.end()) ? -1 : idx_it->second;
+
+                Mat4 child_xform = jx;
+                auto ait = angles.find(joint->name);
+                float a = (ait != angles.end()) ? ait->second : 0.f;
+                if (joint->type == "revolute" || joint->type == "continuous") {
+                    child_xform = child_xform * axis_angle_rotation(joint->axis, a);
+                } else if (joint->type == "prismatic") {
+                    Mat4 slide = Mat4::identity();
+                    slide.m[0][3] = joint->axis.x * a;
+                    slide.m[1][3] = joint->axis.y * a;
+                    slide.m[2][3] = joint->axis.z * a;
+                    child_xform = child_xform * slide;
+                }
+
+                if (ji == joint_idx) {
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++)
+                            out_mat16[r * 4 + c] = child_xform.m[r][c];
+                    found = true;
+                    return;
+                }
+
+                walk(joint->child, child_xform);
+                if (found) return;
+            }
+        };
+
+    walk(h->root_link, h->z_to_y);
 }
 
 // Helper: map movable joint indices from chain
@@ -1407,7 +1448,10 @@ static void ik_movable_indices(UrdfArticulation* h,
     movable.clear();
     UrdfJointInfo* joints = h->joint_infos.data();
     for (int ci = 0; ci < (int)chain.size(); ci++)
-        if (chain[ci].ji >= 0 && (joints[chain[ci].ji].type == 0 || joints[chain[ci].ji].type == 2))
+        if (chain[ci].ji >= 0 &&
+            (joints[chain[ci].ji].type == 0 ||
+             joints[chain[ci].ji].type == 1 ||
+             joints[chain[ci].ji].type == 2))
             movable.push_back(ci);
 }
 
@@ -1426,6 +1470,37 @@ int urdf_ik_lock_joint(UrdfArticulation* h)
     return h ? h->ik_lock_joint : -1;
 }
 
+void urdf_set_ik_ground_y(UrdfArticulation* h, float ground_y)
+{
+    if (h) h->ik_ground_y = ground_y;
+}
+
+const char* urdf_get_ee_link_name(const UrdfArticulation* h)
+{
+    return h ? h->ee_link_name.c_str() : "";
+}
+
+void urdf_set_ee_link_name(UrdfArticulation* h, const char* link_name)
+{
+    if (h && link_name) h->ee_link_name = link_name;
+}
+
+void urdf_link_names(const UrdfArticulation* h, std::vector<std::string>& out)
+{
+    out.clear();
+    if (!h) return;
+    // BFS from root so the list is ordered depth-first (arm order).
+    std::vector<std::string> queue;
+    queue.push_back(h->root_link);
+    for (int qi = 0; qi < (int)queue.size(); ++qi) {
+        out.push_back(queue[qi]);
+        auto it = h->children_map.find(queue[qi]);
+        if (it != h->children_map.end())
+            for (auto* jnt : it->second)
+                queue.push_back(jnt->child);
+    }
+}
+
 void urdf_set_ik_lock_joint(UrdfArticulation* h, int joint_idx)
 {
     if (!h) return;
@@ -1441,7 +1516,7 @@ int urdf_ik_lock_joint_effective(UrdfArticulation* h)
         int t = h->joint_infos[h->ik_lock_joint].type;
         if (t == 0 || t == 2) return h->ik_lock_joint;
     }
-    // Auto: last movable (revolute/continuous) joint.
+    // UI/keyboard fallback: last movable (revolute/continuous) joint.
     for (int i = n - 1; i >= 0; --i) {
         int t = h->joint_infos[i].type;
         if (t == 0 || t == 2) return i;
@@ -1612,6 +1687,19 @@ float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx)
 
 
 
+UrdfJointInfo* urdf_chain_joint_info(UrdfArticulation* h, int movable_idx)
+{
+    if (!h) return nullptr;
+    std::vector<IKChainEntry> chain;
+    if (!ik_collect_chain(h, chain) || chain.empty()) return nullptr;
+    std::vector<int> movable;
+    ik_movable_indices(h, chain, movable);
+    if (movable_idx < 0 || movable_idx >= (int)movable.size()) return nullptr;
+    int ji = chain[movable[movable_idx]].ji;
+    if (ji < 0 || ji >= (int)h->joint_infos.size()) return nullptr;
+    return &h->joint_infos[ji];
+}
+
 // CCD helper: compute the rotation angle for one joint to bring 'current' toward 'target'
 // around the joint's axis. Returns the signed angle (already damped).
 static float ccd_angle_for_joint(float3 j_pos, float3 j_axis,
@@ -1711,7 +1799,8 @@ static void angular_error_world(const Mat4& R_target, const Mat4& R_current,
 // (included in DOF, with angular-error rows added to the Jacobian so the
 // locked link's world rotation is preserved).
 static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
-                            int target_ci, int max_iters, float tolerance)
+                            int target_ci, int max_iters, float tolerance,
+                            const Mat4* ee_rot_target = nullptr)
 {
     if (!h) return false;
     std::vector<IKChainEntry> chain;
@@ -1724,7 +1813,14 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
     const float max_err_ang = 0.20f;   // rad per step
     const float max_dq      = 0.20f;   // per-joint step cap
 
-    int primary_lock = urdf_ik_lock_joint_effective(h);
+    // EE orientation target only applies when driving the EE tip. When
+    // supplied, the primary IK lock is overridden: hitting a 6-DOF pose
+    // usually needs every joint, and excluding one (typically the wrist)
+    // makes the task infeasible.
+    const bool have_ee_rot = (target_ci < 0 && ee_rot_target != nullptr);
+
+    int primary_lock = (h->ik_lock_joint >= 0) ? urdf_ik_lock_joint_effective(h) : -1;
+    if (have_ee_rot) primary_lock = -1;
     int use_limit    = (target_ci < 0) ? (int)chain.size() : target_ci;
 
     // Movable DOF: everything we're allowed to drive. Per-joint freezes
@@ -1777,7 +1873,8 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
         cons.push_back({ ci, h->ik_locked_rot[ji] });
     }
     const int K = (int)cons.size();
-    const int M = 3 + 3 * K;
+    const int ee_rot_row = have_ee_rot ? (3 + 3 * K) : -1;
+    const int M = 3 + 3 * K + (have_ee_rot ? 3 : 0);
 
     std::vector<float3> jpos, jaxis;
     std::vector<Mat4>   xforms;
@@ -1789,12 +1886,14 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
 
     bool   reach_init = false;
     float3 base_pos   = make_float3(0, 0, 0);
-    float  reach_safe = 0.f;        // hard cap: max reach minus margin
+    float  reach_safe = 0.f;        // hard cap: max straight-line reach
     float  reach_max  = 0.f;        // full straight-line arm reach
-    const float reach_margin = 0.92f;
+    const float reach_margin = 1.0f;
 
+    Mat4 ee_xform_local;
     for (int iter = 0; iter < max_iters; ++iter) {
-        float3 ee = ik_forward(h, chain, jpos, jaxis, nullptr,
+        float3 ee = ik_forward(h, chain, jpos, jaxis,
+                                have_ee_rot ? &ee_xform_local : nullptr,
                                 K > 0 ? &xforms : nullptr);
         float3 point = (target_ci < 0) ? ee : jpos[target_ci];
 
@@ -1823,8 +1922,9 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             reach_init = true;
         }
 
-        // Clamp target within reach budget → arm can never be asked to
-        // fully straighten. Excess is projected back along base→target.
+        // Clamp target within reach budget. The viewport IK handle should be
+        // able to pull the arm all the way to its physical reach/limit, so the
+        // cap is the full straight-line reach rather than a conservative 97%.
         float3 tgt = target_pos;
         if (reach_init && reach_safe > 0.f) {
             float tx = tgt.x - base_pos.x;
@@ -1857,6 +1957,16 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             if (m > max_ang) max_ang = m;
         }
 
+        // EE orientation error (only when an EE rotation target was supplied).
+        float ee_aerr[3] = { 0.f, 0.f, 0.f };
+        if (have_ee_rot) {
+            float ox, oy, oz;
+            angular_error_world(*ee_rot_target, ee_xform_local, ox, oy, oz);
+            ee_aerr[0] = ox; ee_aerr[1] = oy; ee_aerr[2] = oz;
+            float m = sqrtf(ox*ox + oy*oy + oz*oz);
+            if (m > max_ang) max_ang = m;
+        }
+
         if (err_p < tolerance && max_ang < 0.01f) return true;
 
         // Clamp per-task errors so a single iteration stays well-scaled.
@@ -1872,6 +1982,14 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                 aerr[3*c+0] *= s; aerr[3*c+1] *= s; aerr[3*c+2] *= s;
             }
         }
+        if (have_ee_rot) {
+            float mx = ee_aerr[0], my = ee_aerr[1], mz = ee_aerr[2];
+            float m = sqrtf(mx*mx + my*my + mz*mz);
+            if (m > max_err_ang && m > 1e-9f) {
+                float s = max_err_ang / m;
+                ee_aerr[0] *= s; ee_aerr[1] *= s; ee_aerr[2] *= s;
+            }
+        }
 
         // Assemble full error stack.
         e[0] = ex; e[1] = ey; e[2] = ez;
@@ -1879,6 +1997,11 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             e[3 + 3*c + 0] = aerr[3*c + 0];
             e[3 + 3*c + 1] = aerr[3*c + 1];
             e[3 + 3*c + 2] = aerr[3*c + 2];
+        }
+        if (have_ee_rot) {
+            e[ee_rot_row + 0] = ee_aerr[0];
+            e[ee_rot_row + 1] = ee_aerr[1];
+            e[ee_rot_row + 2] = ee_aerr[2];
         }
 
         // Build the M×N Jacobian.
@@ -1910,6 +2033,14 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                 J[(row+0)*N + k] = ax.x;
                 J[(row+1)*N + k] = ax.y;
                 J[(row+2)*N + k] = ax.z;
+            }
+            // EE orientation rows: every movable revolute/continuous joint in
+            // the chain is upstream of the EE (target_ci < 0 ⇒ use_limit spans
+            // the whole chain), so the angular contribution is the world axis.
+            if (have_ee_rot && t != 1) {
+                J[(ee_rot_row+0)*N + k] = ax.x;
+                J[(ee_rot_row+1)*N + k] = ax.y;
+                J[(ee_rot_row+2)*N + k] = ax.z;
             }
         }
 
@@ -1948,15 +2079,11 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             dq[k] = s;
         }
 
-        // Null-space bias toward joint center. Pushes revolute joints away
-        // from their limits so the arm folds (elbow bends) instead of going
-        // fully straight when the task doesn't need the last DOF — resolves
-        // the near-singularity stall where dragging IK back only rotates the
-        // base. Projected through (I − Jᵀ(JJᵀ+λ²I)⁻¹J) so it can't fight the
-        // primary task.
+        // Mild null-space bias toward joint center. Keep this only while the
+        // arm is comfortably inside its workspace; near full extension the
+        // user is explicitly asking to reach the boundary, so do not fold the
+        // joints away from their limits.
         {
-            // Base gain 0.08; ramp up sharply as the arm approaches its
-            // reach limit so joints actively fold instead of straightening.
             float extension = 0.f;
             if (reach_init && reach_max > 1e-6f) {
                 float dx = point.x - base_pos.x;
@@ -1964,7 +2091,7 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
                 float dz = point.z - base_pos.z;
                 extension = sqrtf(dx*dx + dy*dy + dz*dz) / reach_max;
             }
-            float bias_gain = 0.08f + 0.60f * fmaxf(0.f, extension - 0.75f);
+            float bias_gain = 0.04f * fmaxf(0.f, 1.f - extension / 0.85f);
             std::vector<float> qb((size_t)N, 0.f);
             for (int k = 0; k < N; ++k) {
                 UrdfJointInfo& info = joints[chain[use_ci[k]].ji];
@@ -1998,6 +2125,57 @@ static bool urdf_solve_dls(UrdfArticulation* h, float3 target_pos,
             }
         }
 
+        // Ground repulsion: for each joint whose world Y is below ik_ground_y,
+        // add a null-space bias that rotates upstream joints to lift it back up.
+        // Uses the Y-row of the per-joint position Jacobian (same cross-product
+        // formula as the primary task, but evaluated at each joint origin rather
+        // than the EE).
+        if (h->ik_ground_y > -1e29f) {
+            const float gnd       = h->ik_ground_y;
+            const float gnd_margin = 0.04f;   // start repelling 4 cm above floor
+            const float gnd_gain   = 2.0f;
+            std::vector<float> qg((size_t)N, 0.f);
+            bool any_penetrating = false;
+            for (int ci = 0; ci < (int)chain.size(); ++ci) {
+                float pen = (gnd + gnd_margin) - jpos[ci].y;
+                if (pen <= 0.f) continue;
+                any_penetrating = true;
+                // Accumulate dJoint_Y/dq[k] for all DOF k upstream of ci.
+                for (int k = 0; k < N; ++k) {
+                    if (use_ci[k] > ci) continue;   // joint k is downstream
+                    int t = joints[chain[use_ci[k]].ji].type;
+                    if (t != 0 && t != 2) continue; // revolute/continuous only
+                    float3 ax = jaxis[use_ci[k]];
+                    float3 r  = { jpos[ci].x - jpos[use_ci[k]].x,
+                                  jpos[ci].y - jpos[use_ci[k]].y,
+                                  jpos[ci].z - jpos[use_ci[k]].z };
+                    // (axis × r).y
+                    float dy = ax.z * r.x - ax.x * r.z;
+                    qg[k] += gnd_gain * pen * dy / inv_sqrt_w[k];
+                }
+            }
+            if (any_penetrating) {
+                // Project onto null space and add.
+                std::vector<float> Jqg((size_t)M, 0.f);
+                for (int r = 0; r < M; ++r) {
+                    float s = 0.f;
+                    for (int k = 0; k < N; ++k) s += J[r*N+k] * qg[k];
+                    Jqg[r] = s;
+                }
+                std::vector<float> AiJqg((size_t)M, 0.f);
+                for (int r = 0; r < M; ++r) {
+                    float s = 0.f;
+                    for (int c = 0; c < M; ++c) s += A[r*M+c] * Jqg[c];
+                    AiJqg[r] = s;
+                }
+                for (int k = 0; k < N; ++k) {
+                    float s = 0.f;
+                    for (int r = 0; r < M; ++r) s += J[r*N+k] * AiJqg[r];
+                    dq[k] += qg[k] - s;
+                }
+            }
+        }
+
         // Step cap operates on the real joint-space delta dq[k]·inv_sqrt_w[k],
         // not the weighted-space dq[k], so max_dq is still the true radians
         // cap per iteration regardless of weighting.
@@ -2022,6 +2200,19 @@ bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
                    int max_iters, float tolerance)
 {
     return urdf_solve_dls(h, target_pos, -1, max_iters, tolerance);
+}
+
+bool urdf_solve_ik_pose(UrdfArticulation* h, float3 target_pos,
+                        const float* target_rot_mat16,
+                        int max_iters, float tolerance)
+{
+    if (!target_rot_mat16)
+        return urdf_solve_dls(h, target_pos, -1, max_iters, tolerance, nullptr);
+    Mat4 R_target;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            R_target.m[r][c] = target_rot_mat16[r * 4 + c];
+    return urdf_solve_dls(h, target_pos, -1, max_iters, tolerance, &R_target);
 }
 
 bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,

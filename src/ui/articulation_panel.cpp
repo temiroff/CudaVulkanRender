@@ -68,9 +68,62 @@ bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active,
             ImGui::SetNextItemWidth(avail);
             ImGui::SliderFloat("##grip_thresh", &gripper_state->grasp_threshold,
                                0.05f, 0.50f, "grip threshold %.2f m");
-            ImGui::SetNextItemWidth(avail);
-            ImGui::SliderFloat("##grip_fwd", &gripper_state->grip_forward,
-                               0.00f, 0.20f, "grip forward %.2f m");
+            // Face-pick grasp setup
+            {
+                bool fp = gripper_state->face_pick_mode;
+                if (fp) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.65f, 0.1f, 1.f));
+                if (ImGui::Button(fp ? "Face pick  [ACTIVE — click a face]" : "Face pick",
+                                  ImVec2(avail, 0.f)))
+                    gripper_state->face_pick_mode = !fp;
+                if (fp) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Activate face-pick mode, then:\n"
+                                      "  Click a finger-pad face  → green dot + grip normal\n"
+                                      "  Click an object face     → red dot  + target normal\n"
+                                      "Pick & Place will align the two faces for the grasp.");
+
+                // Grip face status
+                if (gripper_state->grip_face_set) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.f), "Grip face:   set");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X##gf")) {
+                        gripper_state->grip_face_set = false;
+                        gripper_state->grip_face_tri_idx = -1;
+                    }
+                } else {
+                    ImGui::TextDisabled("Grip face:   not set");
+                }
+
+                // Object face status
+                if (gripper_state->pick_face_set) {
+                    ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.f), "Target face: set");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X##pf")) {
+                        gripper_state->pick_face_set = false;
+                        gripper_state->pick_face_obj_idx = -1;
+                        gripper_state->pick_face_tri_idx = -1;
+                    }
+                } else {
+                    ImGui::TextDisabled("Target face: not set");
+                }
+
+                ImGui::Text("Grip offset: %.3f  %.3f  %.3f",
+                            gripper_state->grip_local[0],
+                            gripper_state->grip_local[1],
+                            gripper_state->grip_local[2]);
+                if (ImGui::Button("Reset grip to EE origin", ImVec2(avail, 0.f))) {
+                    gripper_state->grip_local[0]  = 0.f;
+                    gripper_state->grip_local[1]  = 0.f;
+                    gripper_state->grip_local[2]  = 0.f;
+                    gripper_state->grip_face_set  = false;
+                    gripper_state->pick_face_set  = false;
+                    gripper_state->pick_face_obj_idx = -1;
+                    gripper_state->grip_face_tri_idx = -1;
+                    gripper_state->pick_face_tri_idx = -1;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Clear grip offset and both face picks.");
+            }
         }
 
         // Explicit attach/detach — always shown, even when finger joints
@@ -93,19 +146,97 @@ bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active,
                 gripper_state->request_detach = true;
             if (!holding) ImGui::EndDisabled();
         }
+
+        // Pick & Place — finds the nearest pickup*/pickups* prop and runs a full
+        // pregrasp → grasp → lift → place → release → retract trajectory,
+        // auto-picking the best approach direction (top or ±X/±Z) by IK
+        // feasibility. Place target = the IK gizmo's current world position.
+        {
+            float avail = ImGui::GetContentRegionAvail().x;
+            bool holding  = gripper_state->grasp.active;
+            bool playing  = playback_active;
+            bool disabled = holding || playing;
+
+            // Approach mode: let the user force top-down (wrist perpendicular
+            // to ground, fingers down) or side (wrist parallel, horizontal
+            // fingers). Auto tries top first then falls back to sides.
+            {
+                const char* kModes[] = { "Auto", "Top", "Side" };
+                int mode = gripper_state->pick_approach_mode;
+                if (mode < 0 || mode > 2) mode = 0;
+                ImGui::SetNextItemWidth(avail);
+                if (ImGui::Combo("##pickmode", &mode, kModes, IM_ARRAYSIZE(kModes)))
+                    gripper_state->pick_approach_mode = mode;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Grasp approach for Pick & Place:\n"
+                        "  Auto — top-down first, sides as fallback.\n"
+                        "  Top  — wrist perpendicular to ground, fingers down.\n"
+                        "  Side — wrist parallel to ground, horizontal fingers.");
+            }
+
+            if (disabled) ImGui::BeginDisabled();
+            if (ImGui::Button("Pick & Place", ImVec2(avail, 0.f)))
+                gripper_state->request_pick_and_place = true;
+            if (disabled) ImGui::EndDisabled();
+
+            if (ImGui::IsItemHovered() && !disabled)
+                ImGui::SetTooltip(
+                    "Pick the nearest mesh named pickup*/pickups* and drop it 30 cm away on the floor.\n"
+                    "Approach direction (within the selected mode) and drop side chosen\n"
+                    "automatically by IK feasibility.");
+
+            ImGui::Checkbox("Debug: target line", &gripper_state->show_pick_debug_line);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Draw a live line from the gripper grip point to the\n"
+                    "nearest pickup* mesh centroid, so you can verify the\n"
+                    "planner is aimed at the right object.");
+
+            // Last-run status. Green = planned OK, red = failure.
+            if (gripper_state->last_pick_msg[0]) {
+                ImVec4 col = (gripper_state->last_pick_status > 0)
+                                 ? ImVec4(0.4f, 0.9f, 0.4f, 1.f)
+                                 : ImVec4(0.95f, 0.55f, 0.55f, 1.f);
+                ImGui::TextColored(col, "%s", gripper_state->last_pick_msg);
+            }
+        }
     }
 
-    // IK lock — which joint the solver leaves alone (controlled by
-    // sliders or the [ / ] hotkeys). Default "Auto" = last movable joint.
+    // EE link — the IK chain runs from root up to this link.
+    // If the arm has more joints than the IK gizmo shows, pick a deeper link.
+    {
+        std::vector<std::string> link_names;
+        urdf_link_names(handle, link_names);
+        const char* cur_ee = urdf_get_ee_link_name(handle);
+        ImGui::SetNextItemWidth(-1.f);
+        if (ImGui::BeginCombo("EE link", cur_ee ? cur_ee : "?")) {
+            for (auto& ln : link_names) {
+                bool sel = cur_ee && (ln == cur_ee);
+                if (ImGui::Selectable(ln.c_str(), sel))
+                    urdf_set_ee_link_name(handle, ln.c_str());
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "End-effector link: the IK chain ends here.\n"
+                "If the blue grab-dots don't cover all arm joints,\n"
+                "pick a deeper link (e.g. the hand or gripper base).");
+    }
+
+    // IK lock — which joint the solver leaves alone. Default "None" lets
+    // every movable joint participate in viewport IK.
     {
         int eff_lock = urdf_ik_lock_joint_effective(handle);
         int stored   = urdf_ik_lock_joint(handle);
         const char* preview = (stored < 0)
-            ? (eff_lock >= 0 ? joints[eff_lock].name : "Auto")
+            ? "None (all joints)"
             : joints[stored].name;
         ImGui::SetNextItemWidth(-1.f);
         if (ImGui::BeginCombo("IK lock", preview)) {
-            if (ImGui::Selectable("Auto (last movable)", stored < 0))
+            if (ImGui::Selectable("None (all joints)", stored < 0))
                 urdf_set_ik_lock_joint(handle, -1);
             for (int i = 0; i < n; ++i) {
                 if (joints[i].type != 0 && joints[i].type != 2) continue;
@@ -146,7 +277,7 @@ bool articulation_panel_draw(UrdfArticulation* handle, bool playback_active,
 
     ImGui::Separator();
 
-    int locked = urdf_ik_lock_joint_effective(handle);
+    int locked = urdf_ik_lock_joint(handle) >= 0 ? urdf_ik_lock_joint_effective(handle) : -1;
     int kb_eff = urdf_kb_joint_effective(handle);
     for (int i = 0; i < n; ++i) {
         UrdfJointInfo& j = joints[i];

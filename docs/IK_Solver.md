@@ -1,135 +1,127 @@
-# Inverse Kinematics Solver — CCD (Cyclic Coordinate Descent)
+# Inverse Kinematics Solver — Weighted Damped Least-Squares (DLS) Jacobian
+
+Implementation: `src/urdf_loader.cpp` → `urdf_solve_dls()`
+Public entry points: `urdf_solve_ik()` (drive EE tip) and `urdf_solve_ik_joint()` (drive a specific joint's origin).
 
 ## The Problem
 
-A robot arm is a chain of joints connected by rigid links. Given a desired end-effector (tip) position, find the joint angles that reach it.
+A robot arm is a chain of joints connected by rigid links. Given a desired point (end-effector or a named joint) in world space, find joint angles that reach it — while respecting joint limits, keeping user-locked links' orientations, and avoiding the near-singularity where the arm fully straightens.
 
-## Why CCD
+## Why Damped Least-Squares Jacobian
 
-| Method | Pros | Cons |
-|--------|------|------|
-| **Analytical** | Exact, fast | Only works for specific robot geometries (6-DOF with known structure). Can't generalize. |
-| **Jacobian** | Physically accurate, smooth | Needs matrix inversion, can be singular (arm fully stretched = divide by zero), complex to implement |
-| **CCD** | Works for any chain, handles joint limits naturally, simple to implement, stable | Not physically optimal, can look "robotic" |
+| Method | Verdict |
+|--------|---------|
+| Analytical | Exact but only for specific geometries. Rejected — URDF/MJCF rig can be any topology. |
+| CCD | Simple and robust but can't handle multi-row task spaces (position + orientation constraints), has no natural null-space for secondary objectives, and looks "robotic". Kept as legacy helper (`ccd_angle_for_joint`) but unused by the public API. |
+| **DLS Jacobian** | Handles an arbitrary M-row task (position + K×3 orientation rows), resolves singularities with damping λ², exposes a null space for joint-centering bias. This is the active solver. |
 
-CCD was chosen because:
-1. The URDF could be any robot — 3 joints, 7 joints, whatever. CCD doesn't care.
-2. Joint limits are trivial — just clamp after each step.
-3. No matrix math — no Jacobian, no pseudoinverse, no singularity handling.
-4. Real-time friendly — each iteration is just trig on each joint.
+## Task Formulation
 
-## Algorithm
-
-### Step 1: Collect the Chain
-
-`ik_collect_chain()` walks the URDF kinematic tree from root to end-effector, recording every joint along the path (including fixed joints for transform propagation).
+Each iteration solves
 
 ```
-root → joint0 → joint1 → joint2 → ... → ee_link
+Δq = Jᵀ (J Jᵀ + λ² I)⁻¹ e
 ```
 
-### Step 2: Forward Kinematics
+where:
 
-`ik_forward()` computes every joint's world-space position and rotation axis by walking the chain and multiplying 4x4 transforms:
+- `q ∈ ℝᴺ` — the movable DOF subset (revolute + prismatic + continuous). Primary-locked joint excluded. Per-joint frozen joints are *kept* in the DOF set — they need to move to preserve their child link's orientation.
+- `e ∈ ℝᴹ` — error stack. First 3 rows are the linear error for the driven point. Each per-joint orientation lock adds 3 angular-error rows. So `M = 3 + 3K`.
+- `J ∈ ℝᴹˣᴺ` — Jacobian of the task w.r.t. `q`. Revolute column = `axis × (point − joint_pos)`; prismatic column = `axis`; angular rows use `axis` directly (prismatic contributes zero).
+- `λ² = 0.0025` — damping that keeps `J Jᵀ + λ² I` invertible at singularities.
 
-```
-xform = z_to_y_correction
-for each joint in chain:
-    xform = xform * joint.origin           // joint frame
-    record joint_pos = xform * (0,0,0)     // world position
-    record joint_axis = xform * joint.axis  // world axis
-    xform = xform * rotation(axis, angle)   // apply current angle
-ee_pos = xform * (0,0,0)                   // end-effector position
-```
+The linear system is built explicitly (`A = J Jᵀ + λ² I`, `M×M`), inverted, and applied: `y = A⁻¹ e`, `Δq = Jᵀ y`. `M` is small (typically 3 to ~12), so a plain inversion is fine.
 
-This is the same transform chain used by `urdf_repose()` for rendering, ensuring consistency.
+## Per-Joint Stiffness Weighting
 
-### Step 3: CCD Iteration (10 iterations, tip-to-base)
-
-For each joint, working from the tip toward the base:
+The base twist and shoulder pitch on a serial arm swing through the largest arcs in world space and dominate an unweighted LS solution. That produces ugly "base-first" motion. Weights discourage that:
 
 ```
-         joint_pos ●─────────────── ● ee (current position)
-                    \
-                     \  we want ee here
-                      \
-                       ● target
+w[base_revolute]     = 5.0
+w[shoulder_revolute] = 2.5
+w[others]            = 1.0
 ```
 
-**a)** Get the joint's world position and rotation axis from the latest FK.
+Implemented by scaling Jacobian columns by `1/√w`, solving in the weighted space, then rescaling `Δq[k] *= 1/√w[k]` on step application. The existing DLS math is unchanged. Net effect: IK prefers moving the elbow/wrist.
 
-**b)** Compute two vectors from the joint origin:
-- `to_ee` = current ee position - joint position
-- `to_target` = target position - joint position
+## Orientation Preservation (Per-Joint Locks)
 
-**c)** Project both vectors onto the plane perpendicular to the joint axis. A revolute joint can only rotate around its axis, so the component along the axis is irrelevant:
-```
-projected = vector - dot(vector, axis) * axis
-```
+If the user locks a joint's *rotation* (via `ik_locked_mask`), the lock records that link's current world rotation `R_target`. On every iteration:
 
-**d)** Compute the angle between the two projected vectors:
 ```
-angle = acos(clamp(dot(p_ee, p_target) / (|p_ee| * |p_target|), -1, 1))
+angular_error_world(R_target, R_current)  →  ω ≈ 0.5 · vee(ΔR − ΔRᵀ)
 ```
 
-**e)** Determine sign (CW vs CCW) using the cross product:
+These 3-vectors are appended to `e` and the corresponding Jacobian rows are added. Only joints **upstream** of (or equal to) the locked link contribute — joints downstream can't reorient it.
+
+## End-Effector Orientation Target (Pose IK)
+
+`urdf_solve_ik_pose(h, target_pos, target_rot_mat16, ...)` adds a 6-DOF task: both a position and a world rotation for the EE. Implementation:
+
+- 3 extra angular rows appended to `e` and `J` at row index `ee_rot_row = 3 + 3K`.
+- Error: `angular_error_world(R_target, R_current_ee)` using the EE's world transform captured from `ik_forward`'s `out_ee_xform`.
+- Jacobian: every movable revolute/continuous joint in the chain is upstream of the EE, so its angular column is the world axis directly (prismatic contributes zero).
+- Error clamp: `‖ω‖ ≤ max_err_ang = 0.20 rad` per iteration (same cap as per-joint locks).
+- **Primary IK lock is overridden** when a rotation target is supplied. A 6-DOF pose target generally needs every joint; holding one (typically the wrist) fixed usually makes the task infeasible.
+
+This enables arbitrary approach directions — side grasps, angled picks, re-orientation — not just top-down. Default `max_iters` is 20 (vs 10 for position-only) because the coupled position+orientation task converges more slowly.
+
+## Reach Clamping
+
+The solver computes the arm's straight-line max reach once (sum of fixed link lengths), then clamps the target to `0.92 × reach_max` projected along `base → target`. Consequence: the arm can never be commanded to fully straighten, which is exactly where DLS stalls and motion looks jittery.
+
+## Null-Space Joint Centering
+
+After the primary `Δq_task = Jᵀ A⁻¹ e`, a secondary bias pushes revolute joints toward the middle of their limits:
+
 ```
-sign = dot(cross(p_ee, p_target), axis) > 0 ? +1 : -1
+qb[k] = gain · (center[k] − angle[k])
+Δq   += (I − Jᵀ A⁻¹ J) · qb     // projected onto null space of the task
 ```
 
-**f)** Apply 0.5 damping — only rotate halfway:
+The projection guarantees the bias can't fight the primary task. Gain is `0.08` baseline and ramps up sharply once the arm extends past 75% of its reach — so as the arm approaches singularity, joints actively fold (elbow bends) instead of committing to a straight-line solution.
+
+This is what fixes the classic "IK only rotates the base" failure near the reach limit.
+
+## Step Caps
+
+Per iteration, after solving:
+
 ```
-angle *= sign * 0.5
+max_err_lin = 0.15 m
+max_err_ang = 0.20 rad
+max_dq      = 0.20 rad    (per joint, in real joint space)
 ```
-Without damping, the base joint might swing the whole arm past the target, then the next joint overcorrects, causing oscillation.
 
-**g)** Clamp to joint limits:
-- Revolute: clamp to [lower, upper]
-- Continuous: wrap to [-PI, PI]
+`e` is clamped before the solve (keeps the linearization honest). `Δq` is clamped after the solve. Joint limits are enforced with `clamp_joint()` on every step.
 
-**h)** Recompute FK — this joint changed, so the ee position changed. The next joint sees the updated state.
+## Termination
 
-### Convergence
+Iterate until `‖e_pos‖ < tolerance` **and** `max‖ω_c‖ < 0.01 rad`, up to `max_iters`. Returns `true` on convergence, `false` on timeout or singular `A` (shouldn't happen with λ² > 0).
 
-Each iteration gets roughly 50% closer (due to 0.5 damping):
-- After 10 iterations: ~99.9% convergence
-- Tolerance check: if ee is within 5mm of target, stop early
+## Public API
 
-## Per-Joint Grab Points
+```cpp
+// Drive the end-effector tip to target_pos (position only).
+bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
+                   int max_iters = 10, float tolerance = 0.005f);
 
-`urdf_solve_ik_joint(handle, joint_idx, target)` runs the same CCD algorithm but with a different scope:
+// Drive the end-effector to both target_pos and target_rot_mat16
+// (row-major 4×4, top-left 3×3 used). Pass nullptr for position-only.
+bool urdf_solve_ik_pose(UrdfArticulation* h, float3 target_pos,
+                        const float* target_rot_mat16,
+                        int max_iters = 20, float tolerance = 0.005f);
 
-- Only adjusts joints `[0 .. joint_idx)` (before the target joint)
-- Tries to bring `joint_idx`'s world position toward the drag target
-- Joints after `joint_idx` are passengers — they follow passively
+// Drive joint_idx's origin to target_pos (used by grab-drag on a mid-chain joint).
+bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
+                         int max_iters = 6, float tolerance = 0.005f);
+```
 
-This is like grabbing a chain in the middle and lifting. The joints before the grab point rotate to reach; the joints after just hang.
+All three dispatch to the same `urdf_solve_dls(h, target_pos, target_ci, max_iters, tolerance, ee_rot_target)` core. `target_ci < 0` means "drive the EE tip"; otherwise `target_ci` is the chain index of the driven joint. `ee_rot_target` is honored only when `target_ci < 0`.
 
-## Why Tip-to-Base Order
+## Known Limits / Extensions
 
-**Base-to-tip** (wrong): The base joint makes a huge swing moving everything downstream. The next joint tries to correct, but it also moves everything after it. Chaotic, oscillating.
-
-**Tip-to-base** (correct): The tip joint makes a small local adjustment. The next joint up makes a slightly larger correction. The base joint makes the final gross adjustment. Each joint builds on the previous correction. Stable convergence.
-
-## Why Not FABRIK?
-
-FABRIK (Forward And Backward Reaching IK) is another popular simple solver. It alternately pulls the chain from the tip backward, then from the base forward. It's faster per iteration but treats joints as **ball joints** — it doesn't naturally handle specific rotation axes or joint limits.
-
-For a robot with constrained rotation axes (e.g., joint 1 rotates around Z, joint 2 around Y), CCD is the right choice because it respects the axis constraint at every step. FABRIK would need post-hoc projection onto valid axis rotations, which adds complexity and can break convergence.
-
-## Implementation Files
-
-- **IK solver**: `src/urdf_loader.cpp` — `urdf_solve_ik()`, `urdf_solve_ik_joint()`, `ik_forward()`, `ik_collect_chain()`
-- **IK gizmo**: `src/main.cpp` — XYZ move gizmo at end-effector, per-joint grab points
-- **FK ee position**: `urdf_fk_ee_pos()`, `urdf_fk_ee_transform()` — consistent with solver internals
-- **Cached ee position**: `urdf_end_effector_pos()` — mesh centroid from last `urdf_repose()`, used for display
-
-## Key Design Decisions
-
-1. **FK recomputed after every joint change** inside the CCD loop. Without this, the solver sees stale ee positions and converges to wrong solutions.
-
-2. **Persistent `ik_target`** in the gizmo code. Mouse deltas accumulate onto the target (not the ee position), preventing a feedback loop where ee movement amplifies gizmo delta.
-
-3. **`urdf_fk_ee_pos()` for gizmo snap** instead of `urdf_end_effector_pos()`. The solver uses `ik_forward()` internally, so the gizmo target must match that reference frame. Using the mesh centroid (from `urdf_end_effector_pos`) would cause a small offset/jump on drag start.
-
-4. **Separate `urdf_solve_ik_joint()`** for grab points rather than modifying the main solver. Simpler, no interaction between ee target and grab target — they're independent solves.
+- **Position-only reach clamp.** Doesn't consider orientation feasibility — an in-reach position may still be unreachable with a given target orientation. Convergence of `urdf_solve_ik_pose` is not guaranteed at workspace edges; callers should check the return value and fall back to a pregrasp offset.
+- **Orientation target replaces primary lock.** When `ee_rot_target` is set, the user's primary IK lock is ignored for that solve. This is deliberate (see "End-Effector Orientation Target") but surprising if you expect lock semantics to stack.
+- **No collision avoidance.** Null-space is currently spent on joint-centering; it could host a second secondary task (e.g., distance to a repulsive obstacle field).
+- **CPU-only.** `M` and `N` are small enough that GPU offload wouldn't help. Matrix inversion is `O(M³)` with `M ≤ ~18` in practice (3 position + 3 EE rotation + up to K×3 per-link locks).

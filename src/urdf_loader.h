@@ -41,10 +41,20 @@ UrdfJointInfo* urdf_joint_info(UrdfArticulation* h);  // array of joint_count
 float3 urdf_end_effector_pos(UrdfArticulation* h);
 
 // Solve inverse kinematics: adjust joint angles so the end-effector reaches
-// target_pos. Uses CCD (Cyclic Coordinate Descent) with joint limits.
+// target_pos. Uses weighted damped least-squares Jacobian with joint limits,
+// reach clamping, and null-space joint centering.
 // Returns true if converged within tolerance.
 bool urdf_solve_ik(UrdfArticulation* h, float3 target_pos,
                    int max_iters = 10, float tolerance = 0.005f);
+
+// Solve full 6-DOF pose IK: drive the end-effector to both target_pos and
+// target_rot_mat16 (row-major 4×4, top-left 3×3 used as R_target).
+// Pass target_rot_mat16 = nullptr to fall back to position-only.
+// When a rotation target is given, the primary IK lock is ignored internally
+// so every movable joint can contribute to the orientation.
+bool urdf_solve_ik_pose(UrdfArticulation* h, float3 target_pos,
+                        const float* target_rot_mat16,
+                        int max_iters = 20, float tolerance = 0.005f);
 
 // Solve IK for a specific joint in the chain (not the ee).
 // Only adjusts joints [0..joint_idx) to bring joint_idx toward target_pos.
@@ -55,15 +65,34 @@ bool urdf_solve_ik_joint(UrdfArticulation* h, int joint_idx, float3 target_pos,
 // Get the world-space position of the Nth movable joint (0-based).
 float3 urdf_joint_pos(UrdfArticulation* h, int joint_idx);
 
+// Get the UrdfJointInfo for the Nth movable joint in the IK chain (0-based).
+// Returns nullptr if out of range. Allows reading name/angle and writing angle
+// directly for per-joint viewport control.
+UrdfJointInfo* urdf_chain_joint_info(UrdfArticulation* h, int movable_idx);
+
 // Get the number of movable joints in the IK chain.
 int urdf_ik_chain_length(UrdfArticulation* h);
 
+// Get / set the end-effector link name. The IK chain goes from the root up to
+// (and including) this link. Changing it takes effect immediately — the chain
+// is rebuilt on every IK call.
+// Set a floor Y height so the IK solver adds null-space repulsion when any
+// joint position would go below it. Pass -FLT_MAX (default) to disable.
+void urdf_set_ik_ground_y(UrdfArticulation* h, float ground_y);
+
+const char* urdf_get_ee_link_name(const UrdfArticulation* h);
+void        urdf_set_ee_link_name(UrdfArticulation* h, const char* link_name);
+
+// Return all link names in the articulation, ordered by depth from the root
+// (breadth-first). Useful for populating a "choose EE link" combo.
+void urdf_link_names(const UrdfArticulation* h, std::vector<std::string>& out);
+
 // Which joint IK leaves alone (so the user can set its angle manually).
-// -1 means "auto pick last movable joint". Index is into urdf_joint_info().
+// -1 means no primary IK lock. Index is into urdf_joint_info().
 int  urdf_ik_lock_joint(UrdfArticulation* h);
 void urdf_set_ik_lock_joint(UrdfArticulation* h, int joint_idx);
 
-// Resolve the effective locked joint index (converts -1 → last movable).
+// Resolve the effective locked joint index for UI/keyboard fallback.
 // Returns -1 if nothing is movable.
 int  urdf_ik_lock_joint_effective(UrdfArticulation* h);
 
