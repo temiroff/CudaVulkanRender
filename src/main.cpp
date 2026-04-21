@@ -3370,6 +3370,10 @@ int main() {
                 grab_dragging_joint = -1;
                 grab_dragging_chain = -1;
             }
+            if (sim_running) {
+                grab_dragging_joint = -1;
+                grab_dragging_chain = -1;
+            }
 
             int chain_len = urdf_ik_chain_length(urdf_artic_handle);
             int joint_count = urdf_joint_count(urdf_artic_handle);
@@ -3382,7 +3386,7 @@ int main() {
                 if (ji >= 0 && ji < joint_count) joint_to_chain[(size_t)ji] = ci;
             }
 
-            if (joint_count >= 1 && ik_drag_axis == 0) {
+            if (!sim_running && joint_count >= 1 && ik_drag_axis == 0) {
                 ImDrawList* dl = ImGui::GetForegroundDrawList();
                 ImVec2 mouse = ImGui::GetIO().MousePos;
                 bool ctrl_down = ImGui::GetIO().KeyCtrl;
